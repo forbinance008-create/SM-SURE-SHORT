@@ -199,6 +199,25 @@ def init_db():
                 permissions TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS signal_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                signal_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(user_id, signal_id),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_user_id INTEGER,
+                details TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -224,7 +243,14 @@ def init_db():
             INSERT OR IGNORE INTO settings(key, value) VALUES('withdraw_hold', '0');
             INSERT OR IGNORE INTO settings(key, value) VALUES('notice', '');
             INSERT OR IGNORE INTO settings(key, value) VALUES('trading_rules', 'Trade responsibly. Use proper money management and do not risk money you cannot afford to lose.');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('notifications_enabled', '1');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('signal_confidence', '95–99%');
             """)
+            # Safe migration for databases created by older versions.
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -310,6 +336,33 @@ def set_setting(key, value):
             conn.commit()
         finally:
             conn.close()
+
+
+def audit(admin_id, action, target_user_id=None, details=''):
+    try:
+        with db_lock:
+            conn = db()
+            try:
+                conn.execute("INSERT INTO admin_audit(admin_id,action,target_user_id,details,created_at) VALUES(?,?,?,?,?)",
+                             (admin_id, action, target_user_id, str(details)[:500], utc_iso(now_utc())))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        logger.exception("audit failed")
+
+
+def notifications_enabled_global():
+    return get_setting('notifications_enabled', '1') == '1'
+
+
+def user_notifications_enabled(user_id):
+    u = get_user(user_id)
+    return bool(u and u['notifications_enabled'] == 1)
+
+
+def signal_confidence():
+    return get_setting('signal_confidence', '95–99%')
 
 
 # ============================================================
@@ -762,6 +815,7 @@ def main_keyboard(user_id):
     kb.row("⚡ Live Signals", "👤 My Status")
     kb.row("💰 Wallet", "👥 Referral Link")
     kb.row("⭐ VIP Rules", "📖 Trading Rules")
+    kb.row("🔔 Notifications")
     u = get_user(user_id)
     if not u or u["status"] != "VIP":
         kb.row("🆔 Submit Quotex UID")
@@ -796,6 +850,8 @@ def admin_keyboard():
         types.InlineKeyboardButton("👤 Manage User", callback_data="adm_manage_user"),
         types.InlineKeyboardButton("🗑 Clear Future", callback_data="adm_clear")
     )
+    kb.add(types.InlineKeyboardButton("🔔 Notification Settings", callback_data="adm_notifications"))
+    kb.add(types.InlineKeyboardButton("📢 Send Notice Now", callback_data="adm_notice_send"))
     return kb
 
 
@@ -829,7 +885,8 @@ def start_cmd(message):
             "আপনার account তৈরি হয়েছে।\n\n"
             f"🎟️ Free: প্রতি ২ দিনে সর্বোচ্চ <b>{free_signal_limit()}টি</b> signal.\n"
             f"⭐ VIP: <b>${vip_deposit_cents()/100:.2f}</b> deposit করে join করা যাবে.\n\n"
-            "⚠️ Signals informational only; কোনো profit guarantee নেই।",
+            f"🎯 Stated signal confidence: <b>{escape(signal_confidence())}</b>\n\n"
+            "📌 Confidence is a stated estimate, not a guaranteed result.",
             reply_markup=main_keyboard(message.from_user.id)
         )
     except Exception:
@@ -872,7 +929,7 @@ def future_signal_cmd(message):
             message.chat.id,
             "⛔ <b>Free signal quota শেষ</b>\n\n"
             f"এই ২ দিনের cycle-এ আপনার {free_signal_limit()}টি signal শেষ হয়েছে।\n"
-            "পরবর্তী cycle শুরু হলে quota আবার reset হবে。\n\n"
+            "পরবর্তী cycle শুরু হলে quota আবার reset হবে।\n\n"
             "⭐ VIP হলে এই limit থাকবে না।"
         )
         return
@@ -921,7 +978,8 @@ def future_signal_cmd(message):
         f"🕐 BD Time: <b>{t.strftime('%d-%m-%Y')}</b> <b>{format_signal_time(t)}</b>\n"
         f"{format_signal_text(signal['signal_text'])}\n\n"
         f"{quota}\n\n"
-        "⚠️ Informational only. No guaranteed profit.",
+        f"🎯 Stated confidence: <b>{escape(signal_confidence())}</b>\n"
+        "📌 Confidence is a stated estimate, not a guarantee.",
         reply_markup=kb
     )
 
@@ -994,6 +1052,45 @@ def status_cmd(message):
     )
 
 
+@bot.message_handler(func=lambda m: m.text == "🔔 Notifications")
+def user_notification_settings(message):
+    uid = message.from_user.id
+    u = get_user(uid)
+    if not u:
+        register_user(message.from_user)
+        u = get_user(uid)
+    enabled = bool(u['notifications_enabled'])
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(
+        f"{'🔕 Turn OFF' if enabled else '🔔 Turn ON'} notifications",
+        callback_data="user_notify_toggle"
+    ))
+    bot.send_message(message.chat.id,
+        "🔔 <b>Notifications</b>\n\n"
+        f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n"
+        "ON থাকলে scheduled signal আপনার কাছে automatically আসবে।",
+        reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "user_notify_toggle")
+def user_notify_toggle(call):
+    uid = call.from_user.id
+    with db_lock:
+        conn = db()
+        try:
+            row = conn.execute("SELECT notifications_enabled FROM users WHERE user_id=?", (uid,)).fetchone()
+            if not row:
+                bot.answer_callback_query(call.id, "User not found.")
+                return
+            new_value = 0 if row['notifications_enabled'] else 1
+            conn.execute("UPDATE users SET notifications_enabled=? WHERE user_id=?", (new_value, uid))
+            conn.commit()
+        finally:
+            conn.close()
+    bot.answer_callback_query(call.id, "Updated")
+    user_notification_settings(types.SimpleNamespace(chat=call.message.chat, from_user=call.from_user))
+
+
 @bot.message_handler(func=lambda m: m.text == "⭐ VIP Rules")
 def vip_rules(message):
     deposit = vip_deposit_cents() / 100
@@ -1005,8 +1102,9 @@ def vip_rules(message):
         f"🎟️ Non-VIP: প্রতি ২ দিনে <b>{limit}টি</b> free signal.\n"
         "♾️ VIP: Future Signal limit নেই.\n"
         "🆔 UID verification admin-এর মাধ্যমে হবে.\n\n"
-        "📌 VIP join করার জন্য admin-এর নির্দেশনা অনুসরণ করুন.\n\n"
-        "⚠️ Signals informational only; profit guarantee নেই."
+        "📌 VIP join করার জন্য admin-এর নির্দেশনা অনুসরণ করুন.\n"
+        f"🎯 Stated signal confidence: <b>{escape(signal_confidence())}</b>\n"
+        "📌 Confidence is a stated estimate, not a guarantee."
     )
 
 
@@ -1329,7 +1427,7 @@ def finish_withdraw(message):
         state["action"] = "withdraw_method"
         bot.send_message(
             message.chat.id,
-            "💳 Payment method পাঠাও。\nExample: bKash / Bank / অন্য method"
+            "💳 Payment method পাঠাও।\nExample: bKash / Bank / অন্য method"
         )
         return
 
@@ -1515,7 +1613,7 @@ def adm_add_signal(call):
     bot.answer_callback_query(call.id)
     bot.send_message(
         call.message.chat.id,
-        "➕ Signal পাঠাও。\n\n"
+        "➕ Signal পাঠাও।\n\n"
         "<code>18:30 - EUR/USD - CALL</code>\n"
         "অথবা\n"
         "<code>2026-09-17 18:30 - EUR/USD - CALL</code>\n\n"
@@ -1771,6 +1869,7 @@ def user_vip_toggle(call):
         _, _, decision, uid = call.data.split("_")
         uid = int(uid)
         set_vip(uid, decision == "yes")
+        audit(call.from_user.id, "VIP_STATUS", uid, decision)
         bot.answer_callback_query(call.id, "Updated.")
         manage_user_menu(call.message.chat.id, uid)
         try:
@@ -1787,7 +1886,7 @@ def user_limit_prompt(call):
     uid = int(call.data.rsplit("_", 1)[1])
     states[call.from_user.id] = {"action": "set_user_limit_direct", "target_user": uid}
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, f"🎟️ User <code>{uid}</code>-এর free signal limit কত হবে? শুধু number পাঠাও。")
+    bot.send_message(call.message.chat.id, f"🎟️ User <code>{uid}</code>-এর free signal limit কত হবে? শুধু number পাঠাও।")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("user_default_"))
@@ -1912,7 +2011,7 @@ def save_wallet_adjust(message):
         states.pop(message.from_user.id, None)
 
         if not ok:
-            bot.send_message(message.chat.id, "❌ User নেই অথবা balance negative হবে。")
+            bot.send_message(message.chat.id, "❌ User নেই অথবা balance negative হবে।")
             return
 
         bot.send_message(
@@ -1926,7 +2025,7 @@ def save_wallet_adjust(message):
         try:
             bot.send_message(
                 user_id,
-                f"💰 আপনার wallet update হয়েছে。\n"
+                f"💰 আপনার wallet update হয়েছে।\n"
                 f"New balance: <b>${balance/100:.2f}</b>"
             )
         except Exception:
@@ -1935,7 +2034,7 @@ def save_wallet_adjust(message):
     except Exception:
         bot.send_message(
             message.chat.id,
-            "❌ Format ভুল。 Example: <code>123456789 5</code>"
+            "❌ Format ভুল। Example: <code>123456789 5</code>"
         )
 
 
@@ -1952,8 +2051,8 @@ def adm_broadcast(call):
     bot.answer_callback_query(call.id)
     bot.send_message(
         call.message.chat.id,
-        "📢 Broadcast message পাঠাও。\n\n"
-        "এই message সব registered users-এর কাছে যাবে。"
+        "📢 Broadcast message পাঠাও।\n\n"
+        "এই message সব registered users-এর কাছে যাবে।"
     )
 
 
@@ -2010,116 +2109,143 @@ def adm_subadmins(call):
     if not is_master(call.from_user.id):
         bot.answer_callback_query(call.id, "Master Admin only.")
         return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("➕ Add Sub-admin", callback_data="sub_add"))
+    kb.add(types.InlineKeyboardButton("🗑 Remove Sub-admin", callback_data="sub_remove"))
+    kb.add(types.InlineKeyboardButton("📋 Sub-admin List", callback_data="sub_list"))
+    kb.add(types.InlineKeyboardButton("⬅️ Admin Panel", callback_data="adm_home"))
+    bot.edit_message_text("🛡 <b>SUB-ADMIN MANAGEMENT</b>\n\nChoose an action:", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton(
-            "➕ Add/Update Sub-admin", callback_data="sub_add"
-        )
-    )
-    kb.add(
-        types.InlineKeyboardButton(
-            "🗑 Remove Sub-admin", callback_data="sub_remove"
-        )
-    )
 
+@bot.callback_query_handler(func=lambda c: c.data == "sub_list")
+def sub_list(call):
+    if not is_master(call.from_user.id):
+        return
     with db_lock:
         conn = db()
         try:
-            rows = conn.execute(
-                "SELECT user_id,permissions FROM admins ORDER BY user_id"
-            ).fetchall()
+            rows = conn.execute("SELECT user_id,permissions FROM admins ORDER BY user_id").fetchall()
         finally:
             conn.close()
-
     if rows:
-        text = "🛡 <b>SUB-ADMINS</b>\n\n" + "\n".join(
-            f"<code>{r['user_id']}</code> → {escape(r['permissions'])}"
-            for r in rows
+        text = "🛡 <b>SUB-ADMIN LIST</b>\n\n" + "\n".join(
+            f"👤 <code>{r['user_id']}</code>\n🔐 {escape(r['permissions'] or 'none')}" for r in rows
         )
     else:
-        text = "🛡 <b>SUB-ADMINS</b>\n\nNone."
-
-    bot.send_message(call.message.chat.id, text, reply_markup=kb)
+        text = "🛡 <b>SUB-ADMIN LIST</b>\n\nকোনো Sub-admin নেই।"
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=back_admin_keyboard())
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "sub_add")
 def sub_add(call):
     if not is_master(call.from_user.id):
         return
-
-    states[call.from_user.id] = {"action": "sub_add"}
+    states[call.from_user.id] = {"action": "sub_add_id"}
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "Format:\n"
-        "<code>USER_ID signals,uid,users,wallet,withdraw,broadcast,analytics</code>\n\n"
-        "Example:\n"
-        "<code>123456789 signals,uid,analytics</code>"
-    )
+    bot.send_message(call.message.chat.id, "➕ যে user-কে Sub-admin করবে তার Telegram ID পাঠাও।\n\nExample: <code>123456789</code>\n/cancel দিয়ে বাতিল করতে পারো।")
 
 
-def save_subadmin(message):
+def show_sub_permissions(chat_id, admin_id, selected=None):
+    selected = set(selected or get_permissions(admin_id))
+    # Master is never stored as sub-admin.
+    labels = [
+        ("signals", "📊 Signals"), ("uid", "🆔 UID"),
+        ("users", "👥 Users"), ("wallet", "💳 Wallet"),
+        ("withdraw", "💸 Withdraw"), ("broadcast", "📢 Broadcast"),
+        ("analytics", "📈 Analytics")
+    ]
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for key, label in labels:
+        mark = "✅" if key in selected else "⬜"
+        kb.add(types.InlineKeyboardButton(f"{mark} {label}", callback_data=f"sp_{key}_{admin_id}"))
+    kb.add(types.InlineKeyboardButton("💾 Save Sub-admin", callback_data=f"sp_save_{admin_id}"))
+    kb.add(types.InlineKeyboardButton("❌ Cancel", callback_data="adm_subadmins"))
+    bot.send_message(chat_id, f"🛡 <b>Permissions for {admin_id}</b>\n\nযে কাজগুলো করতে পারবে সেগুলো ON করো:", reply_markup=kb)
+    states[chat_id] = {"action": "sub_permissions", "target_user": admin_id, "permissions": selected}
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sp_"))
+def sub_permission_callback(call):
+    if not is_master(call.from_user.id):
+        return
+    parts = call.data.split("_")
+    if len(parts) < 3:
+        return
+    action = parts[1]
     try:
-        parts = message.text.strip().split(maxsplit=1)
-        if len(parts) != 2:
-            raise ValueError
-
-        uid = int(parts[0])
-        permissions = {
-            p.strip() for p in parts[1].split(",")
-            if p.strip() in ALL_PERMISSIONS
-        }
-
-        if not permissions:
-            raise ValueError
-
-        add_subadmin(uid, permissions)
-        states.pop(message.from_user.id, None)
-
-        bot.send_message(
-            message.chat.id,
-            "✅ Sub-admin saved.\n"
-            f"User: <code>{uid}</code>\n"
-            f"Permissions: <b>{escape(', '.join(sorted(permissions)))}</b>",
-            reply_markup=admin_keyboard()
-        )
-    except Exception:
-        bot.send_message(
-            message.chat.id,
-            "❌ Format ভুল। আবার চেষ্টা করো।"
-        )
+        uid = int(parts[-1])
+    except ValueError:
+        return
+    st = states.get(call.from_user.id, {})
+    if st.get("action") != "sub_permissions" or st.get("target_user") != uid:
+        bot.answer_callback_query(call.id, "Session expired. Start again.")
+        return
+    perms = set(st.get("permissions", set()))
+    if action == "save":
+        if not perms:
+            bot.answer_callback_query(call.id, "কমপক্ষে ১টি permission নির্বাচন করো।")
+            return
+        add_subadmin(uid, perms)
+        audit(call.from_user.id, "ADD_OR_UPDATE_SUBADMIN", uid, ",".join(sorted(perms)))
+        states.pop(call.from_user.id, None)
+        bot.answer_callback_query(call.id, "Saved")
+        bot.edit_message_text(f"✅ <b>Sub-admin saved</b>\n\nUser: <code>{uid}</code>\nPermissions: <b>{escape(', '.join(sorted(perms)))}</b>", call.message.chat.id, call.message.message_id, reply_markup=back_admin_keyboard())
+        return
+    if action not in ALL_PERMISSIONS or action == "settings":
+        return
+    if action in perms:
+        perms.remove(action)
+    else:
+        perms.add(action)
+    st["permissions"] = perms
+    states[call.from_user.id] = st
+    bot.answer_callback_query(call.id)
+    # Replace current permission message with fresh buttons.
+    labels = [("signals","📊 Signals"),("uid","🆔 UID"),("users","👥 Users"),("wallet","💳 Wallet"),("withdraw","💸 Withdraw"),("broadcast","📢 Broadcast"),("analytics","📈 Analytics")]
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for key,label in labels:
+        kb.add(types.InlineKeyboardButton(("✅ " if key in perms else "⬜ ")+label, callback_data=f"sp_{key}_{uid}"))
+    kb.add(types.InlineKeyboardButton("💾 Save Sub-admin", callback_data=f"sp_save_{uid}"))
+    kb.add(types.InlineKeyboardButton("❌ Cancel", callback_data="adm_subadmins"))
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "sub_remove")
 def sub_remove(call):
     if not is_master(call.from_user.id):
         return
+    with db_lock:
+        conn = db()
+        try:
+            rows = conn.execute("SELECT user_id FROM admins ORDER BY user_id").fetchall()
+        finally:
+            conn.close()
+    if not rows:
+        bot.answer_callback_query(call.id, "No sub-admins.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        kb.add(types.InlineKeyboardButton(f"🗑 Remove {r['user_id']}", callback_data=f"sub_del_{r['user_id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="adm_subadmins"))
+    bot.edit_message_text("🗑 <b>REMOVE SUB-ADMIN</b>\n\nযাকে remove করবে তাকে চাপো:", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-    states[call.from_user.id] = {"action": "sub_remove"}
-    bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "Remove করতে Sub-admin-এর Telegram ID পাঠাও।"
-    )
 
-
-def save_sub_remove(message):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sub_del_"))
+def sub_delete_callback(call):
+    if not is_master(call.from_user.id):
+        return
     try:
-        uid = int(message.text.strip())
+        uid = int(call.data.rsplit("_",1)[1])
         remove_subadmin(uid)
-        states.pop(message.from_user.id, None)
-        bot.send_message(
-            message.chat.id,
-            f"✅ Sub-admin <code>{uid}</code> removed.",
-            reply_markup=admin_keyboard()
-        )
+        audit(call.from_user.id, "REMOVE_SUBADMIN", uid)
+        bot.answer_callback_query(call.id, "Removed")
+        adm_subadmins(call)
     except Exception:
-        bot.send_message(message.chat.id, "❌ Invalid user ID.")
+        bot.answer_callback_query(call.id, "Failed")
 
 
 # ============================================================
-# SETTINGS
+
 # ============================================================
 
 @bot.callback_query_handler(func=lambda c: c.data == "adm_settings")
@@ -2153,6 +2279,8 @@ def adm_settings(call):
         types.InlineKeyboardButton("📖 Edit Trading Rules", callback_data="set_rules")
     )
     kb.add(types.InlineKeyboardButton("👤 User Free Limit", callback_data="set_user_limit"))
+    kb.add(types.InlineKeyboardButton(f"🔔 Notifications {'ON' if notifications_enabled_global() else 'OFF'}", callback_data="set_notifications"))
+    kb.add(types.InlineKeyboardButton("🎯 Confidence Label", callback_data="set_confidence"))
     kb.add(types.InlineKeyboardButton("⬅️ Admin Panel", callback_data="adm_home"))
     bot.edit_message_text(
         "⚙️ <b>SETTINGS</b>\n\n"
@@ -2171,7 +2299,7 @@ def setting_prompt(call, action, text):
         return
     states[call.from_user.id] = {"action": action}
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, text + "\n\n/cancel দিয়ে বাতিল করতে পারো。")
+    bot.send_message(call.message.chat.id, text + "\n\n/cancel দিয়ে বাতিল করতে পারো।")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_withdraw")
@@ -2190,7 +2318,7 @@ def set_hold(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_free_limit")
 def set_free_limit(call):
-    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও。\nExample: 6")
+    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও।\nExample: 6")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_ref_bonus")
@@ -2215,7 +2343,7 @@ def set_notice(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_rules")
 def set_rules(call):
-    setting_prompt(call, "set_rules", "📖 নতুন Trading Rules text পাঠাও。")
+    setting_prompt(call, "set_rules", "📖 নতুন Trading Rules text পাঠাও।")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_user_limit")
@@ -2246,8 +2374,12 @@ def save_setting_state(message):
             set_setting("vip_deposit_cents", cents)
             result = f"⭐ VIP deposit এখন ${cents/100:.2f}"
         elif action == "set_notice":
-            set_setting("notice", value)
+            set_setting("notice", value[:4000])
             result = "📢 Notice updated."
+        elif action == "set_confidence":
+            if len(value) > 50: raise ValueError
+            set_setting("signal_confidence", value)
+            result = f"🎯 Confidence label: {escape(value)}"
         elif action == "set_rules":
             set_setting("trading_rules", value)
             result = "📖 Trading Rules updated."
@@ -2270,6 +2402,73 @@ def save_setting_state(message):
     except Exception:
         bot.send_message(message.chat.id, "❌ Format ভুল। আবার চেষ্টা করো।")
         return True
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_notifications")
+def set_notifications(call):
+    if not is_master(call.from_user.id):
+        return
+    set_setting("notifications_enabled", "0" if notifications_enabled_global() else "1")
+    audit(call.from_user.id, "TOGGLE_GLOBAL_NOTIFICATIONS", None, get_setting("notifications_enabled"))
+    adm_settings(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_confidence")
+def set_confidence(call):
+    setting_prompt(call, "set_confidence", "🎯 Signal confidence label কী হবে?\nExample: 95–99%\nএটি guarantee নয়; শুধু stated confidence label হিসেবে দেখানো হবে।")
+
+
+# ============================================================
+# NOTIFICATION ADMIN
+# ============================================================
+
+def broadcast_notice_to_users(admin_chat_id):
+    text = get_setting("notice", "").strip()
+    if not text:
+        bot.send_message(admin_chat_id, "📢 আগে Notice সেট করো।")
+        return
+    with db_lock:
+        conn = db()
+        try:
+            rows = conn.execute("SELECT user_id FROM users WHERE blocked=0").fetchall()
+        finally:
+            conn.close()
+    sent = failed = 0
+    for r in rows:
+        try:
+            bot.send_message(r["user_id"], "📢 <b>NOTICE</b>\n\n" + escape(text))
+            sent += 1
+            time.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            if any(x in str(e).lower() for x in ("blocked", "chat not found", "deactivated")):
+                with db_lock:
+                    conn=db()
+                    try:
+                        conn.execute("UPDATE users SET blocked=1 WHERE user_id=?", (r["user_id"],)); conn.commit()
+                    finally: conn.close()
+    bot.send_message(admin_chat_id, f"📢 Notice sent.\n\n✅ Sent: {sent}\n❌ Failed: {failed}", reply_markup=admin_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_notifications")
+def adm_notifications(call):
+    if not is_master(call.from_user.id):
+        bot.answer_callback_query(call.id, "Master Admin only.")
+        return
+    bot.edit_message_text(
+        "🔔 <b>NOTIFICATION SETTINGS</b>\n\n"
+        f"Global scheduled notifications: <b>{'ON' if notifications_enabled_global() else 'OFF'}</b>\n"
+        "Users can individually turn notifications ON/OFF from their menu.",
+        call.message.chat.id, call.message.message_id, reply_markup=back_admin_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_notice_send")
+def adm_notice_send(call):
+    if not is_master(call.from_user.id):
+        bot.answer_callback_query(call.id, "Master Admin only.")
+        return
+    bot.answer_callback_query(call.id, "Sending...")
+    broadcast_notice_to_users(call.message.chat.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_maintenance")
@@ -2299,7 +2498,7 @@ def state_handler(message):
     if save_manage_user_state(message):
         return
 
-    if action in {"set_free_limit", "set_ref_bonus", "set_min_withdraw", "set_vip_deposit", "set_notice", "set_rules", "set_user_limit"}:
+    if action in {"set_free_limit", "set_ref_bonus", "set_min_withdraw", "set_vip_deposit", "set_notice", "set_rules", "set_user_limit", "set_confidence"}:
         save_setting_state(message)
     elif action == "uid":
         save_uid(message)
@@ -2311,10 +2510,17 @@ def state_handler(message):
         save_wallet_adjust(message)
     elif action == "broadcast":
         do_broadcast(message)
-    elif action == "sub_add":
-        save_subadmin(message)
-    elif action == "sub_remove":
-        save_sub_remove(message)
+    elif action == "sub_add_id":
+        try:
+            uid = int((message.text or '').strip())
+            if uid == ADMIN_ID: raise ValueError
+            if not get_user(uid):
+                bot.send_message(message.chat.id, "❌ আগে ওই user-কে Bot-এ /start দিতে হবে।")
+                return
+            states.pop(message.from_user.id, None)
+            show_sub_permissions(message.chat.id, uid, set())
+        except Exception:
+            bot.send_message(message.chat.id, "❌ সঠিক Telegram ID দাও।")
 
 
 # ============================================================
@@ -2331,6 +2537,80 @@ def fallback(message):
         "আমি এই option বুঝতে পারিনি। নিচের menu ব্যবহার করুন।",
         reply_markup=main_keyboard(message.from_user.id)
     )
+
+
+# ============================================================
+# AUTOMATIC SIGNAL NOTIFICATIONS
+# ============================================================
+
+def send_due_signal_notifications():
+    if not notifications_enabled_global():
+        return
+    current = utc_iso(now_utc())
+    with db_lock:
+        conn = db()
+        try:
+            signals = conn.execute("SELECT * FROM signals WHERE signal_at_utc <= ? ORDER BY signal_at_utc ASC LIMIT 20", (current,)).fetchall()
+            users = conn.execute("SELECT user_id FROM users WHERE blocked=0 AND notifications_enabled=1").fetchall()
+        finally:
+            conn.close()
+    for signal in signals:
+        for u in users:
+            uid = u["user_id"]
+            with db_lock:
+                conn = db()
+                try:
+                    already = conn.execute("SELECT 1 FROM signal_notifications WHERE user_id=? AND signal_id=?", (uid, signal["id"])).fetchone()
+                finally:
+                    conn.close()
+            if already:
+                continue
+            ok, reason = deliver_signal(uid, signal["id"])
+            if not ok:
+                if reason in ("limit", "already"):
+                    if reason == "already":
+                        with db_lock:
+                            conn=db()
+                            try:
+                                conn.execute("INSERT OR IGNORE INTO signal_notifications(user_id,signal_id,sent_at) VALUES(?,?,?)", (uid, signal["id"], utc_iso(now_utc()))); conn.commit()
+                            finally: conn.close()
+                continue
+            process_referral_bonus(uid)
+            t = bd_from_iso(signal["signal_at_utc"])
+            user = get_user(uid)
+            quota = "♾️ VIP Unlimited" if user and user["status"] == "VIP" else f"🎟️ Remaining: <b>{max(0, free_signal_limit_for(uid)-user['free_used'])}/{free_signal_limit_for(uid)}</b>"
+            msg = (
+                "🔔 <b>SIGNAL ALERT</b>\n\n"
+                f"🕐 BD Time: <b>{t.strftime('%d-%m-%Y')}</b> <b>{format_signal_time(t)}</b>\n"
+                f"{format_signal_text(signal['signal_text'])}\n\n"
+                f"{quota}\n"
+                f"🎯 Stated confidence: <b>{escape(signal_confidence())}</b>\n"
+                "📌 Confidence is a stated estimate, not a guarantee."
+            )
+            try:
+                bot.send_message(uid, msg)
+                with db_lock:
+                    conn=db()
+                    try:
+                        conn.execute("INSERT OR IGNORE INTO signal_notifications(user_id,signal_id,sent_at) VALUES(?,?,?)", (uid, signal["id"], utc_iso(now_utc()))); conn.commit()
+                    finally: conn.close()
+            except Exception as e:
+                low = str(e).lower()
+                if "blocked" in low or "chat not found" in low or "deactivated" in low:
+                    with db_lock:
+                        conn=db()
+                        try:
+                            conn.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,)); conn.commit()
+                        finally: conn.close()
+
+
+def notification_loop():
+    while True:
+        try:
+            send_due_signal_notifications()
+        except Exception:
+            logger.exception("notification loop error")
+        time.sleep(10)
 
 
 # ============================================================
@@ -2396,6 +2676,11 @@ def main():
 
     threading.Thread(
         target=backup_loop,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=notification_loop,
         daemon=True
     ).start()
 
