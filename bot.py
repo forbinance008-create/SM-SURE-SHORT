@@ -26,8 +26,9 @@ BD_TZ = ZoneInfo("Asia/Dhaka")
 UTC = timezone.utc
 
 FREE_SIGNALS_PER_CYCLE = 4
-REFERRAL_BONUS_CENTS = 100       # $1.00
-MIN_WITHDRAW_CENTS = 500         # $5.00
+REFERRAL_BONUS_CENTS = 100       # default $1.00
+MIN_WITHDRAW_CENTS = 500         # default $5.00
+VIP_DEPOSIT_CENTS = 1500        # default $15.00
 
 # Optional: keep your own referral URL here if you use one.
 QUOTEX_REF_LINK = os.getenv(
@@ -203,11 +204,26 @@ def init_db():
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_limits (
+                user_id INTEGER PRIMARY KEY,
+                free_limit INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+
             INSERT OR IGNORE INTO settings(key, value)
                 VALUES('maintenance', '0');
 
             INSERT OR IGNORE INTO settings(key, value)
                 VALUES('live_mode', '1');
+
+            INSERT OR IGNORE INTO settings(key, value) VALUES('free_signal_limit', '4');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('referral_bonus_cents', '100');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('min_withdraw_cents', '500');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('vip_deposit_cents', '1500');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('withdraw_enabled', '1');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('withdraw_hold', '0');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('notice', '');
+            INSERT OR IGNORE INTO settings(key, value) VALUES('trading_rules', 'Trade responsibly. Use proper money management and do not risk money you cannot afford to lose.');
             """)
             conn.commit()
         finally:
@@ -224,6 +240,63 @@ def get_setting(key, default=None):
             return row["value"] if row else default
         finally:
             conn.close()
+
+
+def get_int_setting(key, default):
+    try:
+        return int(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def free_signal_limit():
+    return max(0, get_int_setting("free_signal_limit", FREE_SIGNALS_PER_CYCLE))
+
+
+def free_signal_limit_for(user_id):
+    with db_lock:
+        conn = db()
+        try:
+            row = conn.execute("SELECT free_limit FROM user_limits WHERE user_id=?", (user_id,)).fetchone()
+            return max(0, int(row["free_limit"])) if row else free_signal_limit()
+        finally:
+            conn.close()
+
+
+def set_user_free_limit(user_id, limit):
+    with db_lock:
+        conn = db()
+        try:
+            if not conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone():
+                return False
+            if limit is None:
+                conn.execute("DELETE FROM user_limits WHERE user_id=?", (user_id,))
+            else:
+                conn.execute("INSERT INTO user_limits(user_id,free_limit) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET free_limit=excluded.free_limit", (user_id, max(0, int(limit))))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def referral_bonus_cents():
+    return max(0, get_int_setting("referral_bonus_cents", REFERRAL_BONUS_CENTS))
+
+
+def min_withdraw_cents():
+    return max(0, get_int_setting("min_withdraw_cents", 500))
+
+
+def vip_deposit_cents():
+    return max(0, get_int_setting("vip_deposit_cents", VIP_DEPOSIT_CENTS))
+
+
+def withdraw_enabled():
+    return get_setting("withdraw_enabled", "1") == "1"
+
+
+def withdraw_hold():
+    return get_setting("withdraw_hold", "0") == "1"
 
 
 def set_setting(key, value):
@@ -397,7 +470,7 @@ def process_referral_bonus(user_id):
                 SET wallet_cents=wallet_cents+?,
                     refs_count=refs_count+1
                 WHERE user_id=?
-            """, (REFERRAL_BONUS_CENTS, referrer))
+            """, (referral_bonus_cents(), referrer))
 
             new_balance = conn.execute(
                 "SELECT wallet_cents FROM users WHERE user_id=?",
@@ -409,7 +482,7 @@ def process_referral_bonus(user_id):
                     user_id,type,amount_cents,balance_after_cents,note,created_at
                 ) VALUES(?,?,?,?,?,?)
             """, (
-                referrer, "REFERRAL_BONUS", REFERRAL_BONUS_CENTS,
+                referrer, "REFERRAL_BONUS", referral_bonus_cents(),
                 new_balance, f"Referral bonus from user {user_id}",
                 utc_iso(now_utc())
             ))
@@ -423,7 +496,7 @@ def process_referral_bonus(user_id):
                 bot.send_message(
                     referrer,
                     "🎉 <b>Referral Bonus</b>\n\n"
-                    f"আপনার wallet-এ <b>${REFERRAL_BONUS_CENTS/100:.2f}</b> "
+                    f"আপনার wallet-এ <b>${referral_bonus_cents()/100:.2f}</b> "
                     "referral bonus যোগ হয়েছে।"
                 )
             except Exception:
@@ -443,41 +516,71 @@ def parse_signal_line(line):
     if not line:
         return None
 
-    m = re.match(
-        r"^(\d{1,2}):(\d{2})\s*[-|]\s*(.+)$",
-        line
-    )
+    # Supports 24h: 13:27 - EUR/USD - UP
+    # Supports 12h: 9:27 AM - EUR/USD - UP
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?\s*[-|]\s*(.+)$", line, re.I)
     if m:
         hour, minute = int(m.group(1)), int(m.group(2))
-        if hour > 23 or minute > 59:
+        ap = (m.group(3) or "").upper()
+        if minute > 59:
             return None
-
-        target = datetime.combine(
-            now_bd().date(),
-            dt_time(hour, minute),
-            tzinfo=BD_TZ
-        )
+        if ap:
+            if hour < 1 or hour > 12:
+                return None
+            if ap == "AM" and hour == 12:
+                hour = 0
+            elif ap == "PM" and hour != 12:
+                hour += 12
+        elif hour > 23:
+            return None
+        target = datetime.combine(now_bd().date(), dt_time(hour, minute), tzinfo=BD_TZ)
         if target <= now_bd():
             target += timedelta(days=1)
-
-        return m.group(3).strip(), target
-
-    m = re.match(
-        r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*[-|]\s*(.+)$",
-        line
-    )
-    if m:
-        try:
-            target = datetime.strptime(
-                f"{m.group(1)} {int(m.group(2)):02d}:{int(m.group(3)):02d}",
-                "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=BD_TZ)
-        except ValueError:
-            return None
-
         return m.group(4).strip(), target
 
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*(AM|PM)?\s*[-|]\s*(.+)$", line, re.I)
+    if m:
+        hour, minute = int(m.group(2)), int(m.group(3))
+        ap = (m.group(4) or "").upper()
+        if minute > 59:
+            return None
+        if ap:
+            if hour < 1 or hour > 12:
+                return None
+            if ap == "AM" and hour == 12:
+                hour = 0
+            elif ap == "PM" and hour != 12:
+                hour += 12
+        elif hour > 23:
+            return None
+        try:
+            target = datetime.strptime(m.group(1), "%Y-%m-%d").replace(
+                hour=hour, minute=minute, tzinfo=BD_TZ
+            )
+        except ValueError:
+            return None
+        return m.group(5).strip(), target
+
     return None
+
+
+def format_signal_time(dt):
+    # AM is shown in normal 12-hour form; PM is shown in 24-hour form.
+    if dt.hour < 12:
+        return dt.strftime("%I:%M AM").lstrip("0")
+    return dt.strftime("%H:%M")
+
+
+def format_signal_text(raw):
+    raw = raw.strip()
+    m = re.match(r"^(.+?)\s*[-|]\s*(UP|BUY|CALL|DOWN|SELL|PUT)\s*$", raw, re.I)
+    if m:
+        pair = m.group(1).strip().upper()
+        direction = m.group(2).upper()
+        if direction in {"UP", "BUY", "CALL"}:
+            return f"📌 <b>{escape(pair)}</b>\n🟢 ⬆️ <b>UP / BUY</b>"
+        return f"📌 <b>{escape(pair)}</b>\n🔴 ⬇️ <b>DOWN / SELL</b>"
+    return f"📌 <b>{escape(raw)}</b>"
 
 
 def add_signals(text):
@@ -564,7 +667,7 @@ def deliver_signal(user_id, signal_id):
                         WHERE user_id=?
                     """, (ck, user_id))
 
-                if used >= FREE_SIGNALS_PER_CYCLE:
+                if used >= free_signal_limit_for(user_id):
                     conn.commit()
                     return False, "limit"
 
@@ -655,10 +758,13 @@ def remove_subadmin(user_id):
 
 def main_keyboard(user_id):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📊 Future Signals", "⚡ Live Signals")
-    kb.row("🆔 Submit Quotex UID", "👤 My Status")
+    kb.row("📢 Notice", "📊 Future Signals")
+    kb.row("⚡ Live Signals", "👤 My Status")
     kb.row("💰 Wallet", "👥 Referral Link")
-    kb.row("📖 VIP Rules")
+    kb.row("⭐ VIP Rules", "📖 Trading Rules")
+    u = get_user(user_id)
+    if not u or u["status"] != "VIP":
+        kb.row("🆔 Submit Quotex UID")
     if is_admin(user_id):
         kb.row("👑 Admin Control")
     return kb
@@ -687,6 +793,7 @@ def admin_keyboard():
         types.InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings")
     )
     kb.add(
+        types.InlineKeyboardButton("👤 Manage User", callback_data="adm_manage_user"),
         types.InlineKeyboardButton("🗑 Clear Future", callback_data="adm_clear")
     )
     return kb
@@ -720,9 +827,8 @@ def start_cmd(message):
             message.chat.id,
             "🎉 <b>Welcome!</b>\n\n"
             "আপনার account তৈরি হয়েছে।\n\n"
-            f"🎟️ Non-VIP: প্রতি ২ দিনে সর্বোচ্চ "
-            f"<b>{FREE_SIGNALS_PER_CYCLE}টি</b> free signal.\n"
-            "⭐ VIP: এই limit নেই।\n\n"
+            f"🎟️ Free: প্রতি ২ দিনে সর্বোচ্চ <b>{free_signal_limit()}টি</b> signal.\n"
+            f"⭐ VIP: <b>${vip_deposit_cents()/100:.2f}</b> deposit করে join করা যাবে.\n\n"
             "⚠️ Signals informational only; কোনো profit guarantee নেই।",
             reply_markup=main_keyboard(message.from_user.id)
         )
@@ -761,12 +867,12 @@ def future_signal_cmd(message):
     ensure_cycle(uid)
     user = get_user(uid)
 
-    if user["status"] != "VIP" and user["free_used"] >= FREE_SIGNALS_PER_CYCLE:
+    if user["status"] != "VIP" and user["free_used"] >= free_signal_limit_for(uid):
         bot.send_message(
             message.chat.id,
             "⛔ <b>Free signal quota শেষ</b>\n\n"
-            f"এই ২ দিনের cycle-এ আপনার {FREE_SIGNALS_PER_CYCLE}টি signal শেষ হয়েছে।\n"
-            "পরবর্তী cycle শুরু হলে quota আবার reset হবে।\n\n"
+            f"এই ২ দিনের cycle-এ আপনার {free_signal_limit()}টি signal শেষ হয়েছে।\n"
+            "পরবর্তী cycle শুরু হলে quota আবার reset হবে。\n\n"
             "⭐ VIP হলে এই limit থাকবে না।"
         )
         return
@@ -793,10 +899,10 @@ def future_signal_cmd(message):
     if after["status"] == "VIP":
         quota = "♾️ VIP Unlimited"
     else:
-        remaining = max(0, FREE_SIGNALS_PER_CYCLE - after["free_used"])
+        remaining = max(0, free_signal_limit_for(uid) - after["free_used"])
         quota = (
             f"🎟️ Remaining: <b>{remaining}/"
-            f"{FREE_SIGNALS_PER_CYCLE}</b>"
+            f"{free_signal_limit_for(uid)}</b>"
         )
 
     kb = types.InlineKeyboardMarkup()
@@ -812,8 +918,8 @@ def future_signal_cmd(message):
     bot.send_message(
         message.chat.id,
         "📊 <b>FUTURE SIGNAL</b>\n\n"
-        f"🕐 BD Time: <b>{t.strftime('%d-%m-%Y %I:%M %p')}</b>\n"
-        f"📌 <b>{escape(signal['signal_text'])}</b>\n\n"
+        f"🕐 BD Time: <b>{t.strftime('%d-%m-%Y')}</b> <b>{format_signal_time(t)}</b>\n"
+        f"{format_signal_text(signal['signal_text'])}\n\n"
         f"{quota}\n\n"
         "⚠️ Informational only. No guaranteed profit.",
         reply_markup=kb
@@ -874,7 +980,7 @@ def status_cmd(message):
     if u["status"] == "VIP":
         quota = "♾️ Unlimited"
     else:
-        quota = f"{max(0, FREE_SIGNALS_PER_CYCLE-u['free_used'])}/{FREE_SIGNALS_PER_CYCLE}"
+        quota = f"{max(0, free_signal_limit_for(message.from_user.id)-u['free_used'])}/{free_signal_limit_for(message.from_user.id)}"
 
     bot.send_message(
         message.chat.id,
@@ -888,16 +994,19 @@ def status_cmd(message):
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "📖 VIP Rules")
+@bot.message_handler(func=lambda m: m.text == "⭐ VIP Rules")
 def vip_rules(message):
+    deposit = vip_deposit_cents() / 100
+    limit = free_signal_limit()
     bot.send_message(
         message.chat.id,
-        "⭐ <b>VIP</b>\n\n"
-        "VIP user-এর Future Signal limit থাকবে না。\n\n"
-        f"👤 Non-VIP: প্রতি ২ দিনে {FREE_SIGNALS_PER_CYCLE}টি free signal.\n\n"
-        "UID verification admin-এর মাধ্যমে করা হবে।\n\n"
-        f"🔗 Referral/registration link:\n{escape(QUOTEX_REF_LINK)}\n\n"
-        "⚠️ কোনো guaranteed profit claim করা হচ্ছে না।"
+        "⭐ <b>VIP RULES</b>\n\n"
+        f"💵 VIP join/deposit: <b>${deposit:.2f}</b>\n"
+        f"🎟️ Non-VIP: প্রতি ২ দিনে <b>{limit}টি</b> free signal.\n"
+        "♾️ VIP: Future Signal limit নেই.\n"
+        "🆔 UID verification admin-এর মাধ্যমে হবে.\n\n"
+        "📌 VIP join করার জন্য admin-এর নির্দেশনা অনুসরণ করুন.\n\n"
+        "⚠️ Signals informational only; profit guarantee নেই."
     )
 
 
@@ -910,11 +1019,30 @@ def referral_cmd(message):
             message.chat.id,
             "👥 <b>Your Referral Link</b>\n\n"
             f"<code>{link}</code>\n\n"
-            f"Successful referral bonus: <b>${REFERRAL_BONUS_CENTS/100:.2f}</b> "
+            f"Successful referral bonus: <b>${referral_bonus_cents()/100:.2f}</b> "
             "once per referred user."
         )
     except Exception:
         bot.send_message(message.chat.id, "❌ Referral link তৈরি করা যায়নি।")
+
+
+# ============================================================
+# NOTICE / TRADING RULES
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text == "📢 Notice")
+def notice_cmd(message):
+    notice = get_setting("notice", "").strip()
+    if not notice:
+        bot.send_message(message.chat.id, "📢 <b>NOTICE</b>\n\nকোনো নতুন notice নেই।")
+        return
+    bot.send_message(message.chat.id, "📢 <b>NOTICE</b>\n\n" + escape(notice))
+
+
+@bot.message_handler(func=lambda m: m.text == "📖 Trading Rules")
+def trading_rules_cmd(message):
+    rules = get_setting("trading_rules", "Trade responsibly.").strip()
+    bot.send_message(message.chat.id, "📖 <b>TRADING RULES</b>\n\n" + escape(rules))
 
 
 # ============================================================
@@ -931,7 +1059,18 @@ def uid_start(message):
 
     u = get_user(uid)
     if u and u["status"] == "VIP":
-        bot.send_message(message.chat.id, "⭐ আপনি ইতিমধ্যে VIP।")
+        bot.send_message(message.chat.id, "⭐ আপনি ইতিমধ্যে VIP। UID আবার submit করার প্রয়োজন নেই।")
+        return
+    with db_lock:
+        conn = db()
+        try:
+            pending = conn.execute(
+                "SELECT id FROM uid_submissions WHERE user_id=? AND status='PENDING' LIMIT 1", (uid,)
+            ).fetchone()
+        finally:
+            conn.close()
+    if pending:
+        bot.send_message(message.chat.id, "⏳ আপনার UID already pending আছে। Admin review শেষ হওয়া পর্যন্ত আবার submit করা যাবে না।")
         return
 
     states[uid] = {"action": "uid"}
@@ -1015,7 +1154,7 @@ def uid_review(call):
             try:
                 row = conn.execute("""
                     SELECT * FROM uid_submissions
-                    WHERE id=? AND status='PENDING'
+                    WHERE id=? AND status IN ('PENDING','HOLD')
                 """, (sid,)).fetchone()
 
                 if not row:
@@ -1081,7 +1220,7 @@ def wallet_cmd(message):
         message.chat.id,
         f"💰 <b>Wallet</b>\n\n"
         f"Balance: <b>${balance:.2f}</b>\n"
-        f"Minimum withdraw: <b>${MIN_WITHDRAW_CENTS/100:.2f}</b>",
+        f"Minimum withdraw: <b>${min_withdraw_cents()/100:.2f}</b>",
         reply_markup=kb
     )
 
@@ -1092,10 +1231,18 @@ def withdraw_start(call):
         bot.answer_callback_query(call.id, "Maintenance mode.")
         return
 
-    if wallet_balance(call.from_user.id) < MIN_WITHDRAW_CENTS:
+    if not withdraw_enabled():
+        bot.answer_callback_query(call.id, "Withdraw is currently disabled.")
+        return
+
+    if withdraw_hold():
+        bot.answer_callback_query(call.id, "Withdrawals are currently on hold.")
+        return
+
+    if wallet_balance(call.from_user.id) < min_withdraw_cents():
         bot.answer_callback_query(
             call.id,
-            f"Minimum ${MIN_WITHDRAW_CENTS/100:.2f} required."
+            f"Minimum ${min_withdraw_cents()/100:.2f} required."
         )
         return
 
@@ -1135,12 +1282,13 @@ def create_withdraw(user_id, amount_cents, method, account):
                 utc_iso(now_utc())
             ))
 
+            withdrawal_status = "HOLD" if withdraw_hold() else "PENDING"
             cur = conn.execute("""
                 INSERT INTO withdrawals(
                     user_id,amount_cents,method,account,status,created_at
-                ) VALUES(?,?,?,?,'PENDING',?)
+                ) VALUES(?,?,?,?,?,?)
             """, (
-                user_id, amount_cents, method, account,
+                user_id, amount_cents, method, account, withdrawal_status,
                 utc_iso(now_utc())
             ))
 
@@ -1166,10 +1314,10 @@ def finish_withdraw(message):
             bot.send_message(message.chat.id, "❌ শুধু amount দাও। Example: 5")
             return
 
-        if cents < MIN_WITHDRAW_CENTS:
+        if cents < min_withdraw_cents():
             bot.send_message(
                 message.chat.id,
-                f"❌ Minimum ${MIN_WITHDRAW_CENTS/100:.2f}."
+                f"❌ Minimum ${min_withdraw_cents()/100:.2f}."
             )
             return
 
@@ -1181,7 +1329,7 @@ def finish_withdraw(message):
         state["action"] = "withdraw_method"
         bot.send_message(
             message.chat.id,
-            "💳 Payment method পাঠাও।\nExample: bKash / Bank / অন্য method"
+            "💳 Payment method পাঠাও。\nExample: bKash / Bank / অন্য method"
         )
         return
 
@@ -1367,7 +1515,7 @@ def adm_add_signal(call):
     bot.answer_callback_query(call.id)
     bot.send_message(
         call.message.chat.id,
-        "➕ Signal পাঠাও।\n\n"
+        "➕ Signal পাঠাও。\n\n"
         "<code>18:30 - EUR/USD - CALL</code>\n"
         "অথবা\n"
         "<code>2026-09-17 18:30 - EUR/USD - CALL</code>\n\n"
@@ -1415,7 +1563,7 @@ def adm_signals(call):
         for r in rows:
             t = bd_from_iso(r["signal_at_utc"])
             lines.append(
-                f"#{r['id']} | {t.strftime('%d-%m %I:%M %p')} | "
+                f"#{r['id']} | {t.strftime('%d-%m')} {format_signal_time(t)} | "
                 f"{escape(r['signal_text'])}"
             )
         text = "\n".join(lines)
@@ -1519,7 +1667,7 @@ def adm_withdrawals(call):
         try:
             rows = conn.execute("""
                 SELECT * FROM withdrawals
-                WHERE status='PENDING'
+                WHERE status IN ('PENDING','HOLD')
                 ORDER BY id ASC
                 LIMIT 20
             """).fetchall()
@@ -1580,6 +1728,103 @@ def adm_users(call):
         "\n".join(lines) if rows else "No users.",
         reply_markup=back_admin_keyboard()
     )
+
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_manage_user")
+def adm_manage_user(call):
+    if not can(call.from_user.id, "users"):
+        bot.answer_callback_query(call.id, "Access denied.")
+        return
+    states[call.from_user.id] = {"action": "manage_user"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "👤 যে user manage করবে তার Telegram ID পাঠাও।")
+
+
+def manage_user_menu(chat_id, user_id):
+    u = get_user(user_id)
+    if not u:
+        bot.send_message(chat_id, "❌ User পাওয়া যায়নি।", reply_markup=admin_keyboard())
+        return
+    limit = free_signal_limit_for(user_id)
+    custom = limit != free_signal_limit()
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    if u["status"] == "VIP":
+        kb.add(types.InlineKeyboardButton("❌ Remove VIP", callback_data=f"user_vip_no_{user_id}"))
+    else:
+        kb.add(types.InlineKeyboardButton("⭐ Make VIP", callback_data=f"user_vip_yes_{user_id}"))
+    kb.add(types.InlineKeyboardButton("🎟️ Set Free Limit", callback_data=f"user_limit_{user_id}"))
+    kb.add(types.InlineKeyboardButton("♻️ Global Default", callback_data=f"user_default_{user_id}"))
+    bot.send_message(chat_id,
+        f"👤 <b>USER</b>\n\nID: <code>{user_id}</code>\n"
+        f"Status: <b>{u['status']}</b>\n"
+        f"Wallet: <b>${u['wallet_cents']/100:.2f}</b>\n"
+        f"Free limit: <b>{limit}</b> / 2 days {'(custom)' if custom else '(global)'}",
+        reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_vip_"))
+def user_vip_toggle(call):
+    if not can(call.from_user.id, "users"):
+        return
+    try:
+        _, _, decision, uid = call.data.split("_")
+        uid = int(uid)
+        set_vip(uid, decision == "yes")
+        bot.answer_callback_query(call.id, "Updated.")
+        manage_user_menu(call.message.chat.id, uid)
+        try:
+            bot.send_message(uid, "⭐ আপনার VIP status update করা হয়েছে: " + ("VIP Active" if decision == "yes" else "VIP Removed"), reply_markup=main_keyboard(uid))
+        except Exception:
+            pass
+    except Exception:
+        bot.answer_callback_query(call.id, "Update failed.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_limit_"))
+def user_limit_prompt(call):
+    if not can(call.from_user.id, "users"): return
+    uid = int(call.data.rsplit("_", 1)[1])
+    states[call.from_user.id] = {"action": "set_user_limit_direct", "target_user": uid}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"🎟️ User <code>{uid}</code>-এর free signal limit কত হবে? শুধু number পাঠাও。")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_default_"))
+def user_default(call):
+    if not can(call.from_user.id, "users"): return
+    uid = int(call.data.rsplit("_", 1)[1])
+    if set_user_free_limit(uid, None):
+        bot.answer_callback_query(call.id, "Global default applied.")
+        manage_user_menu(call.message.chat.id, uid)
+    else:
+        bot.answer_callback_query(call.id, "User not found.")
+
+
+def save_manage_user_state(message):
+    action = states.get(message.from_user.id, {}).get("action")
+    if action == "manage_user":
+        try:
+            uid = int(message.text.strip())
+            states.pop(message.from_user.id, None)
+            manage_user_menu(message.chat.id, uid)
+        except Exception:
+            bot.send_message(message.chat.id, "❌ Invalid Telegram ID.")
+        return True
+    if action == "set_user_limit_direct":
+        try:
+            uid = int(states[message.from_user.id]["target_user"])
+            limit = int(message.text.strip())
+            if limit < 0: raise ValueError
+            if set_user_free_limit(uid, limit):
+                states.pop(message.from_user.id, None)
+                manage_user_menu(message.chat.id, uid)
+            else:
+                bot.send_message(message.chat.id, "❌ User not found.")
+        except Exception:
+            bot.send_message(message.chat.id, "❌ শুধু 0 বা তার বেশি number দাও।")
+        return True
+    return False
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "adm_analytics")
@@ -1667,7 +1912,7 @@ def save_wallet_adjust(message):
         states.pop(message.from_user.id, None)
 
         if not ok:
-            bot.send_message(message.chat.id, "❌ User নেই অথবা balance negative হবে।")
+            bot.send_message(message.chat.id, "❌ User নেই অথবা balance negative হবে。")
             return
 
         bot.send_message(
@@ -1681,7 +1926,7 @@ def save_wallet_adjust(message):
         try:
             bot.send_message(
                 user_id,
-                f"💰 আপনার wallet update হয়েছে।\n"
+                f"💰 আপনার wallet update হয়েছে。\n"
                 f"New balance: <b>${balance/100:.2f}</b>"
             )
         except Exception:
@@ -1690,7 +1935,7 @@ def save_wallet_adjust(message):
     except Exception:
         bot.send_message(
             message.chat.id,
-            "❌ Format ভুল। Example: <code>123456789 5</code>"
+            "❌ Format ভুল。 Example: <code>123456789 5</code>"
         )
 
 
@@ -1707,8 +1952,8 @@ def adm_broadcast(call):
     bot.answer_callback_query(call.id)
     bot.send_message(
         call.message.chat.id,
-        "📢 Broadcast message পাঠাও।\n\n"
-        "এই message সব registered users-এর কাছে যাবে।"
+        "📢 Broadcast message পাঠাও。\n\n"
+        "এই message সব registered users-এর কাছে যাবে。"
     )
 
 
@@ -1882,42 +2127,154 @@ def adm_settings(call):
     if not is_master(call.from_user.id):
         bot.answer_callback_query(call.id, "Master Admin only.")
         return
-
     maintenance = get_setting("maintenance", "0") == "1"
     live = get_setting("live_mode", "1") == "1"
-
+    wd = withdraw_enabled()
+    hold = withdraw_hold()
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton(
-            f"Maintenance {'ON' if maintenance else 'OFF'}",
-            callback_data="set_maintenance"
-        ),
-        types.InlineKeyboardButton(
-            f"Live {'ON' if live else 'OFF'}",
-            callback_data="set_live"
-        )
+        types.InlineKeyboardButton(f"Maintenance {'ON' if maintenance else 'OFF'}", callback_data="set_maintenance"),
+        types.InlineKeyboardButton(f"Live {'ON' if live else 'OFF'}", callback_data="set_live")
     )
     kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Admin Panel", callback_data="adm_home"
-        )
+        types.InlineKeyboardButton(f"Withdraw {'ON' if wd else 'OFF'}", callback_data="set_withdraw"),
+        types.InlineKeyboardButton(f"Hold {'ON' if hold else 'OFF'}", callback_data="set_hold")
     )
-
+    kb.add(
+        types.InlineKeyboardButton("🎟️ Free Limit", callback_data="set_free_limit"),
+        types.InlineKeyboardButton("🎁 Referral Bonus", callback_data="set_ref_bonus")
+    )
+    kb.add(
+        types.InlineKeyboardButton("💵 Min Withdraw", callback_data="set_min_withdraw"),
+        types.InlineKeyboardButton("⭐ VIP Deposit", callback_data="set_vip_deposit")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📢 Edit Notice", callback_data="set_notice"),
+        types.InlineKeyboardButton("📖 Edit Trading Rules", callback_data="set_rules")
+    )
+    kb.add(types.InlineKeyboardButton("👤 User Free Limit", callback_data="set_user_limit"))
+    kb.add(types.InlineKeyboardButton("⬅️ Admin Panel", callback_data="adm_home"))
     bot.edit_message_text(
         "⚙️ <b>SETTINGS</b>\n\n"
-        f"Maintenance: <b>{'ON' if maintenance else 'OFF'}</b>\n"
-        f"Live mode: <b>{'ON' if live else 'OFF'}</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
+        f"🎟️ Global free signal: <b>{free_signal_limit()}</b> / 2 days\n"
+        f"🎁 Referral bonus: <b>${referral_bonus_cents()/100:.2f}</b>\n"
+        f"💵 Minimum withdraw: <b>${min_withdraw_cents()/100:.2f}</b>\n"
+        f"⭐ VIP deposit: <b>${vip_deposit_cents()/100:.2f}</b>\n"
+        f"💸 Withdraw: <b>{'ON' if wd else 'OFF'}</b> | Hold: <b>{'ON' if hold else 'OFF'}</b>\n"
+        f"🛠️ Maintenance: <b>{'ON' if maintenance else 'OFF'}</b> | Live: <b>{'ON' if live else 'OFF'}</b>",
+        call.message.chat.id, call.message.message_id, reply_markup=kb
     )
+
+
+def setting_prompt(call, action, text):
+    if not is_master(call.from_user.id):
+        return
+    states[call.from_user.id] = {"action": action}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, text + "\n\n/cancel দিয়ে বাতিল করতে পারো。")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_withdraw")
+def set_withdraw(call):
+    if not is_master(call.from_user.id): return
+    set_setting("withdraw_enabled", "0" if withdraw_enabled() else "1")
+    adm_settings(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_hold")
+def set_hold(call):
+    if not is_master(call.from_user.id): return
+    set_setting("withdraw_hold", "0" if withdraw_hold() else "1")
+    adm_settings(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_free_limit")
+def set_free_limit(call):
+    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও。\nExample: 6")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_ref_bonus")
+def set_ref_bonus(call):
+    setting_prompt(call, "set_ref_bonus", "🎁 Referral bonus কত USD হবে?\nExample: 1 or 2.50")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_min_withdraw")
+def set_min_withdraw(call):
+    setting_prompt(call, "set_min_withdraw", "💵 Minimum withdraw কত USD হবে?\nExample: 5 or 10")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_vip_deposit")
+def set_vip_deposit(call):
+    setting_prompt(call, "set_vip_deposit", "⭐ VIP deposit কত USD হবে?\nExample: 15")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_notice")
+def set_notice(call):
+    setting_prompt(call, "set_notice", "📢 নতুন Notice text পাঠাও।")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_rules")
+def set_rules(call):
+    setting_prompt(call, "set_rules", "📖 নতুন Trading Rules text পাঠাও。")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "set_user_limit")
+def set_user_limit(call):
+    setting_prompt(call, "set_user_limit", "👤 Format: USER_ID LIMIT\nExample: <code>123456789 10</code>\nFree signal বন্ধ করতে LIMIT হিসেবে <code>0</code> দাও। Global limit-এ ফেরত দিতে <code>123456789 default</code> পাঠাও।")
+
+
+def save_setting_state(message):
+    action = states.get(message.from_user.id, {}).get("action")
+    value = (message.text or "").strip()
+    try:
+        if action == "set_free_limit":
+            set_setting("free_signal_limit", str(max(0, int(value))))
+            result = f"🎟️ Global free limit এখন {free_signal_limit()} / 2 days"
+        elif action == "set_ref_bonus":
+            cents = int(round(float(value) * 100))
+            if cents < 0: raise ValueError
+            set_setting("referral_bonus_cents", cents)
+            result = f"🎁 Referral bonus এখন ${cents/100:.2f}"
+        elif action == "set_min_withdraw":
+            cents = int(round(float(value) * 100))
+            if cents < 0: raise ValueError
+            set_setting("min_withdraw_cents", cents)
+            result = f"💵 Minimum withdraw এখন ${cents/100:.2f}"
+        elif action == "set_vip_deposit":
+            cents = int(round(float(value) * 100))
+            if cents < 0: raise ValueError
+            set_setting("vip_deposit_cents", cents)
+            result = f"⭐ VIP deposit এখন ${cents/100:.2f}"
+        elif action == "set_notice":
+            set_setting("notice", value)
+            result = "📢 Notice updated."
+        elif action == "set_rules":
+            set_setting("trading_rules", value)
+            result = "📖 Trading Rules updated."
+        elif action == "set_user_limit":
+            parts = value.split(maxsplit=1)
+            if len(parts) != 2: raise ValueError
+            uid = int(parts[0])
+            if parts[1].strip().lower() == "default":
+                ok = set_user_free_limit(uid, None)
+                result = "👤 User limit global default-এ ফিরেছে." if ok else "❌ User not found."
+            else:
+                limit = int(parts[1])
+                ok = set_user_free_limit(uid, limit)
+                result = f"👤 User {uid} free limit = {limit} / 2 days" if ok else "❌ User not found."
+        else:
+            return False
+        states.pop(message.from_user.id, None)
+        bot.send_message(message.chat.id, "✅ " + result, reply_markup=admin_keyboard())
+        return True
+    except Exception:
+        bot.send_message(message.chat.id, "❌ Format ভুল। আবার চেষ্টা করো।")
+        return True
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_maintenance")
 def set_maintenance(call):
-    if not is_master(call.from_user.id):
-        return
-
+    if not is_master(call.from_user.id): return
     old = get_setting("maintenance", "0")
     set_setting("maintenance", "0" if old == "1" else "1")
     adm_settings(call)
@@ -1925,9 +2282,7 @@ def set_maintenance(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_live")
 def set_live(call):
-    if not is_master(call.from_user.id):
-        return
-
+    if not is_master(call.from_user.id): return
     old = get_setting("live_mode", "1")
     set_setting("live_mode", "0" if old == "1" else "1")
     adm_settings(call)
@@ -1941,7 +2296,12 @@ def set_live(call):
 def state_handler(message):
     action = states.get(message.from_user.id, {}).get("action")
 
-    if action == "uid":
+    if save_manage_user_state(message):
+        return
+
+    if action in {"set_free_limit", "set_ref_bonus", "set_min_withdraw", "set_vip_deposit", "set_notice", "set_rules", "set_user_limit"}:
+        save_setting_state(message)
+    elif action == "uid":
         save_uid(message)
     elif action == "withdraw_amount" or action == "withdraw_method" or action == "withdraw_account":
         finish_withdraw(message)
