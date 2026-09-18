@@ -2323,7 +2323,7 @@ def set_hold(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_free_limit")
 def set_free_limit(call):
-    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও。\nExample: 6")
+    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও।\nExample: 6")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_ref_bonus")
@@ -2820,7 +2820,147 @@ def mm_reset_if_new_day(user_id):
     day=now_bd().date().isoformat()
     with db_lock:
         c=db(); r=c.execute("SELECT day_key FROM mm_daily WHERE user_id=?",(user_id,)).fetchone()
-        if not r or r["day_key"]!=day:
-            c.execute("INSERT INTO mm_daily(user_id,day_key) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET day_key=excluded.day_key",(user_id,day))
-            c.commit()
+        if not r:
+            c.execute("INSERT INTO mm_daily(user_id,day_key,target_percent,max_trades) VALUES(?,?,?,?)",(user_id,day,float(get_setting('profit_target_percent','1.85')),int(get_setting('max_trades_per_day','20'))))
+        elif r["day_key"]!=day:
+            c.execute("UPDATE mm_daily SET day_key=?,balance_cents=0,base_cents=0,current_cents=0,stage='BASE',stopped=0,max_daily_loss_cents=0,daily_loss_cents=0,daily_profit_cents=0,trades=0,wins=0,losses=0,target_percent=?,max_trades=? WHERE user_id=?",(day,float(get_setting('profit_target_percent','1.85')),int(get_setting('max_trades_per_day','20')),user_id))
+        c.commit(); c.close()
+
+
+def mm_get(user_id):
+    mm_reset_if_new_day(user_id)
+    with db_lock:
+        c=db(); r=c.execute("SELECT * FROM mm_daily WHERE user_id=?",(user_id,)).fetchone(); c.close(); return r
+
+
+def mm_set_balance(user_id, balance_cents):
+    mm_reset_if_new_day(user_id)
+    base=max(1,int(round(balance_cents*float(get_setting('base_trade_percent','2'))/100)))
+    m1=max(base,int(round(balance_cents*float(get_setting('max_m1_percent','4'))/100)))
+    maxloss=max(0,int(round(balance_cents*float(get_setting('max_daily_loss_percent','5'))/100)))
+    maxtr=max(0,int(get_setting('max_trades_per_day','20')))
+    with db_lock:
+        c=db(); c.execute("UPDATE mm_daily SET balance_cents=?,base_cents=?,current_cents=?,stage='BASE',stopped=0,max_daily_loss_cents=?,max_trades=?,target_percent=? WHERE user_id=?",(balance_cents,base,base,maxloss,maxtr,float(get_setting('profit_target_percent','1.85')),user_id)); c.commit(); c.close()
+
+
+def mm_trade(user_id):
+    r=mm_get(user_id)
+    if not r or r["balance_cents"]<=0 or r["stopped"]: return 0,"STOP"
+    if r["max_daily_loss_cents"] and r["daily_loss_cents"]>=r["max_daily_loss_cents"]: return 0,"STOP"
+    if r["max_trades"] and r["trades"]>=r["max_trades"]: return 0,"STOP"
+    if r["daily_profit_cents"]>=int(round(r["balance_cents"]*r["target_percent"]/100)): return 0,"STOP"
+    return r["current_cents"] or r["base_cents"],r["stage"]
+
+
+def mm_record(user_id, signal_id, result):
+    result=result.upper()
+    if result not in ("WIN","LOSS","SKIP"): return False,"bad"
+    r=mm_get(user_id)
+    if not r or r["balance_cents"]<=0: return False,"balance"
+    with db_lock:
+        c=db()
+        if c.execute("SELECT 1 FROM mm_results WHERE user_id=? AND signal_id=?",(user_id,signal_id)).fetchone(): c.close(); return False,"already"
+        amount=r["current_cents"] or r["base_cents"]
+        if result=="SKIP":
+            next_amount,next_stage=amount,r["stage"]; pnl=0; trades=0
+        elif result=="WIN":
+            next_amount,next_stage=r["base_cents"],"BASE"; pnl=int(round(amount*0.85)); trades=1
+        else:
+            if r["stage"]=="BASE":
+                next_amount=min(max(r["base_cents"]*2,r["base_cents"]),max(r["base_cents"],int(round(r["balance_cents"]*float(get_setting('max_m1_percent','4'))/100)))); next_stage="M1"
+            else:
+                next_amount,next_stage=r["base_cents"],"BASE"
+            pnl=-amount; trades=1
+        loss=r["daily_loss_cents"]+(amount if result=="LOSS" else 0)
+        profit=r["daily_profit_cents"]+pnl
+        tr=r["trades"]+trades
+        stop=1 if (r["max_daily_loss_cents"] and loss>=r["max_daily_loss_cents"]) or (r["max_trades"] and tr>=r["max_trades"]) or profit>=int(round(r["balance_cents"]*r["target_percent"]/100)) else 0
+        c.execute("INSERT INTO mm_results(user_id,signal_id,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?)",(user_id,signal_id,result,amount,pnl,utc_iso(now_utc())))
+        c.execute("UPDATE mm_daily SET current_cents=?,stage=?,stopped=?,daily_loss_cents=?,daily_profit_cents=?,trades=?,wins=wins+?,losses=losses+? WHERE user_id=?",(next_amount,next_stage,stop,loss,profit,tr,1 if result=="WIN" else 0,1 if result=="LOSS" else 0,user_id))
+        c.commit(); c.close()
+    return True,(next_amount,next_stage,stop)
+
+
+def mm_status_text(user_id):
+    r=mm_get(user_id)
+    if not r or r["balance_cents"]<=0: return "⚠️ আজকের Trading Balance এখনো set করা হয়নি।"
+    return (f"💰 Balance: <b>${r['balance_cents']/100:.2f}</b>\n"
+            f"🎯 Target: <b>{r['target_percent']:.2f}%</b>\n"
+            f"📌 Current: <b>${(r['current_cents'] or r['base_cents'])/100:.2f}</b> <b>{r['stage']}</b>\n"
+            f"📊 WIN/LOSS: <b>{r['wins']}/{r['losses']}</b>\n"
+            f"📈 P/L: <b>${r['daily_profit_cents']/100:.2f}</b>\n"
+            f"🛑 Loss: <b>${r['daily_loss_cents']/100:.2f}</b> / ${r['max_daily_loss_cents']/100:.2f}\n"
+            f"🔢 Trades: <b>{r['trades']}/{r['max_trades'] or '∞'}</b>\n"
+            f"{'🛑 STOPPED' if r['stopped'] else '🟢 ACTIVE'}")
+
+
+def extra_main_keyboard(user_id):
+    kb=types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📢 Notice","📊 Future Signals")
+    kb.row("⚡ Live Signals","👤 My Status")
+    kb.row("💰 Wallet","👥 Referral Link")
+    kb.row("⭐ VIP Rules","📖 Trading Rules")
+    kb.row("💰 Money Management","📜 Signal History")
+    kb.row("🔔 Notifications")
+    u=get_user(user_id)
+    if not vip_is_active(user_id): kb.row("🆔 Submit Quotex UID")
+    if is_admin(user_id): kb.row("👑 Admin Control")
+    return kb
+
+
+@bot.message_handler(func=lambda m: m.text=="💰 Money Management")
+def mm_menu(message):
+    uid=message.from_user.id; register_user(message.from_user)
+    kb=types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💵 Set Daily Balance",callback_data="mm_set_bal"))
+    bot.send_message(message.chat.id,f"💰 <b>MONEY MANAGEMENT (M1)</b>\n\n{mm_status_text(uid)}",reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data=="mm_set_bal")
+def mm_set_bal_cb(call):
+    states[call.from_user.id]={"action":"extra_daily_balance"}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,"💵 আপনার আজকের মোট trading balance কত USD? (যেমন: 100)")
+
+
+@bot.message_handler(func=lambda m: m.text=="📜 Signal History")
+def signal_history(message):
+    uid=message.from_user.id
+    with db_lock:
+        c=db()
+        rows=c.execute("SELECT r.*, s.signal_text, s.signal_at_utc FROM mm_results r JOIN signals s ON r.signal_id=s.id WHERE r.user_id=? ORDER BY r.id DESC LIMIT 15", (uid,)).fetchall()
         c.close()
+    if not rows:
+        bot.send_message(message.chat.id,"📜 আপনার কোনো signal history নেই।")
+        return
+    lines=["📜 <b>SIGNAL HISTORY (Last 15)</b>\n"]
+    for r in rows:
+        t=bd_from_iso(r["signal_at_utc"])
+        lines.append(f"⏱ {t.strftime('%d-%m')} {format_signal_time(t)} | {escape(r['signal_text'])} | <b>{r['result']}</b> (${r['amount_cents']/100:.2f}, PnL: ${r['pnl_cents']/100:.2f})")
+    bot.send_message(message.chat.id,"\n".join(lines))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("vote_"))
+def extra_vote_callback(call):
+    try:
+        _, vote, sid = call.data.split("_")
+        sid = int(sid)
+        uid = call.from_user.id
+        ok, res = mm_record(uid, sid, vote)
+        if not ok:
+            if res=="already":
+                bot.answer_callback_query(call.id, "আপনি ইতিমধ্যে এই সিগন্যালে ভোট দিয়েছেন।")
+            else:
+                bot.answer_callback_query(call.id, "ভোট গ্রহণ করা যায়নি।")
+            return
+        bot.answer_callback_query(call.id, f"Vote recorded as {vote} ✅")
+        try:
+            bot.send_message(uid, f"📊 <b>Trade Result Recorded: {vote}</b>\n\n{mm_status_text(uid)}")
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("extra vote error")
+
+
+if __name__ == "__main__":
+    main()
