@@ -887,7 +887,7 @@ def start_cmd(message):
             f"⭐ VIP: <b>${vip_deposit_cents()/100:.2f}</b> deposit করে join করা যাবে.\n\n"
             f"🎯 Stated signal confidence: <b>{escape(signal_confidence())}</b>\n\n"
             "📌 Confidence is a stated estimate, not a guaranteed result.",
-            reply_markup=main_keyboard(message.from_user.id)
+            reply_markup=extra_main_keyboard(message.from_user.id)
         )
     except Exception:
         logger.exception("start error")
@@ -900,7 +900,7 @@ def cancel_cmd(message):
     bot.send_message(
         message.chat.id,
         "❌ Operation cancelled.",
-        reply_markup=main_keyboard(message.from_user.id)
+        reply_markup=extra_main_keyboard(message.from_user.id)
     )
 
 
@@ -923,6 +923,10 @@ def future_signal_cmd(message):
 
     ensure_cycle(uid)
     user = get_user(uid)
+    trade_amount, stage = mm_trade(uid)
+    if trade_amount <= 0:
+        bot.send_message(message.chat.id,"⚠️ <b>আজকের Trading Balance আগে set করো</b>\n\n💰 Money Management → Set Daily Balance",reply_markup=extra_main_keyboard(uid))
+        return
 
     if user["status"] != "VIP" and user["free_used"] >= free_signal_limit_for(uid):
         bot.send_message(
@@ -930,7 +934,7 @@ def future_signal_cmd(message):
             "⛔ <b>Free signal quota শেষ</b>\n\n"
             f"এই ২ দিনের cycle-এ আপনার {free_signal_limit()}টি signal শেষ হয়েছে।\n"
             "পরবর্তী cycle শুরু হলে quota আবার reset হবে।\n\n"
-            "⭐ VIP হলে এই limit থাকবে না।"
+            "⭐ VIP হলে এই limit থাকবে না."
         )
         return
 
@@ -977,7 +981,8 @@ def future_signal_cmd(message):
         "📊 <b>FUTURE SIGNAL</b>\n\n"
         f"🕐 BD Time: <b>{t.strftime('%d-%m-%Y')}</b> <b>{format_signal_time(t)}</b>\n"
         f"{format_signal_text(signal['signal_text'])}\n\n"
-        f"{quota}\n\n"
+        f"{quota}\n"
+        f"💵 Trade: <b>${trade_amount/100:.2f}</b> | <b>{stage}</b>\n\n"
         f"🎯 Stated confidence: <b>{escape(signal_confidence())}</b>\n"
         "📌 Confidence is a stated estimate, not a guarantee.",
         reply_markup=kb
@@ -1873,7 +1878,7 @@ def user_vip_toggle(call):
         bot.answer_callback_query(call.id, "Updated.")
         manage_user_menu(call.message.chat.id, uid)
         try:
-            bot.send_message(uid, "⭐ আপনার VIP status update করা হয়েছে: " + ("VIP Active" if decision == "yes" else "VIP Removed"), reply_markup=main_keyboard(uid))
+            bot.send_message(uid, "⭐ আপনার VIP status update করা হয়েছে: " + ("VIP Active" if decision == "yes" else "VIP Removed"), reply_markup=extra_main_keyboard(uid))
         except Exception:
             pass
     except Exception:
@@ -2318,7 +2323,7 @@ def set_hold(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_free_limit")
 def set_free_limit(call):
-    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও।\nExample: 6")
+    setting_prompt(call, "set_free_limit", "🎟️ Global free signal limit কত হবে? শুধু number পাঠাও。\nExample: 6")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "set_ref_bonus")
@@ -2498,6 +2503,18 @@ def state_handler(message):
     if save_manage_user_state(message):
         return
 
+    if action == "extra_daily_balance":
+        try:
+            cents=int(round(float((message.text or "").strip())*100))
+            if cents<=0: raise ValueError
+            mm_set_balance(message.from_user.id,cents)
+            states.pop(message.from_user.id,None)
+            r=mm_get(message.from_user.id)
+            bot.send_message(message.chat.id,f"✅ আজকের MM set হয়েছে.\n\n💵 Balance: <b>${cents/100:.2f}</b>\n💰 Base Trade: <b>${r['base_cents']/100:.2f}</b>\n🎯 Target: <b>{r['target_percent']:.2f}%</b>\n🛑 Max Daily Loss: <b>${r['max_daily_loss_cents']/100:.2f}</b>",reply_markup=extra_main_keyboard(message.from_user.id))
+        except Exception:
+            bot.send_message(message.chat.id,"❌ সঠিক USD amount দাও। Example: 100")
+        return
+
     if action in {"set_free_limit", "set_ref_bonus", "set_min_withdraw", "set_vip_deposit", "set_notice", "set_rules", "set_user_limit", "set_confidence"}:
         save_setting_state(message)
     elif action == "uid":
@@ -2535,7 +2552,7 @@ def fallback(message):
     bot.send_message(
         message.chat.id,
         "আমি এই option বুঝতে পারিনি। নিচের menu ব্যবহার করুন।",
-        reply_markup=main_keyboard(message.from_user.id)
+        reply_markup=extra_main_keyboard(message.from_user.id)
     )
 
 
@@ -2607,6 +2624,20 @@ def send_due_signal_notifications():
 def notification_loop():
     while True:
         try:
+            with db_lock:
+                c=db(); rows=c.execute("SELECT user_id,expires_at_utc,last_reminder_date FROM vip_memberships").fetchall(); c.close()
+            today=now_bd().date().isoformat()
+            for r in rows:
+                try:
+                    exp=datetime.fromisoformat(r["expires_at_utc"]); days=(exp-now_utc()).total_seconds()/86400
+                    if 0 < days <= int(get_setting("vip_reminder_days","3")) and r["last_reminder_date"]!=today:
+                        bot.send_message(r["user_id"],f"⏳ <b>VIP Reminder</b>\n\nআপনার VIP প্রায় <b>{max(1,int(days))} দিন</b>-এর মধ্যে expire হবে।")
+                        with db_lock:
+                            c=db(); c.execute("UPDATE vip_memberships SET last_reminder_date=? WHERE user_id=?",(today,r["user_id"])); c.commit(); c.close()
+                    elif days <= 0:
+                        with db_lock:
+                            c=db(); c.execute("UPDATE users SET status='FREE' WHERE user_id=?",(r["user_id"],)); c.commit(); c.close()
+                except Exception: pass
             send_due_signal_notifications()
         except Exception:
             logger.exception("notification loop error")
@@ -2698,5 +2729,98 @@ def main():
             time.sleep(5)
 
 
-if __name__ == "__main__":
-    main()
+
+# ============================================================
+# EXTRA FEATURES: VIP TIERS/REMINDERS, 1-STEP M1 MM, NAVIGATION
+# ============================================================
+
+def init_extra_db():
+    with db_lock:
+        conn = db()
+        try:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS vip_memberships (
+                user_id INTEGER PRIMARY KEY,
+                expires_at_utc TEXT,
+                last_reminder_date TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS mm_daily (
+                user_id INTEGER PRIMARY KEY,
+                day_key TEXT NOT NULL,
+                balance_cents INTEGER NOT NULL DEFAULT 0,
+                base_cents INTEGER NOT NULL DEFAULT 0,
+                current_cents INTEGER NOT NULL DEFAULT 0,
+                stage TEXT NOT NULL DEFAULT 'BASE',
+                stopped INTEGER NOT NULL DEFAULT 0,
+                max_daily_loss_cents INTEGER NOT NULL DEFAULT 0,
+                daily_loss_cents INTEGER NOT NULL DEFAULT 0,
+                daily_profit_cents INTEGER NOT NULL DEFAULT 0,
+                trades INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                target_percent REAL NOT NULL DEFAULT 1.85,
+                max_trades INTEGER NOT NULL DEFAULT 20,
+                UNIQUE(user_id)
+            );
+            CREATE TABLE IF NOT EXISTS mm_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                signal_id INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                pnl_cents INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, signal_id),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
+            );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+_orig_init_db = init_db
+def init_db():
+    _orig_init_db()
+    init_extra_db()
+
+
+def vip_expiry(user_id):
+    with db_lock:
+        conn=db()
+        try:
+            r=conn.execute("SELECT expires_at_utc FROM vip_memberships WHERE user_id=?",(user_id,)).fetchone()
+            return r["expires_at_utc"] if r else None
+        finally: conn.close()
+
+
+def vip_is_active(user_id):
+    u=get_user(user_id)
+    if not u or u["status"]!="VIP": return False
+    exp=vip_expiry(user_id)
+    if not exp: return True
+    if datetime.fromisoformat(exp) <= now_utc():
+        with db_lock:
+            c=db(); c.execute("UPDATE users SET status='FREE' WHERE user_id=?",(user_id,)); c.commit(); c.close()
+        return False
+    return True
+
+
+def set_vip_days_extra(user_id, days):
+    exp=now_utc()+timedelta(days=days)
+    with db_lock:
+        c=db()
+        c.execute("INSERT INTO vip_memberships(user_id,expires_at_utc,last_reminder_date) VALUES(?,?,NULL) ON CONFLICT(user_id) DO UPDATE SET expires_at_utc=excluded.expires_at_utc,last_reminder_date=NULL",(user_id,utc_iso(exp)))
+        c.execute("UPDATE users SET status='VIP' WHERE user_id=?",(user_id,))
+        c.commit(); c.close()
+
+
+def mm_reset_if_new_day(user_id):
+    day=now_bd().date().isoformat()
+    with db_lock:
+        c=db(); r=c.execute("SELECT day_key FROM mm_daily WHERE user_id=?",(user_id,)).fetchone()
+        if not r or r["day_key"]!=day:
+            c.execute("INSERT INTO mm_daily(user_id,day_key) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET day_key=excluded.day_key",(user_id,day))
+            c.commit()
+        c.close()
