@@ -1,3299 +1,4171 @@
-=========
+# ============================================================
+# SM QUATEX SURE SHORT
+# Complete Telegram Bot - pyTelegramBotAPI + SQLite
+# ============================================================
 
-def db():
+import os
+import re
+import time
+import math
+import shutil
+import sqlite3
+import logging
+import threading
+import traceback
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import telebot
+from telebot import types
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "6470135702"))
+
+DB_PATH = os.getenv("DB_PATH", "sm_quatex.db")
+BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
+
+BD_TZ = ZoneInfo("Asia/Dhaka")
+
+QUOTEX_REF_LINK = "https://broker-qx.pro/sign-up/?lid=2350796"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Add BOT_TOKEN in Railway Variables.")
+
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+DB_LOCK = threading.RLock()
+STATE = {}
+LIVE_DRAFT = {}
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("SM_QUATEX")
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_db():
     conn = sqlite3.connect(
-        DB_FILE,
+        DB_PATH,
         timeout=30,
         check_same_thread=False
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
-def init_db():
+def db_execute(sql, params=(), fetchone=False, fetchall=False, commit=True):
     with DB_LOCK:
-        conn = db()
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
 
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            status TEXT DEFAULT 'FREE',
-            vip_until TEXT,
-            wallet_cents INTEGER DEFAULT 0,
-            referred_by INTEGER,
-            referral_paid INTEGER DEFAULT 0,
-            refs_count INTEGER DEFAULT 0,
-            notifications INTEGER DEFAULT 1,
-            free_cycle TEXT,
-            free_used INTEGER DEFAULT 0,
-            created_at TEXT,
-            last_seen TEXT,
-            FOREIGN KEY(referred_by) REFERENCES users(user_id)
-        );
+            result = None
 
-        CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
+            if fetchone:
+                result = cur.fetchone()
+            elif fetchall:
+                result = cur.fetchall()
+            else:
+                result = cur.lastrowid
 
-        CREATE TABLE IF NOT EXISTS admins(
-            user_id INTEGER PRIMARY KEY,
-            permissions TEXT DEFAULT ''
-        );
+            if commit:
+                conn.commit()
 
-        CREATE TABLE IF NOT EXISTS signals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_date TEXT NOT NULL,
-            signal_time TEXT NOT NULL,
-            pair TEXT NOT NULL,
-            direction TEXT NOT NULL,
-            confidence TEXT DEFAULT '',
-            audience TEXT DEFAULT 'ALL',
-            selected_users TEXT DEFAULT '',
-            sent INTEGER DEFAULT 0,
-            vote_revealed INTEGER DEFAULT 0,
-            created_at TEXT
-        );
+            return result
+        finally:
+            conn.close()
 
-        CREATE TABLE IF NOT EXISTS signal_deliveries(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            signal_id INTEGER NOT NULL,
-            delivered_at TEXT,
-            quota_used INTEGER DEFAULT 0,
-            UNIQUE(user_id, signal_id)
-        );
 
-        CREATE TABLE IF NOT EXISTS signal_votes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            signal_id INTEGER NOT NULL,
-            vote TEXT NOT NULL,
-            created_at TEXT,
-            UNIQUE(user_id, signal_id)
-        );
+def db_script(script):
+    with DB_LOCK:
+        conn = get_db()
+        try:
+            conn.executescript(script)
+            conn.commit()
+        finally:
+            conn.close()
 
-        CREATE TABLE IF NOT EXISTS signal_results(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            signal_id INTEGER NOT NULL,
-            result TEXT NOT NULL,
-            trade_amount_cents INTEGER DEFAULT 0,
-            created_at TEXT,
-            UNIQUE(user_id, signal_id)
-        );
 
-        CREATE TABLE IF NOT EXISTS uid_submissions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            uid TEXT NOT NULL,
-            status TEXT DEFAULT 'PENDING',
-            submitted_at TEXT,
-            reviewed_at TEXT,
-            reviewed_by INTEGER
-        );
+def init_db():
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_uid_unique
-        ON uid_submissions(uid)
-        WHERE status IN ('PENDING','APPROVED');
+    db_script("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE NOT NULL,
+        username TEXT DEFAULT '',
+        first_name TEXT DEFAULT '',
+        balance_cents INTEGER DEFAULT 0,
+        vip_until TEXT,
+        uid TEXT UNIQUE,
+        notification_on INTEGER DEFAULT 1,
+        live_signal_on INTEGER DEFAULT 0,
+        referral_code TEXT UNIQUE,
+        referred_by INTEGER,
+        referral_paid INTEGER DEFAULT 0,
+        joined_at TEXT,
+        last_seen TEXT
+    );
 
-        CREATE TABLE IF NOT EXISTS wallet_transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            type TEXT,
-            amount_cents INTEGER,
-            balance_after_cents INTEGER,
-            note TEXT,
-            created_at TEXT
-        );
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT DEFAULT ''
+    );
 
-        CREATE TABLE IF NOT EXISTS withdrawals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount_cents INTEGER,
-            method TEXT,
-            account TEXT,
-            status TEXT DEFAULT 'PENDING',
-            created_at TEXT,
-            reviewed_at TEXT,
-            reviewed_by INTEGER
-        );
+    CREATE TABLE IF NOT EXISTS admins (
+        telegram_id INTEGER PRIMARY KEY,
+        role TEXT DEFAULT 'subadmin',
+        p_users INTEGER DEFAULT 0,
+        p_vip INTEGER DEFAULT 0,
+        p_signals INTEGER DEFAULT 0,
+        p_wallet INTEGER DEFAULT 0,
+        p_withdraw INTEGER DEFAULT 0,
+        p_broadcast INTEGER DEFAULT 0,
+        p_settings INTEGER DEFAULT 0,
+        p_live INTEGER DEFAULT 0,
+        p_text INTEGER DEFAULT 0
+    );
 
-        CREATE TABLE IF NOT EXISTS mm_profiles(
-            user_id INTEGER PRIMARY KEY,
-            balance_cents INTEGER DEFAULT 0,
-            profit_target_cents INTEGER DEFAULT 1000,
-            loss_limit_cents INTEGER DEFAULT 500,
-            base_trade_cents INTEGER DEFAULT 100,
-            m1_trade_cents INTEGER DEFAULT 200,
-            max_trades INTEGER DEFAULT 20,
-            daily_start_balance_cents INTEGER DEFAULT 0,
-            daily_pl_cents INTEGER DEFAULT 0,
-            trades_today INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0,
-            stage TEXT DEFAULT 'BASE',
-            stopped INTEGER DEFAULT 0,
-            balance_confirmed INTEGER DEFAULT 0,
-            reset_date TEXT
-        );
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_date TEXT NOT NULL,
+        signal_time TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        confidence TEXT DEFAULT '',
+        audience TEXT DEFAULT 'ALL',
+        status TEXT DEFAULT 'PENDING',
+        created_by INTEGER,
+        created_at TEXT,
+        sent_at TEXT
+    );
 
-        CREATE TABLE IF NOT EXISTS live_sessions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT,
-            ended_at TEXT,
-            active INTEGER DEFAULT 1
-        );
+    CREATE TABLE IF NOT EXISTS selected_signal_users (
+        signal_id INTEGER,
+        telegram_id INTEGER,
+        PRIMARY KEY(signal_id, telegram_id)
+    );
 
-        CREATE TABLE IF NOT EXISTS live_signals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER,
-            content TEXT,
-            confidence TEXT,
-            created_at TEXT
-        );
+    CREATE TABLE IF NOT EXISTS signal_access (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER,
+        telegram_id INTEGER,
+        delivered_at TEXT,
+        consumed_quota INTEGER DEFAULT 0,
+        UNIQUE(signal_id, telegram_id)
+    );
 
-        CREATE TABLE IF NOT EXISTS user_limits(
-            user_id INTEGER PRIMARY KEY,
-            free_limit INTEGER
-        );
-        """)
+    CREATE TABLE IF NOT EXISTS signal_votes (
+        signal_id INTEGER,
+        telegram_id INTEGER,
+        vote TEXT,
+        created_at TEXT,
+        PRIMARY KEY(signal_id, telegram_id)
+    );
 
-        conn.execute(
-            "INSERT OR IGNORE INTO admins(user_id,permissions) VALUES(?,?)",
-            (ADMIN_ID, "ALL")
+    CREATE TABLE IF NOT EXISTS signal_results (
+        signal_id INTEGER,
+        telegram_id INTEGER,
+        result TEXT,
+        amount_cents INTEGER DEFAULT 0,
+        created_at TEXT,
+        PRIMARY KEY(signal_id, telegram_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        amount_cents INTEGER,
+        method TEXT,
+        account TEXT,
+        status TEXT DEFAULT 'PENDING',
+        created_at TEXT,
+        processed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        type TEXT,
+        amount_cents INTEGER,
+        description TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS uid_submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        uid TEXT UNIQUE,
+        status TEXT DEFAULT 'PENDING',
+        created_at TEXT,
+        processed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS live_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT,
+        ended_at TEXT,
+        status TEXT DEFAULT 'ACTIVE'
+    );
+
+    CREATE TABLE IF NOT EXISTS live_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER,
+        telegram_id INTEGER,
+        content TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS mm_profiles (
+        telegram_id INTEGER PRIMARY KEY,
+        balance_cents INTEGER DEFAULT 0,
+        profit_target_cents INTEGER DEFAULT 0,
+        loss_limit_cents INTEGER DEFAULT 0,
+        base_trade_cents INTEGER DEFAULT 200,
+        m1_trade_cents INTEGER DEFAULT 300,
+        m2_trade_cents INTEGER DEFAULT 0,
+        payout_percent REAL DEFAULT 80,
+        max_trades INTEGER DEFAULT 20,
+        max_m1_cents INTEGER DEFAULT 0,
+        stop_trading INTEGER DEFAULT 0,
+        balance_confirmed INTEGER DEFAULT 0,
+        daily_start_balance_cents INTEGER DEFAULT 0,
+        daily_pl_cents INTEGER DEFAULT 0,
+        trades_today INTEGER DEFAULT 0,
+        wins_today INTEGER DEFAULT 0,
+        losses_today INTEGER DEFAULT 0,
+        stage TEXT DEFAULT 'BASE',
+        session_loss_cents INTEGER DEFAULT 0,
+        recovery_loss_cents INTEGER DEFAULT 0,
+        session_no INTEGER DEFAULT 1,
+        current_trade_cents INTEGER DEFAULT 200,
+        last_reset_date TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS referral_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER UNIQUE,
+        amount_cents INTEGER,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS vip_reminders (
+        telegram_id INTEGER,
+        expiry_date TEXT,
+        reminder_date TEXT,
+        PRIMARY KEY(telegram_id, expiry_date, reminder_date)
+    );
+    """)
+
+    defaults = {
+        "maintenance": "0",
+        "withdrawals": "1",
+        "withdraw_hold_hours": "0",
+        "min_withdraw": "5",
+        "free_signal_limit": "4",
+        "referral_bonus": "1",
+        "vip_reminder_days": "3",
+        "vote_reveal": "0",
+        "channel_username": "",
+        "trading_rules": "Use the signals according to your own risk management.",
+        "notice": "Welcome to SM QUATEX SURE SHORT.",
+        "welcome": (
+            "👋 <b>Welcome to SM QUATEX SURE SHORT</b>\n\n"
+            "Use the menu below."
+        ),
+        "maintenance_text": "🛠 Bot is currently under maintenance.",
+        "error_text": "⚠️ Something went wrong. Please try again.",
+        "invalid_text": "❌ Invalid input. Please use the buttons.",
+        "vip_text": "⭐ VIP access is active for you.",
+        "nonvip_text": "You are currently a FREE user.",
+        "signal_template": (
+            "📅 <b>{date}</b>\n\n"
+            "💱 <b>{pair}</b>\n"
+            "⏰ <b>{time}</b>\n"
+            "{direction}\n"
+            "🎯 Confidence: <b>{confidence}</b>\n"
+            "💵 Trade: <b>${trade_amount}</b>\n"
+            "📌 Stage: <b>{stage}</b>"
+        ),
+        "live_template": (
+            "⚡ <b>LIVE SIGNAL</b>\n\n"
+            "{content}"
+        ),
+        "win_text": "✅ WIN recorded.\nProfit: <b>${profit}</b>",
+        "loss_text": "❌ LOSS recorded.\nLoss: <b>${loss}</b>",
+        "skip_text": "⏭ SKIPPED.",
+        "notification_on": "🔔 Notifications are ON.",
+        "notification_off": "🔕 Notifications are OFF.",
+        "withdraw_disabled": "💸 Withdrawals are currently OFF.",
+        "withdraw_success": "✅ Withdrawal request submitted.",
+        "withdraw_min": "Minimum withdrawal is ${amount}.",
+        "uid_duplicate": "❌ This UID is already linked to another account.",
+        "uid_pending": "⏳ Your UID is already waiting for admin approval.",
+        "uid_approved": "✅ Your UID has been approved.",
+        "uid_rejected": "❌ Your UID submission was rejected.",
+        "quota_text": "📊 Free signals remaining: <b>{remaining}</b>",
+        "balance_required": (
+            "💰 Before receiving today's Future Signals, "
+            "please confirm your trading balance."
+        ),
+        "main_menu_title": "🏠 Main Menu",
+        "admin_menu_title": "👑 Admin Panel",
+        "back_text": "🔙 Back",
+        "home_text": "🏠 Main Menu",
+        "rules_text": "📖 <b>Trading Rules</b>\n\n{rules}",
+        "referral_text": (
+            "👥 <b>Referral</b>\n\n"
+            "Your referral link:\n{link}\n\n"
+            "Bonus: ${bonus}"
+        ),
+        "vip_expired": "⚠️ Your VIP access has expired.",
+        "live_off": "⚡ Live Signal is currently OFF for your account.",
+        "live_started": "⚡ Live Session started.",
+        "live_ended": "⛔ Live Session ended.",
+    }
+
+    for key, value in defaults.items():
+        db_execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            (key, value)
         )
 
-        defaults = {
-            "free_signal_limit": "4",
-            "referral_bonus_cents": "100",
-            "min_withdraw_cents": "500",
-            "withdraw_enabled": "1",
-            "maintenance": "0",
-            "confidence": "95–99%",
-            "max_m1_cents": "500",
-            "max_daily_loss_cents": "5000",
-            "default_profit_target": "1000",
-            "default_loss_limit": "500",
-            "default_base_trade": "100",
-            "default_m1_trade": "200",
-            "default_max_trades": "20",
-        }
 
-        for key, value in defaults.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                (key, value)
-            )
-
-        for key, value in DEFAULT_TEXTS.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                (f"text.{key}", value)
-            )
-
-        conn.commit()
-        conn.close()
-
-
-def get_setting(key, default=""):
-    with DB_LOCK:
-        conn = db()
-        row = conn.execute(
-            "SELECT value FROM settings WHERE key=?",
-            (key,)
-        ).fetchone()
-        conn.close()
-        return row["value"] if row else default
-
-
-def set_setting(key, value):
-    with DB_LOCK:
-        conn = db()
-        conn.execute("""
-            INSERT INTO settings(key,value)
-            VALUES(?,?)
-            ON CONFLICT(key)
-            DO UPDATE SET value=excluded.value
-        """, (key, str(value)))
-        conn.commit()
-        conn.close()
-
-
-def T(key):
-    return get_setting(
-        f"text.{key}",
-        DEFAULT_TEXTS.get(key, key)
-    )
-
-
-def setting_int(key, default):
-    try:
-        return int(get_setting(key, str(default)))
-    except Exception:
-        return default
+init_db()
 
 
 # ============================================================
-# HELPERS
+# SETTINGS
+# ============================================================
+
+def get_setting(key, default=""):
+    row = db_execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,),
+        fetchone=True
+    )
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    db_execute(
+        """
+        INSERT INTO settings(key,value)
+        VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, str(value))
+    )
+
+
+# ============================================================
+# UTILS
 # ============================================================
 
 def now_bd():
     return datetime.now(BD_TZ)
 
 
-def now_utc():
-    return datetime.now(UTC)
+def now_str():
+    return now_bd().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def money(cents):
     return f"{cents / 100:.2f}"
 
 
-def parse_money(value):
-    value = value.strip().replace("$", "").replace(",", "")
-    amount = float(value)
-    if amount < 0:
-        raise ValueError
-    return int(round(amount * 100))
+def cents(value):
+    value = str(value).replace("$", "").replace(",", "").strip()
+    return int(round(float(value) * 100))
 
 
-def current_cycle():
-    today = now_bd().date()
-    epoch = datetime(2026, 1, 1, tzinfo=BD_TZ).date()
-    days = (today - epoch).days
-    start = (days // 2) * 2
-    return (epoch + timedelta(days=start)).isoformat()
+def esc(text):
+    if text is None:
+        return ""
+    return str(text)
 
 
 def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def admin_row(user_id):
+    return db_execute(
+        "SELECT * FROM admins WHERE telegram_id=?",
+        (user_id,),
+        fetchone=True
+    )
+
+
+def has_permission(user_id, permission):
     if user_id == ADMIN_ID:
         return True
 
-    with DB_LOCK:
-        conn = db()
-        row = conn.execute(
-            "SELECT user_id FROM admins WHERE user_id=?", and stage == "BASE":
-            next_stage = "M1"
-        else:
-            next_stage = "BASE"
+    row = admin_row(user_id)
+    if not row:
+        return False
 
-        trades = m["trades_today"]
+    return bool(row[permission])
 
-        if result in ("WIN", "LOSS"):
-            trades += 1
 
-        stopped = m["stopped"]
+def is_vip(user_id):
+    row = db_execute(
+        "SELECT vip_until FROM users WHERE telegram_id=?",
+        (user_id,),
+        fetchone=True
+    )
 
-        if new_pl >= m["profit_target_cents"]:
-            stopped = 1
+    if not row or not row["vip_until"]:
+        return False
 
-        if new_pl <= -m["loss_limit_cents"]:
-            stopped = 1
+    try:
+        return datetime.fromisoformat(row["vip_until"]) > now_bd()
+    except Exception:
+        return False
 
-        if trades >= m["max_trades"]:
-            stopped = 1
 
-        conn.execute("""
+def user_row(user_id):
+    return db_execute(
+        "SELECT * FROM users WHERE telegram_id=?",
+        (user_id,),
+        fetchone=True
+    )
+
+
+def register_user(message):
+    u = message.from_user
+    existing = user_row(u.id)
+
+    if existing:
+        db_execute(
+            """
+            UPDATE users
+            SET username=?, first_name=?, last_seen=?
+            WHERE telegram_id=?
+            """,
+            (
+                u.username or "",
+                u.first_name or "",
+                now_str(),
+                u.id
+            )
+        )
+        ensure_mm(u.id)
+        return existing
+
+    referrer = None
+    if message.text and message.text.startswith("/start "):
+        code = message.text.split(" ", 1)[1].strip()
+        ref = db_execute(
+            "SELECT telegram_id FROM users WHERE referral_code=?",
+            (code,),
+            fetchone=True
+        )
+        if ref and ref["telegram_id"] != u.id:
+            referrer = ref["telegram_id"]
+
+    referral_code = f"ref{u.id}"
+
+    db_execute(
+        """
+        INSERT INTO users(
+            telegram_id,username,first_name,referral_code,
+            referred_by,joined_at,last_seen
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            u.id,
+            u.username or "",
+            u.first_name or "",
+            referral_code,
+            referrer,
+            now_str(),
+            now_str()
+        )
+    )
+
+    ensure_mm(u.id)
+
+    return user_row(u.id)
+
+
+# ============================================================
+# MONEY MANAGEMENT
+# ============================================================
+
+def ensure_mm(user_id):
+    row = db_execute(
+        "SELECT * FROM mm_profiles WHERE telegram_id=?",
+        (user_id,),
+        fetchone=True
+    )
+
+    if row:
+        return row
+
+    db_execute(
+        """
+        INSERT INTO mm_profiles(
+            telegram_id,last_reset_date
+        )
+        VALUES(?,?)
+        """,
+        (user_id, now_bd().date().isoformat())
+    )
+
+    return db_execute(
+        "SELECT * FROM mm_profiles WHERE telegram_id=?",
+        (user_id,),
+        fetchone=True
+    )
+
+
+def reset_daily_mm_if_needed(user_id):
+    row = ensure_mm(user_id)
+    today = now_bd().date().isoformat()
+
+    if row["last_reset_date"] != today:
+        db_execute(
+            """
+            UPDATE mm_profiles
+            SET balance_confirmed=0,
+                daily_start_balance_cents=balance_cents,
+                daily_pl_cents=0,
+                trades_today=0,
+                wins_today=0,
+                losses_today=0,
+                stop_trading=0,
+                last_reset_date=?
+            WHERE telegram_id=?
+            """,
+            (today, user_id)
+        )
+
+    return ensure_mm(user_id)
+
+
+def current_trade_amount(user_id):
+    row = reset_daily_mm_if_needed(user_id)
+
+    stage = row["stage"]
+    recovery = row["recovery_loss_cents"]
+
+    if stage == "BASE" and recovery <= 0:
+        return row["base_trade_cents"]
+
+    if stage == "M1":
+        if row["m1_trade_cents"] > 0:
+            return row["m1_trade_cents"]
+
+    if stage == "M2":
+        if row["m2_trade_cents"] > 0:
+            return row["m2_trade_cents"]
+
+        payout = max(float(row["payout_percent"]), 1.0) / 100
+        desired_profit = row["base_trade_cents"]
+
+        calculated = math.ceil(
+            (recovery + desired_profit) / payout
+        )
+
+        if row["max_m1_cents"] > 0:
+            calculated = min(calculated, row["max_m1_cents"])
+
+        return calculated
+
+    if recovery > 0:
+        payout = max(float(row["payout_percent"]), 1.0) / 100
+        calculated = math.ceil(
+            (recovery + row["base_trade_cents"]) / payout
+        )
+        return calculated
+
+    return row["base_trade_cents"]
+
+
+def mm_can_trade(user_id):
+    row = reset_daily_mm_if_needed(user_id)
+
+    if row["stop_trading"]:
+        return False, "⛔ Trading is stopped."
+
+    if row["max_trades"] > 0 and row["trades_today"] >= row["max_trades"]:
+        return False, "⛔ Today's maximum trades have been reached."
+
+    if row["profit_target_cents"] > 0 and row["daily_pl_cents"] >= row["profit_target_cents"]:
+        return False, "🎯 Profit Target reached."
+
+    if row["loss_limit_cents"] > 0 and row["daily_pl_cents"] <= -row["loss_limit_cents"]:
+        return False, "🛑 Loss Limit reached."
+
+    return True, ""
+
+
+def apply_trade_result(user_id, signal_id, result):
+    row = reset_daily_mm_if_needed(user_id)
+
+    existing = db_execute(
+        """
+        SELECT * FROM signal_results
+        WHERE signal_id=? AND telegram_id=?
+        """,
+        (signal_id, user_id),
+        fetchone=True
+    )
+
+    if existing:
+        return False, "⚠️ This signal result was already recorded."
+
+    amount = current_trade_amount(user_id)
+
+    if result == "WIN":
+        profit = math.floor(
+            amount * max(float(row["payout_percent"]), 0) / 100
+        )
+
+        db_execute(
+            """
+            UPDATE mm_profiles
+            SET balance_cents=balance_cents+?,
+                daily_pl_cents=daily_pl_cents+?,
+                trades_today=trades_today+1,
+                wins_today=wins_today+1,
+                stage='BASE',
+                session_loss_cents=0,
+                recovery_loss_cents=0,
+                current_trade_cents=?
+            WHERE telegram_id=?
+            """,
+            (
+                profit,
+                profit,
+                row["base_trade_cents"],
+                user_id
+            )
+        )
+
+        db_execute(
+            """
             INSERT INTO signal_results(
-                user_id,signal_id,result,trade_amount_cents,created_at
+                signal_id,telegram_id,result,amount_cents,created_at
             )
             VALUES(?,?,?,?,?)
-        """, (
-            user_id,
-            signal_id,
-            result,
-            amount,
-            now_utc().isoformat()
-        ))
+            """,
+            (signal_id, user_id, result, profit, now_str())
+        )
 
-        conn.execute("""
+        return True, get_setting("win_text").replace(
+            "{profit}", money(profit)
+        )
+
+    if result == "LOSS":
+
+        new_recovery = row["recovery_loss_cents"] + amount
+
+        if row["stage"] == "BASE":
+            new_stage = "M1"
+        elif row["stage"] == "M1":
+            new_stage = "M2"
+        else:
+            new_stage = "BASE"
+
+        if row["stage"] == "M2":
+            new_stage = "BASE"
+
+        db_execute(
+            """
             UPDATE mm_profiles
-            SET balance_cents=?,
-                daily_pl_cents=?,
-                trades_today=?,
-                wins=wins+?,
-                losses=losses+?,
+            SET balance_cents=balance_cents-?,
+                daily_pl_cents=daily_pl_cents-?,
+                trades_today=trades_today+1,
+                losses_today=losses_today+1,
                 stage=?,
-                stopped=?
-            WHERE user_id=?
-        """, (
-            new_balance,
-            new_pl,
-            trades,
-            1 if result == "WIN" else 0,
-            1 if result == "LOSS" else 0,
-            next_stage,
-            stopped,
-            user_id
-        ))
+                session_loss_cents=session_loss_cents+?,
+                recovery_loss_cents=?,
+                current_trade_cents=?
+            WHERE telegram_id=?
+            """,
+            (
+                amount,
+                amount,
+                new_stage,
+                amount,
+                new_recovery,
+                amount,
+                user_id
+            )
+        )
 
-        conn.commit()
-        conn.close()
+        new_amount = current_trade_amount(user_id)
+
+        db_execute(
+            """
+            INSERT INTO signal_results(
+                signal_id,telegram_id,result,amount_cents,created_at
+            )
+            VALUES(?,?,?,?,?)
+            """,
+            (signal_id, user_id, result, amount, now_str())
+        )
+
+        text = get_setting("loss_text").replace(
+            "{loss}", money(amount)
+        )
+
+        text += (
+            f"\n\n🔄 Next stage: <b>{new_stage}</b>"
+            f"\n💵 Next recovery amount: <b>${money(new_amount)}</b>"
+        )
+
+        return True, text
+
+    db_execute(
+        """
+        INSERT INTO signal_results(
+            signal_id,telegram_id,result,amount_cents,created_at
+        )
+        VALUES(?,?,?,?,?)
+        """,
+        (signal_id, user_id, result, 0, now_str())
+    )
+
+    return True, get_setting("skip_text")
+
+
+# ============================================================
+# QUOTA
+# ============================================================
+
+def cycle_id():
+    epoch = datetime(1970, 1, 1, tzinfo=BD_TZ)
+    days = (now_bd() - epoch).days
+    return days // 2
+
+
+def quota_used(user_id):
+    start = now_bd().date() - timedelta(
+        days=(now_bd().date().toordinal() % 2)
+    )
+
+    rows = db_execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM signal_access
+        WHERE telegram_id=?
+          AND consumed_quota=1
+          AND delivered_at >= ?
+        """,
+        (
+            user_id,
+            datetime.combine(
+                start,
+                datetime.min.time()
+            ).replace(tzinfo=BD_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        ),
+        fetchone=True
+    )
+
+    return rows["c"] if rows else 0
+
+
+def free_remaining(user_id):
+    if is_vip(user_id):
+        return 999999
+
+    limit = int(get_setting("free_signal_limit", "4"))
+
+    used = quota_used(user_id)
+
+    return max(0, limit - used)
+
+
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def kb(rows, resize=True):
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=resize
+    )
+
+    for row in rows:
+        markup.row(*row)
+
+    return markup
+
+
+def user_keyboard(user_id):
+    return kb([
+        ["📡 Future Signals", "⚡ Live Signals"],
+        ["💰 Money Management", "💼 Wallet"],
+        ["💸 Withdraw", "👤 VIP / UID"],
+        ["👥 Referral", "📊 Dashboard"],
+        ["🗳 Vote Signal", "📈 Signal Result"],
+        ["📜 Signal History", "📖 Trading Rules"],
+        ["🔔 Notifications", "❓ Help"],
+    ])
+
+
+def admin_keyboard():
+    return kb([
+        ["📊 Admin Dashboard", "👥 Users"],
+        ["📡 Future Signals", "⚡ Live Session"],
+        ["⭐ VIP Management", "🆔 UID Requests"],
+        ["💰 Wallet / Withdraw", "📢 Broadcast"],
+        ["📝 Bot Text Editor", "⚙️ Settings"],
+        ["👨‍💼 Sub-Admins", "📊 Vote Results"],
+        ["📋 Signal History", "🛠 Maintenance"],
+        ["🏠 Main Menu"],
+    ])
+
+
+def back_keyboard():
+    return kb([
+        ["🔙 Back", "🏠 Main Menu"]
+    ])
+
+
+def money_keyboard():
+    return kb([
+        ["💵 Set Balance", "🎯 Profit Target"],
+        ["🛑 Loss Limit", "💵 Base Trade"],
+        ["🔄 M1 Trade", "🔄 M2 Trade"],
+        ["📈 Payout %", "🔢 Max Trades"],
+        ["🚫 Stop Trading", "▶️ Resume Trading"],
+        ["📊 MM Status", "🔙 Back"],
+        ["🏠 Main Menu"],
+    ])
+
+
+def signal_keyboard():
+    return kb([
+        ["➕ Add Future Signals"],
+        ["📋 Future Signal List"],
+        ["🗑 Delete Future Signal"],
+        ["🎯 Signal Audience"],
+        ["🔙 Back", "🏠 Main Menu"],
+    ])
+
+
+def vip_keyboard():
+    return kb([
+        ["➕ Add VIP", "🔄 Renew VIP"],
+        ["❌ Remove VIP", "📋 VIP List"],
+        ["🔙 Back", "🏠 Main Menu"],
+    ])
+
+
+def wallet_admin_keyboard():
+    return kb([
+        ["💸 Pending Withdrawals"],
+        ["💰 Add Balance"],
+        ["➖ Remove Balance"],
+        ["⚙️ Withdrawal Settings"],
+        ["🔙 Back", "🏠 Main Menu"],
+    ])
+
+
+# ============================================================
+# MESSAGE / TEMPLATE
+# ============================================================
+
+def direction_text(direction):
+    d = direction.upper()
+
+    if d in ("UP", "BUY", "CALL"):
+        return "🟢⬆️ <b>UP / BUY</b>"
+
+    if d in ("DOWN", "SELL", "PUT"):
+        return "🔴⬇️ <b>DOWN / SELL</b>"
+
+    return f"📌 <b>{d}</b>"
+
+
+def signal_message(signal, user_id):
+    row = reset_daily_mm_if_needed(user_id)
+    amount = current_trade_amount(user_id)
+
+    date = signal["signal_date"]
+    tm = signal["signal_time"]
+
+    template = get_setting("signal_template")
+
+    values = {
+        "date": date,
+        "time": tm,
+        "pair": signal["pair"],
+        "direction": direction_text(signal["direction"]),
+        "confidence": signal["confidence"] or "-",
+        "signal_id": signal["id"],
+        "trade_amount": money(amount),
+        "stage": row["stage"],
+        "remaining_signals": free_remaining(user_id)
+    }
+
+    try:
+        return template.format(**values)
+    except Exception:
+        return (
+            f"📅 <b>{date}</b>\n\n"
+            f"💱 <b>{signal['pair']}</b>\n"
+            f"⏰ <b>{tm}</b>\n"
+            f"{direction_text(signal['direction'])}\n"
+            f"🎯 Confidence: <b>{signal['confidence']}</b>"
+        )
+
+
+# ============================================================
+# START / MAIN
+# ============================================================
+
+def send_main_menu(chat_id):
+    if is_admin(chat_id) or admin_row(chat_id):
+        bot.send_message(
+            chat_id,
+            get_setting("admin_menu_title"),
+            reply_markup=admin_keyboard()
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            get_setting("main_menu_title"),
+            reply_markup=user_keyboard(chat_id)
+        )
+
+
+@bot.message_handler(commands=["start"])
+def start_handler(message):
+    register_user(message)
+
+    if get_setting("maintenance") == "1" and not is_admin(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            get_setting("maintenance_text"),
+            reply_markup=user_keyboard(message.from_user.id)
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        get_setting("welcome"),
+        reply_markup=(
+            admin_keyboard()
+            if is_admin(message.from_user.id) or admin_row(message.from_user.id)
+            else user_keyboard(message.from_user.id)
+        )
+    )
+
+
+# ============================================================
+# COMMON FUNCTIONS
+# ============================================================
+
+def set_state(user_id, action, data=None):
+    STATE[user_id] = {
+        "action": action,
+        "data": data or {}
+    }
+
+
+def get_state(user_id):
+    return STATE.get(user_id)
+
+
+def clear_state(user_id):
+    STATE.pop(user_id, None)
+
+
+def send_back(chat_id):
+    if is_admin(chat_id) or admin_row(chat_id):
+        bot.send_message(
+            chat_id,
+            "↩️ Back",
+            reply_markup=admin_keyboard()
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            "↩️ Back",
+            reply_markup=user_keyboard(chat_id)
+        )
+
+
+# ============================================================
+# USER FUTURE SIGNALS
+# ============================================================
+
+def handle_future_signals_user(message):
+
+    user_id = message.from_user.id
+
+    if not is_vip(user_id):
+
+        reset_daily_mm_if_needed(user_id)
+
+        mm = ensure_mm(user_id)
+
+        if not mm["balance_confirmed"]:
+            set_state(user_id, "SET_BALANCE_FOR_SIGNAL")
+
+            bot.send_message(
+                user_id,
+                get_setting("balance_required"),
+                reply_markup=back_keyboard()
+            )
+            return
+
+    remaining = free_remaining(user_id)
+
+    bot.send_message(
+        user_id,
+        get_setting("quota_text").replace(
+            "{remaining}",
+            "Unlimited" if is_vip(user_id) else str(remaining)
+        ),
+        reply_markup=kb([
+            ["📅 Today's Signals"],
+            ["📜 Signal History"],
+            ["🔙 Back", "🏠 Main Menu"]
+        ])
+    )
+
+
+def send_todays_signals(user_id):
+
+    today = now_bd().date().isoformat()
+
+    rows = db_execute(
+        """
+        SELECT * FROM signals
+        WHERE signal_date=?
+        ORDER BY signal_time
+        """,
+        (today,),
+        fetchall=True
+    )
+
+    if not rows:
+        bot.send_message(
+            user_id,
+            "📭 No signals available for today.",
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    sent = 0
+
+    for signal in rows:
+        if signal["status"] != "SENT":
+            continue
+
+        if signal["audience"] == "VIP" and not is_vip(user_id):
+            continue
+
+        if signal["audience"] == "SELECTED":
+            selected = db_execute(
+                """
+                SELECT 1 FROM selected_signal_users
+                WHERE signal_id=? AND telegram_id=?
+                """,
+                (signal["id"], user_id),
+                fetchone=True
+            )
+            if not selected:
+                continue
+
+        existing = db_execute(
+            """
+            SELECT * FROM signal_access
+            WHERE signal_id=? AND telegram_id=?
+            """,
+            (signal["id"], user_id),
+            fetchone=True
+        )
+
+        if existing:
+            continue
+
+        consume = 0
+
+        if signal["audience"] == "ALL" and not is_vip(user_id):
+            if free_remaining(user_id) <= 0:
+                break
+            consume = 1
+
+        try:
+            bot.send_message(
+                user_id,
+                signal_message(signal, user_id)
+            )
+
+            db_execute(
+                """
+                INSERT INTO signal_access(
+                    signal_id,telegram_id,delivered_at,consumed_quota
+                )
+                VALUES(?,?,?,?)
+                """,
+                (
+                    signal["id"],
+                    user_id,
+                    now_str(),
+                    consume
+                )
+            )
+
+            sent += 1
+
+        except Exception:
+            logger.exception("Signal delivery error")
+
+    bot.send_message(
+        user_id,
+        f"📡 Sent <b>{sent}</b> available signal(s).",
+        reply_markup=user_keyboard(user_id)
+    )
+
+
+# ============================================================
+# ADMIN FUTURE SIGNAL BULK PARSER
+# ============================================================
+
+def parse_signal_line(line, default_date=None):
+
+    line = line.strip()
+
+    if not line:
+        return None
+
+    # Full format:
+    # 21-09-2026 12:30 | EURUSD | UP | 95
+    m = re.match(
+        r"^(\d{1,2}[-/]\d{1,2}[-/]\d{4})\s+"
+        r"(\d{1,2}:\d{2})\s*\|\s*"
+        r"([^|]+)\|\s*"
+        r"(UP|DOWN|BUY|SELL|CALL|PUT)"
+        r"(?:\s*\|\s*(\d+(?:\.\d+)?))?$",
+        line,
+        re.I
+    )
+
+    if m:
+        raw_date, tm, pair, direction, confidence = m.groups()
+
+        raw_date = raw_date.replace("/", "-")
+
+        parts = raw_date.split("-")
+
+        if len(parts[0]) == 4:
+            date = raw_date
+        else:
+            date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+
+        return {
+            "date": date,
+            "time": tm,
+            "pair": pair.strip().upper(),
+            "direction": direction.upper(),
+            "confidence": confidence or ""
+        }
+
+    # Short format:
+    # 12:30 EURUSD UP 95
+    if default_date:
+
+        m = re.match(
+            r"^(\d{1,2}:\d{2})\s+"
+            r"([A-Za-z0-9._/-]+)\s+"
+            r"(UP|DOWN|BUY|SELL|CALL|PUT)"
+            r"(?:\s+(\d+(?:\.\d+)?))?$",
+            line,
+            re.I
+        )
+
+        if m:
+            tm, pair, direction, confidence = m.groups()
+
+            return {
+                "date": default_date,
+                "time": tm,
+                "pair": pair.upper(),
+                "direction": direction.upper(),
+                "confidence": confidence or ""
+            }
+
+    return None
+
+
+def save_bulk_signals(text, default_date, audience, admin_id):
+
+    created = []
+    failed = []
+
+    for line in text.splitlines():
+
+        item = parse_signal_line(line, default_date)
+
+        if not item:
+            failed.append(line)
+            continue
+
+        try:
+            datetime.strptime(
+                f"{item['date']} {item['time']}",
+                "%Y-%m-%d %H:%M"
+            )
+
+            db_execute(
+                """
+                INSERT INTO signals(
+                    signal_date,signal_time,pair,direction,
+                    confidence,audience,status,created_by,created_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    item["date"],
+                    item["time"],
+                    item["pair"],
+                    item["direction"],
+                    item["confidence"],
+                    audience,
+                    "PENDING",
+                    admin_id,
+                    now_str()
+                )
+            )
+
+            created.append(item)
+
+        except Exception:
+            failed.append(line)
+
+    return created, failed
+
+
+# ============================================================
+# LIVE SESSION
+# ============================================================
+
+def active_live_session():
+    return db_execute(
+        """
+        SELECT * FROM live_sessions
+        WHERE status='ACTIVE'
+        ORDER BY id DESC LIMIT 1
+        """,
+        fetchone=True
+    )
+
+
+def start_live_session(admin_id):
+    existing = active_live_session()
+
+    if existing:
+        return existing
+
+    db_execute(
+        """
+        INSERT INTO live_sessions(started_at,status)
+        VALUES(?,?)
+        """,
+        (now_str(), "ACTIVE")
+    )
+
+    return active_live_session()
+
+
+def end_live_session():
+    session = active_live_session()
+
+    if not session:
+        return
+
+    db_execute(
+        """
+        UPDATE live_sessions
+        SET ended_at=?,status='ENDED'
+        WHERE id=?
+        """,
+        (now_str(), session["id"])
+    )
+
+
+def send_live_to_vips(content, admin_id):
+
+    session = active_live_session()
+
+    if not session:
+        return 0
+
+    users = db_execute(
+        """
+        SELECT telegram_id
+        FROM users
+        WHERE live_signal_on=1
+        """,
+        fetchall=True
+    )
+
+    sent = 0
+
+    template = get_setting("live_template")
+
+    try:
+        formatted = template.format(content=content)
+    except Exception:
+        formatted = content
+
+    for u in users:
+        try:
+            if is_vip(u["telegram_id"]):
+                bot.send_message(
+                    u["telegram_id"],
+                    formatted
+                )
+
+                db_execute(
+                    """
+                    INSERT INTO live_signals(
+                        session_id,telegram_id,content,created_at
+                    )
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        session["id"],
+                        u["telegram_id"],
+                        content,
+                        now_str()
+                    )
+                )
+
+                sent += 1
+
+        except Exception:
+            pass
+
+    return sent
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+def broadcast(text, target="ALL", selected=None):
+
+    if target == "VIP":
+        users = db_execute(
+            "SELECT telegram_id FROM users",
+            fetchall=True
+        )
+        users = [
+            u for u in users
+            if is_vip(u["telegram_id"])
+        ]
+
+    elif target == "SELECTED":
+        users = [
+            {"telegram_id": x}
+            for x in (selected or [])
+        ]
+
+    else:
+        users = db_execute(
+            "SELECT telegram_id FROM users",
+            fetchall=True
+        )
+
+    sent = 0
+
+    for u in users:
+        try:
+            bot.send_message(
+                u["telegram_id"],
+                text
+            )
+            sent += 1
+        except Exception:
+            pass
+
+    return sent
+
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+
+def admin_dashboard(chat_id):
+
+    users = db_execute(
+        "SELECT COUNT(*) AS c FROM users",
+        fetchone=True
+    )["c"]
+
+    vip = sum(
+        1
+        for u in db_execute(
+            "SELECT telegram_id FROM users",
+            fetchall=True
+        )
+        if is_vip(u["telegram_id"])
+    )
+
+    pending_uid = db_execute(
+        """
+        SELECT COUNT(*) AS c FROM uid_submissions
+        WHERE status='PENDING'
+        """,
+        fetchone=True
+    )["c"]
+
+    pending_withdraw = db_execute(
+        """
+        SELECT COUNT(*) AS c FROM withdrawals
+        WHERE status='PENDING'
+        """,
+        fetchone=True
+    )["c"]
+
+    signals = db_execute(
+        """
+        SELECT COUNT(*) AS c FROM signals
+        WHERE signal_date=?
+        """,
+        (now_bd().date().isoformat(),),
+        fetchone=True
+    )["c"]
+
+    text = (
+        "📊 <b>Admin Dashboard</b>\n\n"
+        f"👥 Users: <b>{users}</b>\n"
+        f"⭐ VIP: <b>{vip}</b>\n"
+        f"🆔 Pending UID: <b>{pending_uid}</b>\n"
+        f"💸 Pending Withdraw: <b>{pending_withdraw}</b>\n"
+        f"📡 Today's Signals: <b>{signals}</b>\n"
+        f"🛠 Maintenance: <b>{'ON' if get_setting('maintenance') == '1' else 'OFF'}</b>\n"
+        f"💸 Withdrawals: <b>{'ON' if get_setting('withdrawals') == '1' else 'OFF'}</b>"
+    )
+
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=admin_keyboard()
+    )
+
+
+# ============================================================
+# UID
+# ============================================================
+
+def submit_uid(user_id, uid):
+
+    uid = uid.strip()
+
+    duplicate_user = db_execute(
+        "SELECT telegram_id FROM users WHERE uid=?",
+        (uid,),
+        fetchone=True
+    )
+
+    if duplicate_user:
+        return False, get_setting("uid_duplicate")
+
+    pending = db_execute(
+        """
+        SELECT id FROM uid_submissions
+        WHERE telegram_id=? AND status='PENDING'
+        """,
+        (user_id,),
+        fetchone=True
+    )
+
+    if pending:
+        return False, get_setting("uid_pending")
+
+    db_execute(
+        """
+        INSERT INTO uid_submissions(
+            telegram_id,uid,status,created_at
+        )
+        VALUES(?,?,?,?)
+        """,
+        (user_id, uid, "PENDING", now_str())
+    )
+
+    return True, "✅ UID submitted. Waiting for admin approval."
+
+
+# ============================================================
+# VIP
+# ============================================================
+
+def add_vip(user_id, days):
+
+    until = now_bd() + timedelta(days=days)
+
+    db_execute(
+        """
+        UPDATE users
+        SET vip_until=?
+        WHERE telegram_id=?
+        """,
+        (until.isoformat(), user_id)
+    )
+
+
+def remove_vip(user_id):
+
+    db_execute(
+        """
+        UPDATE users
+        SET vip_until=NULL
+        WHERE telegram_id=?
+        """,
+        (user_id,)
+    )
+
+
+# ============================================================
+# WALLET
+# ============================================================
+
+def wallet_balance(user_id):
+
+    row = user_row(user_id)
+
+    return row["balance_cents"] if row else 0
+
+
+def wallet_add(user_id, amount, tx_type, description):
+
+    db_execute(
+        """
+        UPDATE users
+        SET balance_cents=balance_cents+?
+        WHERE telegram_id=?
+        """,
+        (amount, user_id)
+    )
+
+    db_execute(
+        """
+        INSERT INTO wallet_transactions(
+            telegram_id,type,amount_cents,description,created_at
+        )
+        VALUES(?,?,?,?,?)
+        """,
+        (
+            user_id,
+            tx_type,
+            amount,
+            description,
+            now_str()
+        )
+    )
+
+
+def wallet_remove(user_id, amount, tx_type, description):
+
+    row = user_row(user_id)
+
+    if not row or row["balance_cents"] < amount:
+        return False
+
+    db_execute(
+        """
+        UPDATE users
+        SET balance_cents=balance_cents-?
+        WHERE telegram_id=?
+        """,
+        (amount, user_id)
+    )
+
+    db_execute(
+        """
+        INSERT INTO wallet_transactions(
+            telegram_id,type,amount_cents,description,created_at
+        )
+        VALUES(?,?,?,?,?)
+        """,
+        (
+            user_id,
+            tx_type,
+            -amount,
+            description,
+            now_str()
+        )
+    )
 
     return True
 
 
 # ============================================================
-# SIGNAL FORMAT
+# REFERRAL
 # ============================================================
 
-def direction_display(direction):
-    direction = direction.upper()
+def process_referral_bonus(user_id):
 
-    if direction in ("UP", "BUY", "CALL"):
-        return "🟢 ⬆️ <b>UP / BUY</b>"
+    user = user_row(user_id)
 
-    return "🔴 ⬇️ <b>DOWN / SELL</b>"
+    if not user or not user["referred_by"] or user["referral_paid"]:
+        return
 
-
-def parse_signal_datetime(date_text, time_text):
-    date_text = date_text.strip()
-    time_text = time_text.strip().upper()
-
-    formats = [
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %I:%M %p",
-        "%d-%m-%Y %H:%M",
-        "%d-%m-%Y %I:%M %p"
-    ]
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(
-                f"{date_text} {time_text}",
-                fmt
-            ).replace(tzinfo=BD_TZ)
-        except ValueError:
-            continue
-
-    raise ValueError
-
-
-def signal_due_datetime(row):
-    return datetime.strptime(
-        f"{row['signal_date']} {row['signal_time']}",
-        "%Y-%m-%d %H:%M"
-    ).replace(tzinfo=BD_TZ)
-
-
-def user_can_receive_signal(user_id, signal):
-    audience = signal["audience"]
-
-    if audience == "ALL":
-        if vip_active(user_id):
-            return True
-
-        reset_cycle(user_id)
-        u = user_row(user_id)
-
-        return u["free_used"] < free_limit(user_id)
-
-    if audience == "VIP":
-        return vip_active(user_id)
-
-    if audience == "SELECTED":
-        ids = [
-            x.strip()
-            for x in (signal["selected_users"] or "").split(",")
-            if x.strip()
-        ]
-
-        return str(user_id) in ids
-
-    return False
-
-
-def next_future_signal(user_id):
-    with DB_LOCK:
-        conn = db()
-        rows = conn.execute("""
-            SELECT *
-            FROM signals
-            WHERE sent=0
-            ORDER BY signal_date ASC,signal_time ASC
-        """).fetchall()
-        conn.close()
-
-    for signal in rows:
-        if user_can_receive_signal(user_id, signal):
-            return signal
-
-    return None
-
-
-def send_signal_to_user(user_id, signal, quota=False):
-    with DB_LOCK:
-        conn = db()
-
-        exists = conn.execute("""
-            SELECT id FROM signal_deliveries
-            WHERE user_id=? AND signal_id=?
-        """, (
-            user_id,
-            signal["id"]
-        )).fetchone()
-
-        if exists:
-            conn.close()
-            return False
-
-        conn.execute("""
-            INSERT INTO signal_deliveries(
-                user_id,signal_id,delivered_at,quota_used
-            )
-            VALUES(?,?,?,?)
-        """, (
-            user_id,
-            signal["id"],
-            now_utc().isoformat(),
-            1 if quota else 0
-        ))
-
-        if quota:
-            conn.execute("""
-                UPDATE users
-                SET free_used=free_used+1
-                WHERE user_id=?
-            """, (user_id,))
-
-        conn.commit()
-        conn.close()
-
-    trade, stage = current_trade(user_id)
-
-    u = user_row(user_id)
-
-    if vip_active(user_id):
-        remaining = "UNLIMITED"
-    else:
-        remaining = str(
-            max(
-                0,
-                free_limit(user_id) - u["free_used"]
-            )
-        )
-
-    message = T("signal").format(
-        date=signal["signal_date"],
-        time=signal["signal_time"],
-        pair=escape(signal["pair"]),
-        direction=direction_display(signal["direction"]),
-        confidence=escape(
-            signal["confidence"] or
-            get_setting("confidence", "95–99%")
-        ),
-        trade_amount=money(trade),
-        stage=stage,
-        remaining=remaining
+    already = db_execute(
+        """
+        SELECT id FROM referral_transactions
+        WHERE referred_id=?
+        """,
+        (user_id,),
+        fetchone=True
     )
 
-    try:
-        bot.send_message(
+    if already:
+        return
+
+    qualifying = db_execute(
+        """
+        SELECT id FROM signal_access
+        WHERE telegram_id=?
+        LIMIT 1
+        """,
+        (user_id,),
+        fetchone=True
+    )
+
+    if not qualifying:
+        return
+
+    bonus = cents(get_setting("referral_bonus", "1"))
+
+    wallet_add(
+        user["referred_by"],
+        bonus,
+        "REFERRAL",
+        f"Referral bonus from {user_id}"
+    )
+
+    db_execute(
+        """
+        INSERT INTO referral_transactions(
+            referrer_id,referred_id,amount_cents,created_at
+        )
+        VALUES(?,?,?,?)
+        """,
+        (
+            user["referred_by"],
             user_id,
-            message,
-            reply_markup=main_menu(user_id)
+            bonus,
+            now_str()
         )
-        return True
-    except Exception:
-        logger.exception("Signal send failed")
-        return False
+    )
 
-
-# ============================================================
-# START
-# ============================================================
-
-@bot.message_handler(commands=["start"])
-def start_handler(message):
-    try:
-        referral = None
-
-        parts = message.text.split(maxsplit=1)
-
-        if len(parts) == 2 and parts[1].startswith("ref_"):
-            try:
-                referral = int(parts[1][4:])
-            except Exception:
-                referral = None
-
-        register_user(message.from_user, referral)
-
-        bot.send_message(
-            message.chat.id,
-            T("welcome"),
-            reply_markup=main_menu(message.from_user.id)
-        )
-
-    except Exception:
-        logger.exception("Start error")
-        bot.send_message(
-            message.chat.id,
-            T("error"),
-            reply_markup=main_menu(message.from_user.id)
-        )
-
-
-# ============================================================
-# CANCEL
-# ============================================================
-
-@bot.message_handler(commands=["cancel"])
-def cancel_handler(message):
-    STATES.pop(message.from_user.id, None)
-
-    bot.send_message(
-        message.chat.id,
-        T("cancelled"),
-        reply_markup=main_menu(message.from_user.id)
+    db_execute(
+        """
+        UPDATE users
+        SET referral_paid=1
+        WHERE telegram_id=?
+        """,
+        (user_id,)
     )
 
 
 # ============================================================
-# USER ACTIONS
+# WITHDRAW
 # ============================================================
 
-def handle_user_button(message):
+def create_withdraw(user_id, amount_cents, method, account):
 
-    uid = message.from_user.id
-    text = message.text
+    if get_setting("withdrawals") != "1":
+        return False, get_setting("withdraw_disabled")
 
-    register_user(message.from_user)
+    minimum = cents(get_setting("min_withdraw", "5"))
 
-    if maintenance_blocked(uid):
-        bot.send_message(
-            message.chat.id,
-            T("maintenance"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Notice
-    if text == T("btn_notice"):
-        notice = get_setting("notice", "").strip()
-
-        bot.send_message(
-            message.chat.id,
-            notice if notice else T("notice_empty"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Rules
-    if text == T("btn_rules"):
-        bot.send_message(
-            message.chat.id,
-            get_setting("rules_text", T("rules")),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Help
-    if text == T("btn_help"):
-        bot.send_message(
-            message.chat.id,
-            T("help"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Future signal
-    if text == T("btn_future"):
-        reset_mm_day(uid)
-
-        if not ensure_balance_before_signal(uid):
-            bot.send_message(
-                message.chat.id,
-                T("trade_stopped") +
-                "\n\n" +
-                mm_text(uid),
-                reply_markup=money_menu()
-            )
-            return
-
-        signal = next_future_signal(uid)
-
-        if not signal:
-            bot.send_message(
-                message.chat.id,
-                T("future_empty"),
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        quota = (
-            not vip_active(uid)
-            and signal["audience"] == "ALL"
+    if amount_cents < minimum:
+        return False, get_setting("withdraw_min").replace(
+            "{amount}",
+            money(minimum)
         )
 
-        if quota:
-            if user_row(uid)["free_used"] >= free_limit(uid):
-                bot.send_message(
-                    message.chat.id,
-                    T("quota_end"),
-                    reply_markup=main_menu(uid)
-                )
-                return
+    if not wallet_remove(
+        user_id,
+        amount_cents,
+        "WITHDRAW_HOLD",
+        "Withdrawal request"
+    ):
+        return False, "❌ Insufficient balance."
 
-        send_signal_to_user(
-            uid,
-            signal,
-            quota=quota
+    db_execute(
+        """
+        INSERT INTO withdrawals(
+            telegram_id,amount_cents,method,account,
+            status,created_at
         )
-
-        return
-
-    # Money management
-    if text == T("btn_money"):
-        show_mm(message)
-        return
-
-    if text == T("btn_set_balance"):
-        mm_set_value(
-            message,
-            "balance_cents",
-            T("balance_prompt")
+        VALUES(?,?,?,?,?,?)
+        """,
+        (
+            user_id,
+            amount_cents,
+            method,
+            account,
+            "PENDING",
+            now_str()
         )
-        return
+    )
 
-    if text == T("btn_set_target"):
-        mm_set_value(
-            message,
-            "profit_target_cents",
-            T("target_prompt")
-        )
-        return
-
-    if text == T("btn_set_loss"):
-        mm_set_value(
-            message,
-            "loss_limit_cents",
-            T("loss_prompt")
-        )
-        return
-
-    if text == T("btn_set_base"):
-        mm_set_value(
-            message,
-            "base_trade_cents",
-            T("base_prompt")
-        )
-        return
-
-    if text == T("btn_set_m1"):
-        mm_set_value(
-            message,
-            "m1_trade_cents",
-            T("m1_prompt")
-        )
-        return
-
-    if text == T("btn_set_max"):
-        STATES[uid] = {
-            "action": "mm_int",
-            "field": "max_trades"
-        }
-
-        bot.send_message(
-            message.chat.id,
-            T("max_prompt"),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    if text == T("btn_mm_status"):
-        show_mm(message)
-        return
-
-    if text == T("btn_stop"):
-        update_mm_value(uid, "stopped", 1)
-        bot.send_message(
-            message.chat.id,
-            T("trade_stopped"),
-            reply_markup=money_menu()
-        )
-        return
-
-    if text == T("btn_resume"):
-        update_mm_value(uid, "stopped", 0)
-        bot.send_message(
-            message.chat.id,
-            "▶️ Trading resumed.",
-            reply_markup=money_menu()
-        )
-        return
-
-    # Wallet
-    if text == T("btn_wallet"):
-        u = user_row(uid)
-
-        bot.send_message(
-            message.chat.id,
-            T("wallet").format(
-                balance=money(u["wallet_cents"]),
-                refs=u["refs_count"]
-            ),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Referral
-    if text == T("btn_referral"):
-        try:
-            me = bot.get_me()
-            link = f"https://t.me/{me.username}?start=ref_{uid}"
-
-            bot.send_message(
-                message.chat.id,
-                T("referral").format(
-                    link=escape(link),
-                    bonus=money(
-                        setting_int(
-                            "referral_bonus_cents",
-                            100
-                        )
-                    )
-                ),
-                reply_markup=main_menu(uid)
-            )
-        except Exception:
-            bot.send_message(
-                message.chat.id,
-                T("error"),
-                reply_markup=main_menu(uid)
-            )
-        return
-
-    # VIP
-    if text == T("btn_vip"):
-        u = user_row(uid)
-
-        expiry = u["vip_until"] or "No expiry"
-
-        bot.send_message(
-            message.chat.id,
-            T("vip_message") +
-            f"\n\n⏳ Expiry: <b>{escape(expiry)}</b>",
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # UID
-    if text == T("btn_uid"):
-        if vip_active(uid):
-            bot.send_message(
-                message.chat.id,
-                T("vip_message"),
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        with DB_LOCK:
-            conn = db()
-
-            pending = conn.execute("""
-                SELECT id FROM uid_submissions
-                WHERE user_id=? AND status='PENDING'
-                LIMIT 1
-            """, (uid,)).fetchone()
-
-            approved = conn.execute("""
-                SELECT id FROM uid_submissions
-                WHERE user_id=? AND status='APPROVED'
-                LIMIT 1
-            """, (uid,)).fetchone()
-
-            conn.close()
-
-        if pending or approved:
-            bot.send_message(
-                message.chat.id,
-                T("uid_pending"),
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        STATES[uid] = {"action": "uid"}
-
-        bot.send_message(
-            message.chat.id,
-            T("uid_prompt"),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Status
-    if text == T("btn_status"):
-        u = user_row(uid)
-        reset_cycle(uid)
-        u = user_row(uid)
-
-        remaining = (
-            "UNLIMITED"
-            if vip_active(uid)
-            else str(
-                max(
-                    0,
-                    free_limit(uid) - u["free_used"]
-                )
-            )
-        )
-
-        bot.send_message(
-            message.chat.id,
-            (
-                "👤 <b>MY STATUS</b>\n\n"
-                f"🆔 ID: <code>{uid}</code>\n"
-                f"⭐ Status: <b>{u['status']}</b>\n"
-                f"💰 Wallet: <b>${money(u['wallet_cents'])}</b>\n"
-                f"👥 Referrals: <b>{u['refs_count']}</b>\n"
-                f"🎟️ Remaining Signals: <b>{remaining}</b>"
-            ),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # History
-    if text == T("btn_history"):
-        with DB_LOCK:
-            conn = db()
-            rows = conn.execute("""
-                SELECT s.*,r.result
-                FROM signal_deliveries d
-                JOIN signals s ON s.id=d.signal_id
-                LEFT JOIN signal_results r
-                    ON r.signal_id=s.id
-                    AND r.user_id=?
-                WHERE d.user_id=?
-                ORDER BY d.id DESC
-                LIMIT 10
-            """, (uid, uid)).fetchall()
-            conn.close()
-
-        if not rows:
-            msg = "📜 কোনো signal history নেই।"
-        else:
-            lines = ["📜 <b>SIGNAL HISTORY</b>\n"]
-
-            for r in rows:
-                result = r["result"] or "PENDING"
-
-                lines.append(
-                    f"#{r['id']} | "
-                    f"{r['signal_date']} "
-                    f"{r['signal_time']} | "
-                    f"{escape(r['pair'])} | "
-                    f"<b>{result}</b>"
-                )
-
-            msg = "\n".join(lines)
-
-        bot.send_message(
-            message.chat.id,
-            msg,
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Vote
-    if text == T("btn_vote"):
-        with DB_LOCK:
-            conn = db()
-            row = conn.execute("""
-                SELECT s.*
-                FROM signal_deliveries d
-                JOIN signals s ON s.id=d.signal_id
-                LEFT JOIN signal_votes v
-                    ON v.signal_id=s.id
-                    AND v.user_id=?
-                WHERE d.user_id=?
-                AND v.id IS NULL
-                ORDER BY d.id DESC
-                LIMIT 1
-            """, (uid, uid)).fetchone()
-            conn.close()
-
-        if not row:
-            bot.send_message(
-                message.chat.id,
-                "🗳 কোনো pending vote নেই।",
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        STATES[uid] = {
-            "action": "vote",
-            "signal_id": row["id"]
-        }
-
-        bot.send_message(
-            message.chat.id,
-            T("vote_prompt"),
-            reply_markup=kb([
-                [T("btn_up"), T("btn_down")],
-                [T("btn_vote_skip")],
-                [T("btn_back")]
-            ])
-        )
-        return
-
-    # Result
-    if text == T("btn_result"):
-        with DB_LOCK:
-            conn = db()
-            row = conn.execute("""
-                SELECT s.*
-                FROM signal_deliveries d
-                JOIN signals s ON s.id=d.signal_id
-                LEFT JOIN signal_results r
-                    ON r.signal_id=s.id
-                    AND r.user_id=?
-                WHERE d.user_id=?
-                AND r.id IS NULL
-                ORDER BY d.id DESC
-                LIMIT 1
-            """, (uid, uid)).fetchone()
-            conn.close()
-
-        if not row:
-            bot.send_message(
-                message.chat.id,
-                "📈 কোনো pending signal result নেই।",
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        STATES[uid] = {
-            "action": "result",
-            "signal_id": row["id"]
-        }
-
-        bot.send_message(
-            message.chat.id,
-            "📈 এই signal-এর result নির্বাচন করুন।",
-            reply_markup=kb([
-                [T("btn_win"), T("btn_loss")],
-                [T("btn_skip")],
-                [T("btn_back")]
-            ])
-        )
-        return
-
-    # Notifications
-    if text == T("btn_notification"):
-        u = user_row(uid)
-        new_value = 0 if u["notifications"] else 1
-
-        with DB_LOCK:
-            conn = db()
-            conn.execute(
-                "UPDATE users SET notifications=? WHERE user_id=?",
-                (new_value, uid)
-            )
-            conn.commit()
-            conn.close()
-
-        bot.send_message(
-            message.chat.id,
-            T("notification_on")
-            if new_value
-            else T("notification_off"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Live user
-    if text == T("btn_live"):
-        bot.send_message(
-            message.chat.id,
-            "⚡ Live signal session বর্তমানে admin-controlled।",
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Back/home
-    if text == T("btn_home"):
-        bot.send_message(
-            message.chat.id,
-            "🏠 Main Menu",
-            reply_markup=main_menu(uid)
-        )
-        return
-
-
-# ============================================================
-# ADMIN MENU
-# ============================================================
-
-def admin_action(message):
-
-    uid = message.from_user.id
-    text = message.text
-
-    if not is_admin(uid):
-        bot.send_message(
-            message.chat.id,
-            T("admin_denied"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    # Add signal
-    if text == T("btn_add_signal"):
-        STATES[uid] = {
-            "action": "add_signal_date"
-        }
-
-        bot.send_message(
-            uid,
-            "📅 Signal date লিখুন:\n\nExample: 2026-09-25",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Signal manager
-    if text == T("btn_signals"):
-        with DB_LOCK:
-            conn = db()
-            rows = conn.execute("""
-                SELECT *
-                FROM signals
-                ORDER BY id DESC
-                LIMIT 15
-            """).fetchall()
-            conn.close()
-
-        if not rows:
-            msg = "📊 কোনো signal নেই।"
-        else:
-            lines = ["📊 <b>SIGNAL MANAGER</b>\n"]
-
-            for r in rows:
-                lines.append(
-                    f"#{r['id']} | "
-                    f"{r['signal_date']} "
-                    f"{r['signal_time']} | "
-                    f"{escape(r['pair'])} | "
-                    f"{r['direction']} | "
-                    f"{r['audience']}"
-                )
-
-            msg = "\n".join(lines)
-
-        bot.send_message(
-            uid,
-            msg,
-            reply_markup=admin_menu()
-        )
-        return
-
-    # Live session
-    if text == T("btn_live_session"):
-        with DB_LOCK:
-            conn = db()
-
-            active = conn.execute("""
-                SELECT id FROM live_sessions
-                WHERE active=1
-                ORDER BY id DESC
-                LIMIT 1
-            """).fetchone()
-
-            if not active:
-                cur = conn.execute("""
-                    INSERT INTO live_sessions(started_at,active)
-                    VALUES(?,1)
-                """, (now_utc().isoformat(),))
-
-                session_id = cur.lastrowid
-                conn.commit()
-            else:
-                session_id = active["id"]
-
-            conn.close()
-
-        STATES[uid] = {
-            "action": "live_signal",
-            "session_id": session_id
-        }
-
-        bot.send_message(
-            uid,
-            T("live_prompt"),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Users
-    if text == T("btn_users"):
-        with DB_LOCK:
-            conn = db()
-
-            total = conn.execute(
-                "SELECT COUNT(*) c FROM users"
-            ).fetchone()["c"]
-
-            vip = conn.execute(
-                "SELECT COUNT(*) c FROM users WHERE status='VIP'"
-            ).fetchone()["c"]
-
-            conn.close()
-
-        bot.send_message(
-            uid,
-            (
-                "👥 <b>USERS</b>\n\n"
-                f"Total: <b>{total}</b>\n"
-                f"VIP: <b>{vip}</b>"
-            ),
-            reply_markup=admin_menu()
-        )
-        return
-
-    # Pending UID
-    if text == T("btn_uid_pending"):
-        if not can(uid, "uid"):
-            bot.send_message(uid, T("admin_denied"))
-            return
-
-        with DB_LOCK:
-            conn = db()
-            rows = conn.execute("""
-                SELECT * FROM uid_submissions
-                WHERE status='PENDING'
-                ORDER BY id DESC
-                LIMIT 20
-            """).fetchall()
-            conn.close()
-
-        if not rows:
-            msg = "🆔 কোনো pending UID নেই।"
-        else:
-            lines = ["🆔 <b>PENDING UID</b>\n"]
-
-            for r in rows:
-                lines.append(
-                    f"ID: {r['id']}\n"
-                    f"User: <code>{r['user_id']}</code>\n"
-                    f"UID: <code>{escape(r['uid'])}</code>\n"
-                    f"Approve করতে: <code>/approve_uid {r['id']}</code>\n"
-                    f"Reject করতে: <code>/reject_uid {r['id']}</code>\n"
-                )
-
-            msg = "\n".join(lines)
-
-        bot.send_message(
-            uid,
-            msg,
-            reply_markup=admin_menu()
-        )
-        return
-
-    # VIP manager
-    if text == T("btn_vip_manage"):
-        STATES[uid] = {
-            "action": "vip_manage"
-        }
-
-        bot.send_message(
-            uid,
-            (
-                "⭐ VIP Manager\n\n"
-                "Format:\n"
-                "<code>USER_ID DAYS</code>\n\n"
-                "Example:\n"
-                "<code>123456789 30</code>"
-            ),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Wallet manager
-    if text == T("btn_wallet_manage"):
-        STATES[uid] = {
-            "action": "wallet_adjust"
-        }
-
-        bot.send_message(
-            uid,
-            (
-                "💳 Wallet Adjust\n\n"
-                "Format:\n"
-                "<code>USER_ID AMOUNT</code>\n\n"
-                "Example:\n"
-                "<code>123456789 10</code>\n\n"
-                "Negative amount দিয়ে deduct করা যাবে।"
-            ),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Withdrawals
-    if text == T("btn_withdraw"):
-        if not can(uid, "withdraw"):
-            bot.send_message(uid, T("admin_denied"))
-            return
-
-        with DB_LOCK:
-            conn = db()
-            rows = conn.execute("""
-                SELECT * FROM withdrawals
-                WHERE status='PENDING'
-                ORDER BY id DESC
-                LIMIT 20
-            """).fetchall()
-            conn.close()
-
-        if not rows:
-            msg = "💸 কোনো pending withdrawal নেই।"
-        else:
-            lines = ["💸 <b>PENDING WITHDRAWALS</b>\n"]
-
-            for r in rows:
-                lines.append(
-                    f"#{r['id']} | "
-                    f"User {r['user_id']} | "
-                    f"${money(r['amount_cents'])}\n"
-                    f"{r['method']} | {escape(r['account'])}\n"
-                    f"Approve: /approve_withdraw {r['id']}\n"
-                    f"Reject: /reject_withdraw {r['id']}\n"
-                )
-
-            msg = "\n".join(lines)
-
-        bot.send_message(
-            uid,
-            msg,
-            reply_markup=admin_menu()
-        )
-        return
-
-    # Broadcast
-    if text == T("btn_broadcast"):
-        STATES[uid] = {
-            "action": "broadcast"
-        }
-
-        bot.send_message(
-            uid,
-            T("broadcast_prompt"),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Text editor
-    if text == T("btn_text_editor"):
-        show_text_editor(uid)
-        return
-
-    # Notice edit
-    if text == T("btn_notice_edit"):
-        STATES[uid] = {
-            "action": "edit_notice"
-        }
-
-        bot.send_message(
-            uid,
-            "📢 নতুন Notice text পাঠান।",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Rules edit
-    if text == T("btn_rules_edit"):
-        STATES[uid] = {
-            "action": "edit_rules"
-        }
-
-        bot.send_message(
-            uid,
-            "📖 নতুন Trading Rules text পাঠান।",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Sub admins
-    if text == T("btn_subadmins"):
-        if not can(uid, "ALL"):
-            bot.send_message(uid, T("admin_denied"))
-            return
-
-        STATES[uid] = {
-            "action": "subadmin"
-        }
-
-        bot.send_message(
-            uid,
-            (
-                "🛡 <b>SUB-ADMIN</b>\n\n"
-                "Format:\n"
-                "<code>USER_ID permission1,permission2</code>\n\n"
-                "Permissions:\n"
-                "signals, uid, users, wallet, withdraw, "
-                "broadcast, settings, analytics"
-            ),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Settings
-    if text == T("btn_settings"):
-        STATES[uid] = {
-            "action": "setting"
-        }
-
-        bot.send_message(
-            uid,
-            (
-                "⚙️ Settings\n\n"
-                "Format:\n"
-                "<code>KEY VALUE</code>\n\n"
-                "Example:\n"
-                "<code>free_signal_limit 6</code>"
-            ),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Analytics
-    if text == T("btn_analytics"):
-        show_analytics(uid)
-        return
-
-    # Maintenance
-    if text == T("btn_maintenance"):
-        current = get_setting("maintenance", "0")
-        new = "0" if current == "1" else "1"
-        set_setting("maintenance", new)
-
-        bot.send_message(
-            uid,
-            f"🔧 Maintenance: <b>{'ON' if new == '1' else 'OFF'}</b>",
-            reply_markup=admin_menu()
-        )
-        return
-
-    # Backup
-    if text == T("btn_backup"):
-        create_backup()
-
-        bot.send_message(
-            uid,
-            T("backup_done"),
-            reply_markup=admin_menu()
-        )
-        return
-
-    # User manage
-    if text == T("btn_user_manage"):
-        STATES[uid] = {
-            "action": "user_manage"
-        }
-
-        bot.send_message(
-            uid,
-            (
-                "👤 User Manage\n\n"
-                "Format:\n"
-                "<code>USER_ID</code>"
-            ),
-            reply_markup=back_keyboard()
-        )
-        return
-
-    # Back
-    if text == T("btn_back"):
-        bot.send_message(
-            uid,
-            "👑 Admin Panel",
-            reply_markup=admin_menu()
-        )
-        return
-
-    if text == T("btn_home"):
-        bot.send_message(
-            uid,
-            "🏠 Main Menu",
-            reply_markup=main_menu(uid)
-        )
+    return True, get_setting("withdraw_success")
 
 
 # ============================================================
 # TEXT EDITOR
 # ============================================================
 
-TEXT_EDITOR_KEYS = [
-    "welcome",
-    "maintenance",
-    "notice_empty",
-    "rules",
-    "help",
-    "error",
-    "cancelled",
-    "invalid",
-    "uid_prompt",
-    "uid_pending",
-    "uid_success",
-    "uid_duplicate",
-    "vip_message",
-    "wallet",
-    "referral",
-    "future_empty",
-    "quota_end",
-    "signal",
-    "live_signal",
-    "vote_prompt",
-    "vote_saved",
-    "vote_result",
-    "result_saved",
-    "mm",
-    "balance_prompt",
-    "target_prompt",
-    "loss_prompt",
-    "base_prompt",
-    "m1_prompt",
-    "max_prompt",
-    "trade_stopped",
-    "withdraw_off",
-    "withdraw_amount",
-    "withdraw_method",
-    "withdraw_account",
-    "withdraw_success",
-    "withdraw_min",
-    "admin_denied",
-    "broadcast_prompt",
-    "broadcast_done",
-    "live_prompt",
-    "live_ended",
-    "text_saved",
-    "backup_done",
-    "notification_on",
-    "notification_off"
-]
+TEXT_KEYS = {
+    "👋 Welcome": "welcome",
+    "📡 Signal Template": "signal_template",
+    "⚡ Live Template": "live_template",
+    "📢 Notice": "notice",
+    "📖 Trading Rules": "trading_rules",
+    "🛠 Maintenance Text": "maintenance_text",
+    "❌ Error Text": "error_text",
+    "⚠️ Invalid Text": "invalid_text",
+    "⭐ VIP Text": "vip_text",
+    "🔔 Notification ON": "notification_on",
+    "🔕 Notification OFF": "notification_off",
+    "💸 Withdraw Disabled": "withdraw_disabled",
+    "✅ WIN Text": "win_text",
+    "❌ LOSS Text": "loss_text",
+    "⏭ SKIP Text": "skip_text",
+    "⚠️ VIP Expired": "vip_expired",
+    "⚡ Live OFF Text": "live_off",
+}
 
 
-def show_text_editor(user_id):
+def text_editor_keyboard():
+    keys = list(TEXT_KEYS.keys())
     rows = []
 
-    for key in TEXT_EDITOR_KEYS:
-        label = key.replace("_", " ").title()
-        rows.append([label])
+    for i in range(0, len(keys), 2):
+        rows.append(keys[i:i+2])
 
-    rows.append([T("btn_back"), T("btn_home")])
+    rows.append(["🔙 Back", "🏠 Main Menu"])
 
-    bot.send_message(
-        user_id,
-        "📝 <b>BOT TEXT EDITOR</b>\n\n"
-        "যে text পরিবর্তন করতে চান সেটিতে press করুন।",
-        reply_markup=kb(rows)
-    )
-
-    STATES[user_id] = {
-        "action": "choose_text"
-    }
+    return kb(rows)
 
 
 # ============================================================
-# WITHDRAW USER
-# ============================================================
-
-def start_withdraw(message):
-    uid = message.from_user.id
-
-    if get_setting("withdraw_enabled", "1") != "1":
-        bot.send_message(
-            message.chat.id,
-            T("withdraw_off"),
-            reply_markup=main_menu(uid)
-        )
-        return
-
-    STATES[uid] = {
-        "action": "withdraw_amount"
-    }
-
-    bot.send_message(
-        message.chat.id,
-        T("withdraw_amount"),
-        reply_markup=back_keyboard()
-    )
-
-
-# ============================================================
-# GENERIC STATE HANDLER
+# GENERIC INPUT HANDLER
 # ============================================================
 
 @bot.message_handler(content_types=["text"])
 def all_text_handler(message):
 
-    uid = message.from_user.id
-    text = message.text.strip()
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
 
-    register_user(message.from_user)
+    register_user(message)
 
-    # Admin menu has priority
-    if is_admin(uid):
-        if text in [
-            T("btn_admin"),
-            T("btn_add_signal"),
-            T("btn_signals"),
-            T("btn_live_session"),
-            T("btn_users"),
-            T("btn_uid_pending"),
-            T("btn_vip_manage"),
-            T("btn_wallet_manage"),
-            T("btn_withdraw"),
-            T("btn_broadcast"),
-            T("btn_text_editor"),
-            T("btn_notice_edit"),
-            T("btn_rules_edit"),
-            T("btn_subadmins"),
-            T("btn_settings"),
-            T("btn_analytics"),
-            T("btn_maintenance"),
-            T("btn_backup"),
-            T("btn_user_manage")
-        ]:
-            if text == T("btn_admin"):
-                bot.send_message(
-                    uid,
-                    "👑 <b>ADMIN PANEL</b>",
-                    reply_markup=admin_menu()
-                )
-            else:
-                admin_action(message)
-            return
+    # --------------------------------------------------------
+    # BACK / HOME
+    # --------------------------------------------------------
 
-    # State handling
-    state = STATES.get(uid)
+    if text == "🏠 Main Menu":
+        clear_state(user_id)
+        send_main_menu(user_id)
+        return
+
+    if text == "🔙 Back":
+        clear_state(user_id)
+        send_back(user_id)
+        return
+
+    state = get_state(user_id)
+
+    # --------------------------------------------------------
+    # STATE INPUTS
+    # --------------------------------------------------------
 
     if state:
-        action = state.get("action")
 
-        # Back
-        if text == T("btn_back"):
-            STATES.pop(uid, None)
+        action = state["action"]
+        data = state["data"]
 
-            if is_admin(uid):
+        # BALANCE
+        if action == "SET_BALANCE_FOR_SIGNAL":
+            try:
+                amount = cents(text)
+                if amount <= 0:
+                    raise ValueError
+
+                db_execute(
+                    """
+                    UPDATE mm_profiles
+                    SET balance_cents=?,
+                        daily_start_balance_cents=?,
+                        balance_confirmed=1,
+                        last_reset_date=?
+                    WHERE telegram_id=?
+                    """,
+                    (
+                        amount,
+                        amount,
+                        now_bd().date().isoformat(),
+                        user_id
+                    )
+                )
+
+                clear_state(user_id)
+
                 bot.send_message(
-                    uid,
-                    "👑 Admin Panel",
-                    reply_markup=admin_menu()
+                    user_id,
+                    f"✅ Trading balance confirmed: <b>${money(amount)}</b>",
+                    reply_markup=user_keyboard(user_id)
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Enter a valid USD amount, e.g. <b>100</b>.",
+                    reply_markup=back_keyboard()
+                )
+            return
+
+        # MM generic numeric
+        if action in (
+            "MM_BALANCE",
+            "MM_PROFIT",
+            "MM_LOSS",
+            "MM_BASE",
+            "MM_M1",
+            "MM_M2",
+            "MM_PAYOUT",
+            "MM_MAX_TRADES"
+        ):
+            try:
+                if action == "MM_PAYOUT":
+                    value = float(text)
+                    if value <= 0 or value > 100:
+                        raise ValueError
+
+                    db_execute(
+                        """
+                        UPDATE mm_profiles
+                        SET payout_percent=?
+                        WHERE telegram_id=?
+                        """,
+                        (value, user_id)
+                    )
+
+                elif action == "MM_MAX_TRADES":
+                    value = int(text)
+                    if value < 0:
+                        raise ValueError
+
+                    db_execute(
+                        """
+                        UPDATE mm_profiles
+                        SET max_trades=?
+                        WHERE telegram_id=?
+                        """,
+                        (value, user_id)
+                    )
+
+                else:
+                    value = cents(text)
+
+                    if value < 0:
+                        raise ValueError
+
+                    field = {
+                        "MM_BALANCE": "balance_cents",
+                        "MM_PROFIT": "profit_target_cents",
+                        "MM_LOSS": "loss_limit_cents",
+                        "MM_BASE": "base_trade_cents",
+                        "MM_M1": "m1_trade_cents",
+                        "MM_M2": "m2_trade_cents",
+                    }[action]
+
+                    db_execute(
+                        f"""
+                        UPDATE mm_profiles
+                        SET {field}=?
+                        WHERE telegram_id=?
+                        """,
+                        (value, user_id)
+                    )
+
+                clear_state(user_id)
+
+                bot.send_message(
+                    user_id,
+                    "✅ Money Management setting saved.",
+                    reply_markup=money_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid value.",
+                    reply_markup=money_keyboard()
+                )
+
+            return
+
+        # UID
+        if action == "UID_INPUT":
+            ok, result = submit_uid(user_id, text)
+
+            if ok:
+                clear_state(user_id)
+
+                # Notify admin
+                try:
+                    bot.send_message(
+                        ADMIN_ID,
+                        f"🆔 <b>New UID Request</b>\n\n"
+                        f"User: <code>{user_id}</code>\n"
+                        f"UID: <code>{text}</code>\n\n"
+                        f"Use UID Requests menu to process."
+                    )
+                except Exception:
+                    pass
+
+                bot.send_message(
+                    user_id,
+                    result,
+                    reply_markup=user_keyboard(user_id)
                 )
             else:
                 bot.send_message(
-                    uid,
-                    "🏠 Main Menu",
-                    reply_markup=main_menu(uid)
-                )
-            return
-
-        # Home
-        if text == T("btn_home"):
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                "🏠 Main Menu",
-                reply_markup=main_menu(uid)
-            )
-            return
-
-        # ---------- UID ----------
-        if action == "uid":
-            value = text
-
-            if not 3 <= len(value) <= 100:
-                bot.send_message(
-                    uid,
-                    T("invalid")
-                )
-                return
-
-            with DB_LOCK:
-                conn = db()
-
-                duplicate = conn.execute("""
-                    SELECT id FROM uid_submissions
-                    WHERE uid=?
-                    AND status IN ('PENDING','APPROVED')
-                """, (value,)).fetchone()
-
-                if duplicate:
-                    conn.close()
-
-                    bot.send_message(
-                        uid,
-                        T("uid_duplicate"),
-                        reply_markup=main_menu(uid)
-                    )
-
-                    STATES.pop(uid, None)
-                    return
-
-                existing = conn.execute("""
-                    SELECT id FROM uid_submissions
-                    WHERE user_id=?
-                    AND status IN ('PENDING','APPROVED')
-                """, (uid,)).fetchone()
-
-                if existing:
-                    conn.close()
-
-                    bot.send_message(
-                        uid,
-                        T("uid_pending"),
-                        reply_markup=main_menu(uid)
-                    )
-
-                    STATES.pop(uid, None)
-                    return
-
-                conn.execute("""
-                    INSERT INTO uid_submissions(
-                        user_id,uid,status,submitted_at
-                    )
-                    VALUES(?,?,?,?)
-                """, (
-                    uid,
-                    value,
-                    "PENDING",
-                    now_utc().isoformat()
-                ))
-
-                conn.commit()
-                conn.close()
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                T("uid_success"),
-                reply_markup=main_menu(uid)
-            )
-
-            bot.send_message(
-                ADMIN_ID,
-                (
-                    "🆔 <b>NEW UID</b>\n\n"
-                    f"User: <code>{uid}</code>\n"
-                    f"UID: <code>{escape(value)}</code>\n\n"
-                    f"/approve_uid {uid}\n"
-                    f"/reject_uid {uid}"
-                )
-            )
-
-            return
-
-        # ---------- MM money ----------
-        if action == "mm_value":
-            field = state["field"]
-
-            try:
-                amount = parse_money(text)
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            if amount <= 0:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            if field == "m1_trade_cents":
-                max_m1 = setting_int(
-                    "max_m1_cents",
-                    500
-                )
-
-                if amount > max_m1:
-                    bot.send_message(
-                        uid,
-                        f"❌ Maximum M1 amount: ${money(max_m1)}"
-                    )
-                    return
-
-            update_mm_value(uid, field, amount)
-
-            if field == "balance_cents":
-                update_mm_value(
-                    uid,
-                    "daily_start_balance_cents",
-                    amount
-                )
-                update_mm_value(
-                    uid,
-                    "balance_confirmed",
-                    1
-                )
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                "✅ Value saved.",
-                reply_markup=money_menu()
-            )
-            return
-
-        # ---------- MM integer ----------
-        if action == "mm_int":
-            try:
-                value = int(text)
-                if value <= 0:
-                    raise ValueError
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            update_mm_value(
-                uid,
-                state["field"],
-                value
-            )
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                "✅ Value saved.",
-                reply_markup=money_menu()
-            )
-            return
-
-        # ---------- Vote ----------
-        if action == "vote":
-            vote = None
-
-            if text == T("btn_up"):
-                vote = "UP"
-
-            elif text == T("btn_down"):
-                vote = "DOWN"
-
-            elif text == T("btn_vote_skip"):
-                vote = "SKIP"
-
-            if vote:
-                try:
-                    with DB_LOCK:
-                        conn = db()
-                        conn.execute("""
-                            INSERT INTO signal_votes(
-                                user_id,signal_id,vote,created_at
-                            )
-                            VALUES(?,?,?,?)
-                        """, (
-                            uid,
-                            state["signal_id"],
-                            vote,
-                            now_utc().isoformat()
-                        ))
-                        conn.commit()
-                        conn.close()
-
-                    STATES.pop(uid, None)
-
-                    bot.send_message(
-                        uid,
-                        T("vote_saved"),
-                        reply_markup=main_menu(uid)
-                    )
-
-                except sqlite3.IntegrityError:
-                    STATES.pop(uid, None)
-
-                    bot.send_message(
-                        uid,
-                        "⚠️ আপনি এই signal-এ already vote দিয়েছেন।",
-                        reply_markup=main_menu(uid)
-                    )
-
-                return
-
-        # ---------- Result ----------
-        if action == "result":
-            result = None
-
-            if text == T("btn_win"):
-                result = "WIN"
-
-            elif text == T("btn_loss"):
-                result = "LOSS"
-
-            elif text == T("btn_skip"):
-                result = "SKIP"
-
-            if result:
-                ok = apply_trade_result(
-                    uid,
-                    state["signal_id"],
-                    result
-                )
-
-                STATES.pop(uid, None)
-
-                if ok:
-                    bot.send_message(
-                        uid,
-                        T("result_saved") +
-                        "\n\n" +
-                        mm_text(uid),
-                        reply_markup=main_menu(uid)
-                    )
-                else:
-                    bot.send_message(
-                        uid,
-                        "⚠️ এই signal-এর result already saved.",
-                        reply_markup=main_menu(uid)
-                    )
-
-                return
-
-        # ---------- Withdraw amount ----------
-        if action == "withdraw_amount":
-            try:
-                amount = parse_money(text)
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            minimum = setting_int(
-                "min_withdraw_cents",
-                500
-            )
-
-            if amount < minimum:
-                bot.send_message(
-                    uid,
-                    T("withdraw_min").format(
-                        amount=money(minimum)
-                    )
-                )
-                return
-
-            u = user_row(uid)
-
-            if amount > u["wallet_cents"]:
-                bot.send_message(
-                    uid,
-                    "❌ Wallet balance insufficient."
-                )
-                return
-
-            STATES[uid] = {
-                "action": "withdraw_method",
-                "amount": amount
-            }
-
-            bot.send_message(
-                uid,
-                T("withdraw_method"),
-                reply_markup=back_keyboard()
-            )
-            return
-
-        # ---------- Withdraw method ----------
-        if action == "withdraw_method":
-            STATES[uid]["method"] = text
-            STATES[uid]["action"] = "withdraw_account"
-
-            bot.send_message(
-                uid,
-                T("withdraw_account"),
-                reply_markup=back_keyboard()
-            )
-            return
-
-        # ---------- Withdraw account ----------
-        if action == "withdraw_account":
-
-            amount = STATES[uid]["amount"]
-            method = STATES[uid]["method"]
-
-            with DB_LOCK:
-                conn = db()
-
-                balance = conn.execute(
-                    "SELECT wallet_cents FROM users WHERE user_id=?",
-                    (uid,)
-                ).fetchone()["wallet_cents"]
-
-                if balance < amount:
-                    conn.close()
-
-                    STATES.pop(uid, None)
-
-                    bot.send_message(
-                        uid,
-                        "❌ Wallet balance insufficient.",
-                        reply_markup=main_menu(uid)
-                    )
-                    return
-
-                new_balance = balance - amount
-
-                conn.execute("""
-                    UPDATE users
-                    SET wallet_cents=?
-                    WHERE user_id=?
-                """, (
-                    new_balance,
-                    uid
-                ))
-
-                conn.execute("""
-                    INSERT INTO wallet_transactions(
-                        user_id,type,amount_cents,
-                        balance_after_cents,note,created_at
-                    )
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    uid,
-                    "WITHDRAW_HOLD",
-                    -amount,
-                    new_balance,
-                    "Withdrawal pending",
-                    now_utc().isoformat()
-                ))
-
-                conn.execute("""
-                    INSERT INTO withdrawals(
-                        user_id,amount_cents,method,
-                        account,status,created_at
-                    )
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    uid,
-                    amount,
-                    method,
-                    text,
-                    "PENDING",
-                    now_utc().isoformat()
-                ))
-
-                conn.commit()
-                conn.close()
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                T("withdraw_success"),
-                reply_markup=main_menu(uid)
-            )
-
-            bot.send_message(
-                ADMIN_ID,
-                (
-                    "💸 <b>NEW WITHDRAWAL</b>\n\n"
-                    f"User: <code>{uid}</code>\n"
-                    f"Amount: <b>${money(amount)}</b>\n"
-                    f"Method: {escape(method)}\n"
-                    f"Account: <code>{escape(text)}</code>"
-                )
-            )
-
-            return
-
-        # ---------- Text editor selection ----------
-        if action == "choose_text":
-
-            selected = None
-
-            for key in TEXT_EDITOR_KEYS:
-                if text == key.replace("_", " ").title():
-                    selected = key
-                    break
-
-            if selected:
-                STATES[uid] = {
-                    "action": "edit_text",
-                    "key": selected
-                }
-
-                current = T(selected)
-
-                bot.send_message(
-                    uid,
-                    (
-                        "📝 <b>EDIT TEXT</b>\n\n"
-                        f"<b>Key:</b> {selected}\n\n"
-                        "<b>Current:</b>\n"
-                        f"{escape(current)}\n\n"
-                        "এখন নতুন text পাঠান।"
-                    ),
+                    user_id,
+                    result,
                     reply_markup=back_keyboard()
                 )
-                return
+            return
 
-        # ---------- Text editor save ----------
-        if action == "edit_text":
+        # WITHDRAW AMOUNT
+        if action == "WITHDRAW_AMOUNT":
+            try:
+                amount = cents(text)
 
-            key = state["key"]
+                if amount <= 0:
+                    raise ValueError
 
-            set_setting(
-                f"text.{key}",
+                set_state(
+                    user_id,
+                    "WITHDRAW_METHOD",
+                    {"amount": amount}
+                )
+
+                bot.send_message(
+                    user_id,
+                    "💳 Enter withdrawal method.\nExample: bKash",
+                    reply_markup=back_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Enter a valid amount.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # WITHDRAW METHOD
+        if action == "WITHDRAW_METHOD":
+
+            data["method"] = text
+
+            set_state(
+                user_id,
+                "WITHDRAW_ACCOUNT",
+                data
+            )
+
+            bot.send_message(
+                user_id,
+                "📱 Enter your account number:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # WITHDRAW ACCOUNT
+        if action == "WITHDRAW_ACCOUNT":
+
+            ok, result = create_withdraw(
+                user_id,
+                data["amount"],
+                data["method"],
                 text
             )
 
-            STATES.pop(uid, None)
+            clear_state(user_id)
 
             bot.send_message(
-                uid,
-                T("text_saved"),
-                reply_markup=admin_menu()
+                user_id,
+                result,
+                reply_markup=user_keyboard(user_id)
+            )
+
+            return
+
+        # BULK SIGNAL DATE
+        if action == "SIGNAL_DATE":
+
+            date = text.replace("/", "-")
+
+            try:
+                parts = date.split("-")
+
+                if len(parts) == 3 and len(parts[0]) != 4:
+                    date = (
+                        f"{parts[2]}-{parts[1].zfill(2)}-"
+                        f"{parts[0].zfill(2)}"
+                    )
+
+                datetime.strptime(date, "%Y-%m-%d")
+
+                set_state(
+                    user_id,
+                    "SIGNAL_BULK",
+                    {
+                        "date": date,
+                        "audience": "ALL"
+                    }
+                )
+
+                bot.send_message(
+                    user_id,
+                    "📡 Now paste ALL signals at once.\n\n"
+                    "<code>12:30 EURUSD UP 95\n"
+                    "12:35 GBPUSD DOWN 97\n"
+                    "12:40 USDJPY UP 96</code>\n\n"
+                    "Or use full date format:\n"
+                    "<code>21-09-2026 12:30 | EURUSD | UP | 95</code>",
+                    reply_markup=back_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Date format: <code>21-09-2026</code>",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # BULK SIGNAL
+        if action == "SIGNAL_BULK":
+
+            created, failed = save_bulk_signals(
+                text,
+                data.get("date"),
+                data.get("audience", "ALL"),
+                user_id
+            )
+
+            clear_state(user_id)
+
+            result = (
+                f"✅ Added: <b>{len(created)}</b>\n"
+                f"❌ Failed: <b>{len(failed)}</b>"
+            )
+
+            if failed:
+                result += "\n\nFailed lines:\n"
+                result += "\n".join(
+                    f"• {x[:100]}" for x in failed[:10]
+                )
+
+            bot.send_message(
+                user_id,
+                result,
+                reply_markup=signal_keyboard()
             )
             return
 
-        # ---------- Notice ----------
-        if action == "edit_notice":
+        # TEXT EDITOR
+        if action == "EDIT_TEXT":
+
+            key = data["key"]
+
+            set_setting(key, text)
+
+            clear_state(user_id)
+
+            bot.send_message(
+                user_id,
+                "✅ Text updated and saved permanently.",
+                reply_markup=text_editor_keyboard()
+            )
+            return
+
+        # NOTICE
+        if action == "NOTICE_INPUT":
+
             set_setting("notice", text)
-            STATES.pop(uid, None)
+            clear_state(user_id)
 
             bot.send_message(
-                uid,
-                T("text_saved"),
-                reply_markup=admin_menu()
+                user_id,
+                "✅ Notice updated.",
+                reply_markup=admin_keyboard()
             )
             return
 
-        # ---------- Rules ----------
-        if action == "edit_rules":
-            set_setting("rules_text", text)
-            STATES.pop(uid, None)
+        # BROADCAST
+        if action == "BROADCAST_INPUT":
+
+            target = data.get("target", "ALL")
+
+            sent = broadcast(text, target)
+
+            clear_state(user_id)
 
             bot.send_message(
-                uid,
-                T("text_saved"),
-                reply_markup=admin_menu()
+                user_id,
+                f"📢 Broadcast complete.\nSent: <b>{sent}</b>",
+                reply_markup=admin_keyboard()
             )
             return
 
-        # ---------- Broadcast ----------
-        if action == "broadcast":
-            STATES.pop(uid, None)
+        # LIVE TEXT
+        if action == "LIVE_TEXT":
 
-            sent = 0
+            if not active_live_session():
+                bot.send_message(
+                    user_id,
+                    "⚠️ Live Session is not active.",
+                    reply_markup=admin_keyboard()
+                )
+                clear_state(user_id)
+                return
 
-            with DB_LOCK:
-                conn = db()
-                users = conn.execute(
-                    "SELECT user_id FROM users WHERE blocked=0"
-                ).fetchall()
-                conn.close()
+            sent = send_live_to_vips(
+                text,
+                user_id
+            )
 
-            for u in users:
+            clear_state(user_id)
+
+            bot.send_message(
+                user_id,
+                f"⚡ Live message sent to <b>{sent}</b> VIP user(s).",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        # LIVE PAIR
+        if action == "LIVE_PAIR":
+            LIVE_DRAFT[user_id] = {
+                "pair": text
+            }
+
+            clear_state(user_id)
+
+            bot.send_message(
+                user_id,
+                "⏰ Enter signal time:",
+                reply_markup=kb([
+                    ["⬆️ UP", "⬇️ DOWN"],
+                    ["📤 Send Live Signal"],
+                    ["✏️ Send Live Text"],
+                    ["⛔ End Live Mode"],
+                    ["🔙 Back"]
+                ])
+            )
+
+            LIVE_DRAFT[user_id]["direction"] = ""
+
+            set_state(user_id, "LIVE_TIME")
+            return
+
+        # LIVE TIME
+        if action == "LIVE_TIME":
+
+            LIVE_DRAFT.setdefault(user_id, {})
+            LIVE_DRAFT[user_id]["time"] = text
+
+            clear_state(user_id)
+
+            bot.send_message(
+                user_id,
+                "Choose direction:",
+                reply_markup=kb([
+                    ["⬆️ UP", "⬇️ DOWN"],
+                    ["📤 Send Live Signal"],
+                    ["✏️ Send Live Text"],
+                    ["⛔ End Live Mode"],
+                    ["🔙 Back"]
+                ])
+            )
+            return
+
+        # ADD VIP
+        if action == "VIP_USER":
+            try:
+                target = int(text)
+                set_state(
+                    user_id,
+                    "VIP_DAYS",
+                    {"target": target}
+                )
+
+                bot.send_message(
+                    user_id,
+                    "📅 Enter VIP days:",
+                    reply_markup=back_keyboard()
+                )
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Enter Telegram User ID.",
+                    reply_markup=back_keyboard()
+                )
+            return
+
+        if action == "VIP_DAYS":
+            try:
+                days = int(text)
+
+                if days <= 0:
+                    raise ValueError
+
+                target = data["target"]
+
+                add_vip(target, days)
+
+                clear_state(user_id)
+
+                bot.send_message(
+                    user_id,
+                    f"✅ VIP added for <code>{target}</code> for {days} days.",
+                    reply_markup=vip_keyboard()
+                )
+
                 try:
                     bot.send_message(
-                        u["user_id"],
-                        text
+                        target,
+                        f"⭐ VIP activated for <b>{days} days</b>."
                     )
-                    sent += 1
-                    time.sleep(0.03)
                 except Exception:
                     pass
 
-            bot.send_message(
-                uid,
-                f"{T('broadcast_done')}\nSent: <b>{sent}</b>",
-                reply_markup=admin_menu()
-            )
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid days.",
+                    reply_markup=back_keyboard()
+                )
+
             return
 
-        # ---------- Add signal ----------
-        if action == "add_signal_date":
-            STATES[uid] = {
-                "action": "add_signal_time",
-                "date": text
-            }
+        # BALANCE ADD
+        if action == "ADMIN_ADD_BALANCE":
+            try:
+                amount = cents(text)
 
-            bot.send_message(
-                uid,
-                "🕐 Signal time লিখুন।\n\nExample: 21:30",
-                reply_markup=back_keyboard()
-            )
-            return
+                if amount <= 0:
+                    raise ValueError
 
-        if action == "add_signal_time":
-            STATES[uid]["time"] = text
-            STATES[uid]["action"] = "add_signal_pair"
+                target = data["target"]
 
-            bot.send_message(
-                uid,
-                "📌 Pair লিখুন।\n\nExample: EUR/USD",
-                reply_markup=back_keyboard()
-            )
-            return
+                wallet_add(
+                    target,
+                    amount,
+                    "ADMIN_ADD",
+                    "Admin added balance"
+                )
 
-        if action == "add_signal_pair":
-            STATES[uid]["pair"] = text
-            STATES[uid]["action"] = "add_signal_direction"
-
-            bot.send_message(
-                uid,
-                "Direction নির্বাচন করুন:",
-                reply_markup=kb([
-                    ["UP", "DOWN"],
-                    [T("btn_back")]
-                ])
-            )
-            return
-
-        if action == "add_signal_direction":
-            if text not in ("UP", "DOWN"):
-                bot.send_message(uid, T("invalid"))
-                return
-
-            STATES[uid]["direction"] = text
-            STATES[uid]["action"] = "add_signal_confidence"
-
-            bot.send_message(
-                uid,
-                "🎯 Confidence লিখুন।\n\nExample: 95–99%",
-                reply_markup=back_keyboard()
-            )
-            return
-
-        if action == "add_signal_confidence":
-            STATES[uid]["confidence"] = text
-            STATES[uid]["action"] = "add_signal_audience"
-
-            bot.send_message(
-                uid,
-                "Audience নির্বাচন করুন:",
-                reply_markup=kb([
-                    ["ALL", "VIP"],
-                    ["SELECTED"],
-                    [T("btn_back")]
-                ])
-            )
-            return
-
-        if action == "add_signal_audience":
-
-            if text not in ("ALL", "VIP", "SELECTED"):
-                bot.send_message(uid, T("invalid"))
-                return
-
-            STATES[uid]["audience"] = text
-
-            if text == "SELECTED":
-                STATES[uid]["action"] = "add_signal_users"
+                clear_state(user_id)
 
                 bot.send_message(
-                    uid,
-                    (
-                        "Selected Telegram user IDs comma দিয়ে লিখুন।\n\n"
-                        "Example:\n"
-                        "<code>123,456,789</code>"
-                    ),
+                    user_id,
+                    "✅ Balance added.",
+                    reply_markup=wallet_admin_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid amount.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # BALANCE REMOVE
+        if action == "ADMIN_REMOVE_BALANCE":
+            try:
+                amount = cents(text)
+
+                target = data["target"]
+
+                if not wallet_remove(
+                    target,
+                    amount,
+                    "ADMIN_REMOVE",
+                    "Admin removed balance"
+                ):
+                    raise ValueError
+
+                clear_state(user_id)
+
+                bot.send_message(
+                    user_id,
+                    "✅ Balance removed.",
+                    reply_markup=wallet_admin_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid amount or insufficient balance.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # SUB ADMIN ID
+        if action == "SUBADMIN_ID":
+            try:
+                target = int(text)
+
+                db_execute(
+                    """
+                    INSERT OR IGNORE INTO admins(
+                        telegram_id,role
+                    )
+                    VALUES(?,?)
+                    """,
+                    (target, "subadmin")
+                )
+
+                set_state(
+                    user_id,
+                    "SUBADMIN_PERMISSION",
+                    {"target": target}
+                )
+
+                bot.send_message(
+                    user_id,
+                    "Choose permission to toggle:",
+                    reply_markup=kb([
+                        ["👥 Users", "⭐ VIP"],
+                        ["📡 Signals", "💰 Wallet"],
+                        ["💸 Withdraw", "📢 Broadcast"],
+                        ["⚙️ Settings", "⚡ Live"],
+                        ["📝 Text Editor"],
+                        ["💾 Save Permissions"],
+                        ["🔙 Back"]
+                    ])
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid Telegram ID.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # BROADCAST TARGET
+        if action == "BROADCAST_TARGET":
+            target = text
+
+            if target == "👥 All Users":
+                target = "ALL"
+            elif target == "⭐ VIP Users":
+                target = "VIP"
+            else:
+                target = "ALL"
+
+            set_state(
+                user_id,
+                "BROADCAST_INPUT",
+                {"target": target}
+            )
+
+            bot.send_message(
+                user_id,
+                "📢 Enter broadcast text:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # WITHDRAW SETTINGS
+        if action == "MIN_WITHDRAW":
+            try:
+                amount = float(text)
+
+                if amount < 0:
+                    raise ValueError
+
+                set_setting("min_withdraw", amount)
+
+                clear_state(user_id)
+
+                bot.send_message(
+                    user_id,
+                    "✅ Minimum withdrawal updated.",
+                    reply_markup=wallet_admin_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid amount.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+        # REFERRAL BONUS
+        if action == "REFERRAL_BONUS":
+            try:
+                amount = float(text)
+
+                if amount < 0:
+                    raise ValueError
+
+                set_setting("referral_bonus", amount)
+
+                clear_state(user_id)
+
+                bot.send_message(
+                    user_id,
+                    "✅ Referral bonus updated.",
+                    reply_markup=admin_keyboard()
+                )
+
+            except Exception:
+                bot.send_message(
+                    user_id,
+                    "❌ Invalid amount.",
+                    reply_markup=back_keyboard()
+                )
+
+            return
+
+    # ========================================================
+    # USER MENU
+    # ========================================================
+
+    if text == "📡 Future Signals":
+        handle_future_signals_user(message)
+        return
+
+    if text == "📅 Today's Signals":
+        send_todays_signals(user_id)
+        return
+
+    if text == "⚡ Live Signals":
+
+        current = user_row(user_id)
+
+        if not is_vip(user_id):
+            bot.send_message(
+                user_id,
+                "⭐ Live Signals are VIP-only.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        enabled = current["live_signal_on"]
+
+        db_execute(
+            """
+            UPDATE users
+            SET live_signal_on=?
+            WHERE telegram_id=?
+            """,
+            (0 if enabled else 1, user_id)
+        )
+
+        bot.send_message(
+            user_id,
+            "⚡ Live Signal " + ("OFF" if enabled else "ON"),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "💰 Money Management":
+        reset_daily_mm_if_needed(user_id)
+
+        bot.send_message(
+            user_id,
+            "💰 <b>Money Management</b>",
+            reply_markup=money_keyboard()
+        )
+        return
+
+    if text == "💵 Set Balance":
+        set_state(user_id, "MM_BALANCE")
+        bot.send_message(
+            user_id,
+            "💵 Enter current trading balance in USD:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🎯 Profit Target":
+        set_state(user_id, "MM_PROFIT")
+        bot.send_message(
+            user_id,
+            "🎯 Enter daily Profit Target in USD:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🛑 Loss Limit":
+        set_state(user_id, "MM_LOSS")
+        bot.send_message(
+            user_id,
+            "🛑 Enter daily Loss Limit in USD:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "💵 Base Trade":
+        set_state(user_id, "MM_BASE")
+        bot.send_message(
+            user_id,
+            "💵 Enter Base Trade amount:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🔄 M1 Trade":
+        set_state(user_id, "MM_M1")
+        bot.send_message(
+            user_id,
+            "🔄 Enter M1 Trade amount:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🔄 M2 Trade":
+        set_state(user_id, "MM_M2")
+        bot.send_message(
+            user_id,
+            "🔄 Enter M2 amount, or 0 for automatic recovery calculation:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "📈 Payout %":
+        set_state(user_id, "MM_PAYOUT")
+        bot.send_message(
+            user_id,
+            "📈 Enter expected payout percentage, e.g. 80:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🔢 Max Trades":
+        set_state(user_id, "MM_MAX_TRADES")
+        bot.send_message(
+            user_id,
+            "🔢 Enter maximum trades per day:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "🚫 Stop Trading":
+        db_execute(
+            """
+            UPDATE mm_profiles
+            SET stop_trading=1
+            WHERE telegram_id=?
+            """,
+            (user_id,)
+        )
+
+        bot.send_message(
+            user_id,
+            "⛔ Trading stopped.",
+            reply_markup=money_keyboard()
+        )
+        return
+
+    if text == "▶️ Resume Trading":
+        db_execute(
+            """
+            UPDATE mm_profiles
+            SET stop_trading=0
+            WHERE telegram_id=?
+            """,
+            (user_id,)
+        )
+
+        bot.send_message(
+            user_id,
+            "▶️ Trading resumed.",
+            reply_markup=money_keyboard()
+        )
+        return
+
+    if text == "📊 MM Status":
+
+        row = reset_daily_mm_if_needed(user_id)
+        amount = current_trade_amount(user_id)
+
+        bot.send_message(
+            user_id,
+            (
+                "💰 <b>Money Management</b>\n\n"
+                f"Balance: <b>${money(row['balance_cents'])}</b>\n"
+                f"Daily P/L: <b>${money(row['daily_pl_cents'])}</b>\n"
+                f"Profit Target: <b>${money(row['profit_target_cents'])}</b>\n"
+                f"Loss Limit: <b>${money(row['loss_limit_cents'])}</b>\n"
+                f"Base: <b>${money(row['base_trade_cents'])}</b>\n"
+                f"M1: <b>${money(row['m1_trade_cents'])}</b>\n"
+                f"Stage: <b>{row['stage']}</b>\n"
+                f"Recovery: <b>${money(row['recovery_loss_cents'])}</b>\n"
+                f"Next Trade: <b>${money(amount)}</b>\n"
+                f"Trades: <b>{row['trades_today']}/{row['max_trades']}</b>"
+            ),
+            reply_markup=money_keyboard()
+        )
+        return
+
+    if text == "💼 Wallet":
+
+        row = user_row(user_id)
+
+        bot.send_message(
+            user_id,
+            (
+                "💼 <b>Wallet</b>\n\n"
+                f"Balance: <b>${money(row['balance_cents'])}</b>"
+            ),
+            reply_markup=kb([
+                ["💸 Withdraw"],
+                ["📜 Wallet History"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+        return
+
+    if text == "💸 Withdraw":
+
+        if get_setting("withdrawals") != "1":
+            bot.send_message(
+                user_id,
+                get_setting("withdraw_disabled"),
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        set_state(user_id, "WITHDRAW_AMOUNT")
+
+        bot.send_message(
+            user_id,
+            "💸 Enter withdrawal amount in USD:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "👤 VIP / UID":
+
+        u = user_row(user_id)
+
+        vip_status = (
+            u["vip_until"]
+            if is_vip(user_id)
+            else "Not active"
+        )
+
+        bot.send_message(
+            user_id,
+            (
+                "👤 <b>VIP / UID</b>\n\n"
+                f"VIP: <b>{vip_status}</b>\n"
+                f"UID: <b>{u['uid'] or 'Not submitted'}</b>"
+            ),
+            reply_markup=kb([
+                ["🆔 Submit UID"],
+                ["⭐ VIP Status"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+        return
+
+    if text == "🆔 Submit UID":
+
+        u = user_row(user_id)
+
+        if u["uid"]:
+            bot.send_message(
+                user_id,
+                "✅ Your UID is already approved and linked.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        set_state(user_id, "UID_INPUT")
+
+        bot.send_message(
+            user_id,
+            "🆔 Enter your Quotex UID:",
+            reply_markup=back_keyboard()
+        )
+        return
+
+    if text == "⭐ VIP Status":
+
+        bot.send_message(
+            user_id,
+            (
+                get_setting("vip_text")
+                if is_vip(user_id)
+                else get_setting("nonvip_text")
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "👥 Referral":
+
+        link = (
+            f"https://t.me/{bot.get_me().username}"
+            f"?start=ref{user_id}"
+        )
+
+        bot.send_message(
+            user_id,
+            get_setting("referral_text")
+            .replace("{link}", link)
+            .replace(
+                "{bonus}",
+                get_setting("referral_bonus")
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "📊 Dashboard":
+
+        u = user_row(user_id)
+        mm = reset_daily_mm_if_needed(user_id)
+
+        bot.send_message(
+            user_id,
+            (
+                "📊 <b>Dashboard</b>\n\n"
+                f"👤 User: <b>{u['first_name']}</b>\n"
+                f"⭐ VIP: <b>{'YES' if is_vip(user_id) else 'NO'}</b>\n"
+                f"💰 Wallet: <b>${money(u['balance_cents'])}</b>\n"
+                f"📡 Free Signals: <b>"
+                f"{'Unlimited' if is_vip(user_id) else free_remaining(user_id)}"
+                f"</b>\n"
+                f"📈 Today's P/L: <b>${money(mm['daily_pl_cents'])}</b>\n"
+                f"✅ Wins: <b>{mm['wins_today']}</b>\n"
+                f"❌ Losses: <b>{mm['losses_today']}</b>"
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "📈 Signal Result":
+
+        row = db_execute(
+            """
+            SELECT s.*
+            FROM signals s
+            JOIN signal_access a
+              ON a.signal_id=s.id
+            WHERE a.telegram_id=?
+            ORDER BY s.id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+            fetchone=True
+        )
+
+        if not row:
+            bot.send_message(
+                user_id,
+                "📭 No actionable signal found.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        result = db_execute(
+            """
+            SELECT id FROM signal_results
+            WHERE signal_id=? AND telegram_id=?
+            """,
+            (row["id"], user_id),
+            fetchone=True
+        )
+
+        if result:
+            bot.send_message(
+                user_id,
+                "⚠️ Result for the latest signal is already recorded.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        set_state(
+            user_id,
+            "RESULT_CHOICE",
+            {"signal_id": row["id"]}
+        )
+
+        bot.send_message(
+            user_id,
+            f"📈 Result for <b>{row['pair']}</b>:",
+            reply_markup=kb([
+                ["✅ WIN", "❌ LOSS"],
+                ["⏭ SKIP"],
+                ["🔙 Back"]
+            ])
+        )
+        return
+
+    if text in ("✅ WIN", "❌ LOSS", "⏭ SKIP"):
+
+        state = get_state(user_id)
+
+        if not state or state["action"] != "RESULT_CHOICE":
+            return
+
+        result = {
+            "✅ WIN": "WIN",
+            "❌ LOSS": "LOSS",
+            "⏭ SKIP": "SKIP"
+        }[text]
+
+        ok, response = apply_trade_result(
+            user_id,
+            state["data"]["signal_id"],
+            result
+        )
+
+        clear_state(user_id)
+
+        bot.send_message(
+            user_id,
+            response,
+            reply_markup=user_keyboard(user_id)
+        )
+
+        process_referral_bonus(user_id)
+        return
+
+    if text == "🗳 Vote Signal":
+
+        row = db_execute(
+            """
+            SELECT s.*
+            FROM signals s
+            JOIN signal_access a
+              ON a.signal_id=s.id
+            WHERE a.telegram_id=?
+            ORDER BY s.id DESC
+            LIMIT 1
+            """,
+            (user_id,),
+            fetchone=True
+        )
+
+        if not row:
+            bot.send_message(
+                user_id,
+                "📭 No signal available for voting.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        existing = db_execute(
+            """
+            SELECT vote FROM signal_votes
+            WHERE signal_id=? AND telegram_id=?
+            """,
+            (row["id"], user_id),
+            fetchone=True
+        )
+
+        if existing:
+            bot.send_message(
+                user_id,
+                "🗳 You already voted on this signal.",
+                reply_markup=user_keyboard(user_id)
+            )
+            return
+
+        set_state(
+            user_id,
+            "VOTE_CHOICE",
+            {"signal_id": row["id"]}
+        )
+
+        bot.send_message(
+            user_id,
+            "🗳 Choose your prediction:",
+            reply_markup=kb([
+                ["👍 UP", "👎 DOWN"],
+                ["⏭ SKIP"],
+                ["🔙 Back"]
+            ])
+        )
+        return
+
+    if text in ("👍 UP", "👎 DOWN"):
+
+        state = get_state(user_id)
+
+        if not state or state["action"] != "VOTE_CHOICE":
+            return
+
+        vote = "UP" if text == "👍 UP" else "DOWN"
+
+        db_execute(
+            """
+            INSERT OR IGNORE INTO signal_votes(
+                signal_id,telegram_id,vote,created_at
+            )
+            VALUES(?,?,?,?)
+            """,
+            (
+                state["data"]["signal_id"],
+                user_id,
+                vote,
+                now_str()
+            )
+        )
+
+        clear_state(user_id)
+
+        bot.send_message(
+            user_id,
+            "✅ Vote recorded.",
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "⏭ SKIP":
+
+        state = get_state(user_id)
+
+        if state and state["action"] == "VOTE_CHOICE":
+            db_execute(
+                """
+                INSERT OR IGNORE INTO signal_votes(
+                    signal_id,telegram_id,vote,created_at
+                )
+                VALUES(?,?,?,?)
+                """,
+                (
+                    state["data"]["signal_id"],
+                    user_id,
+                    "SKIP",
+                    now_str()
+                )
+            )
+
+            clear_state(user_id)
+
+            bot.send_message(
+                user_id,
+                "⏭ Vote skipped.",
+                reply_markup=user_keyboard(user_id)
+            )
+        return
+
+    if text == "📜 Signal History":
+
+        rows = db_execute(
+            """
+            SELECT s.signal_date,s.signal_time,s.pair,
+                   s.direction,r.result
+            FROM signals s
+            JOIN signal_access a
+              ON a.signal_id=s.id
+            LEFT JOIN signal_results r
+              ON r.signal_id=s.id
+             AND r.telegram_id=?
+            WHERE a.telegram_id=?
+            ORDER BY s.id DESC
+            LIMIT 15
+            """,
+            (user_id, user_id),
+            fetchall=True
+        )
+
+        if not rows:
+            output = "📭 No signal history."
+        else:
+            lines = ["📜 <b>Signal History</b>\n"]
+
+            for r in rows:
+                result = r["result"] or "Pending"
+
+                lines.append(
+                    f"📅 {r['signal_date']} "
+                    f"{r['signal_time']}\n"
+                    f"💱 {r['pair']} | "
+                    f"{r['direction']} | "
+                    f"<b>{result}</b>\n"
+                )
+
+            output = "\n".join(lines)
+
+        bot.send_message(
+            user_id,
+            output,
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "📖 Trading Rules":
+
+        bot.send_message(
+            user_id,
+            get_setting("rules_text").replace(
+                "{rules}",
+                get_setting("trading_rules")
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "🔔 Notifications":
+
+        u = user_row(user_id)
+
+        new_value = 0 if u["notification_on"] else 1
+
+        db_execute(
+            """
+            UPDATE users
+            SET notification_on=?
+            WHERE telegram_id=?
+            """,
+            (new_value, user_id)
+        )
+
+        bot.send_message(
+            user_id,
+            get_setting(
+                "notification_on"
+                if new_value
+                else "notification_off"
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "❓ Help":
+
+        bot.send_message(
+            user_id,
+            (
+                "❓ <b>Help</b>\n\n"
+                "📡 Future Signals — scheduled signals\n"
+                "⚡ Live Signals — VIP live session\n"
+                "💰 Money Management — trading settings\n"
+                "💼 Wallet — balance and transactions\n"
+                "💸 Withdraw — withdrawal request\n"
+                "⭐ VIP / UID — VIP and Quotex UID\n"
+                "👥 Referral — referral system\n"
+            ),
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    if text == "📜 Wallet History":
+
+        rows = db_execute(
+            """
+            SELECT type,amount_cents,description,created_at
+            FROM wallet_transactions
+            WHERE telegram_id=?
+            ORDER BY id DESC LIMIT 15
+            """,
+            (user_id,),
+            fetchall=True
+        )
+
+        if not rows:
+            output = "📭 No wallet transactions."
+        else:
+            lines = ["📜 <b>Wallet History</b>\n"]
+
+            for r in rows:
+                sign = "+" if r["amount_cents"] >= 0 else ""
+
+                lines.append(
+                    f"{r['created_at']} | "
+                    f"{r['type']} | "
+                    f"{sign}${money(r['amount_cents'])}\n"
+                    f"{r['description']}"
+                )
+
+            output = "\n".join(lines)
+
+        bot.send_message(
+            user_id,
+            output,
+            reply_markup=user_keyboard(user_id)
+        )
+        return
+
+    # ========================================================
+    # ADMIN MENU
+    # ========================================================
+
+    if is_admin(user_id) or admin_row(user_id):
+
+        # ADMIN DASHBOARD
+        if text == "📊 Admin Dashboard":
+            if has_permission(user_id, "p_users"):
+                admin_dashboard(user_id)
+            return
+
+        # USERS
+        if text == "👥 Users":
+
+            if not has_permission(user_id, "p_users"):
+                return
+
+            users = db_execute(
+                """
+                SELECT telegram_id,first_name,username,
+                       balance_cents,vip_until,uid
+                FROM users
+                ORDER BY id DESC
+                LIMIT 30
+                """,
+                fetchall=True
+            )
+
+            lines = ["👥 <b>Users</b>\n"]
+
+            for u in users:
+                lines.append(
+                    f"ID: <code>{u['telegram_id']}</code>\n"
+                    f"Name: {u['first_name']}\n"
+                    f"Balance: ${money(u['balance_cents'])}\n"
+                    f"VIP: {'YES' if is_vip(u['telegram_id']) else 'NO'}\n"
+                    f"UID: {u['uid'] or '-'}\n"
+                )
+
+            bot.send_message(
+                user_id,
+                "\n".join(lines),
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        # FUTURE SIGNAL ADMIN
+        if text == "📡 Future Signals":
+
+            if not has_permission(user_id, "p_signals"):
+                return
+
+            bot.send_message(
+                user_id,
+                "📡 <b>Future Signal Manager</b>",
+                reply_markup=signal_keyboard()
+            )
+            return
+
+        if text == "➕ Add Future Signals":
+
+            set_state(user_id, "SIGNAL_DATE")
+
+            bot.send_message(
+                user_id,
+                "📅 Enter date in Bangladesh time.\n\n"
+                "Example: <code>21-09-2026</code>",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "📋 Future Signal List":
+
+            rows = db_execute(
+                """
+                SELECT * FROM signals
+                WHERE signal_date>=?
+                ORDER BY signal_date,signal_time
+                LIMIT 50
+                """,
+                (now_bd().date().isoformat(),),
+                fetchall=True
+            )
+
+            if not rows:
+                bot.send_message(
+                    user_id,
+                    "📭 No future signals.",
+                    reply_markup=signal_keyboard()
+                )
+                return
+
+            lines = ["📋 <b>Future Signals</b>\n"]
+
+            for s in rows:
+                lines.append(
+                    f"#{s['id']} | {s['signal_date']} "
+                    f"{s['signal_time']}\n"
+                    f"{s['pair']} | {s['direction']} | "
+                    f"{s['confidence']} | {s['status']}"
+                )
+
+            bot.send_message(
+                user_id,
+                "\n".join(lines),
+                reply_markup=signal_keyboard()
+            )
+            return
+
+        if text == "🗑 Delete Future Signal":
+
+            set_state(user_id, "DELETE_SIGNAL")
+
+            bot.send_message(
+                user_id,
+                "🗑 Enter signal ID to delete:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # LIVE
+        if text == "⚡ Live Session":
+
+            if not has_permission(user_id, "p_live"):
+                return
+
+            session = active_live_session()
+
+            if session:
+                bot.send_message(
+                    user_id,
+                    "⚡ Live Session is already active.",
+                    reply_markup=kb([
+                        ["📌 Pair", "⏰ Time"],
+                        ["⬆️ UP", "⬇️ DOWN"],
+                        ["📤 Send Live Signal"],
+                        ["✏️ Send Live Text"],
+                        ["⛔ End Live Mode"],
+                        ["🔙 Back"]
+                    ])
+                )
+            else:
+                start_live_session(user_id)
+
+                bot.send_message(
+                    user_id,
+                    get_setting("live_started"),
+                    reply_markup=kb([
+                        ["📌 Pair", "⏰ Time"],
+                        ["⬆️ UP", "⬇️ DOWN"],
+                        ["📤 Send Live Signal"],
+                        ["✏️ Send Live Text"],
+                        ["⛔ End Live Mode"],
+                        ["🔙 Back"]
+                    ])
+                )
+
+            return
+
+        if text == "📌 Pair":
+
+            set_state(user_id, "LIVE_PAIR")
+
+            bot.send_message(
+                user_id,
+                "📌 Enter pair:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "⏰ Time":
+
+            set_state(user_id, "LIVE_TIME")
+
+            bot.send_message(
+                user_id,
+                "⏰ Enter live signal time:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text in ("⬆️ UP", "⬇️ DOWN"):
+
+            LIVE_DRAFT.setdefault(user_id, {})
+
+            LIVE_DRAFT[user_id]["direction"] = (
+                "UP" if text == "⬆️ UP" else "DOWN"
+            )
+
+            bot.send_message(
+                user_id,
+                f"✅ Direction: <b>{LIVE_DRAFT[user_id]['direction']}</b>",
+                reply_markup=kb([
+                    ["📌 Pair", "⏰ Time"],
+                    ["⬆️ UP", "⬇️ DOWN"],
+                    ["📤 Send Live Signal"],
+                    ["✏️ Send Live Text"],
+                    ["⛔ End Live Mode"],
+                    ["🔙 Back"]
+                ])
+            )
+            return
+
+        if text == "📤 Send Live Signal":
+
+            draft = LIVE_DRAFT.get(user_id, {})
+
+            if not draft.get("pair"):
+                set_state(user_id, "LIVE_PAIR")
+
+                bot.send_message(
+                    user_id,
+                    "📌 Enter pair first:",
                     reply_markup=back_keyboard()
                 )
                 return
 
-            save_future_signal(uid, "")
+            if not draft.get("time"):
+                set_state(user_id, "LIVE_TIME")
 
-            return
-
-        if action == "add_signal_users":
-            save_future_signal(uid, text)
-            return
-
-        # ---------- Live signal ----------
-        if action == "live_signal":
-
-            session_id = state["session_id"]
-
-            with DB_LOCK:
-                conn = db()
-
-                conn.execute("""
-                    INSERT INTO live_signals(
-                        session_id,content,confidence,created_at
-                    )
-                    VALUES(?,?,?,?)
-                """, (
-                    session_id,
-                    text,
-                    get_setting("confidence", "95–99%"),
-                    now_utc().isoformat()
-                ))
-
-                conn.commit()
-
-                users = conn.execute("""
-                    SELECT user_id
-                    FROM users
-                    WHERE notifications=1
-                """).fetchall()
-
-                conn.close()
-
-            for u in users:
-                try:
-                    bot.send_message(
-                        u["user_id"],
-                        T("live_signal").format(
-                            content=escape(text),
-                            confidence=escape(
-                                get_setting(
-                                    "confidence",
-                                    "95–99%"
-                                )
-                            )
-                        )
-                    )
-                except Exception:
-                    pass
-
-            bot.send_message(
-                uid,
-                "⚡ Live signal sent.",
-                reply_markup=admin_menu()
-            )
-
-            STATES.pop(uid, None)
-            return
-
-        # ---------- VIP manager ----------
-        if action == "vip_manage":
-            parts = text.split()
-
-            if len(parts) != 2:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            try:
-                target = int(parts[0])
-                days = int(parts[1])
-                if days <= 0:
-                    raise ValueError
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            until = now_utc() + timedelta(days=days)
-
-            with DB_LOCK:
-                conn = db()
-                conn.execute("""
-                    UPDATE users
-                    SET status='VIP',vip_until=?
-                    WHERE user_id=?
-                """, (
-                    until.isoformat(),
-                    target
-                ))
-                conn.commit()
-                conn.close()
-
-            STATES.pop(uid, None)
-
-            try:
                 bot.send_message(
-                    target,
-                    f"⭐ <b>VIP Activated</b>\n\n"
-                    f"Expiry: <b>{until.isoformat()}</b>"
+                    user_id,
+                    "⏰ Enter time first:",
+                    reply_markup=back_keyboard()
                 )
-            except Exception:
-                pass
-
-            bot.send_message(
-                uid,
-                "✅ VIP updated.",
-                reply_markup=admin_menu()
-            )
-            return
-
-        # ---------- Wallet adjust ----------
-        if action == "wallet_adjust":
-            parts = text.split()
-
-            if len(parts) != 2:
-                bot.send_message(uid, T("invalid"))
                 return
 
-            try:
-                target = int(parts[0])
-                amount = parse_money(parts[1])
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            if parts[1].startswith("-"):
-                amount = -amount
-
-            with DB_LOCK:
-                conn = db()
-
-                row = conn.execute(
-                    "SELECT wallet_cents FROM users WHERE user_id=?",
-                    (target,)
-                ).fetchone()
-
-                if not row:
-                    conn.close()
-                    bot.send_message(uid, "❌ User not found.")
-                    return
-
-                new_balance = row["wallet_cents"] + amount
-
-                if new_balance < 0:
-                    conn.close()
-                    bot.send_message(uid, "❌ Insufficient wallet.")
-                    return
-
-                conn.execute("""
-                    UPDATE users
-                    SET wallet_cents=?
-                    WHERE user_id=?
-                """, (
-                    new_balance,
-                    target
-                ))
-
-                conn.execute("""
-                    INSERT INTO wallet_transactions(
-                        user_id,type,amount_cents,
-                        balance_after_cents,note,created_at
-                    )
-                    VALUES(?,?,?,?,?,?)
-                """, (
-                    target,
-                    "ADMIN_ADJUST",
-                    amount,
-                    new_balance,
-                    f"Admin adjustment by {uid}",
-                    now_utc().isoformat()
-                ))
-
-                conn.commit()
-                conn.close()
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                f"✅ Wallet updated: ${money(new_balance)}",
-                reply_markup=admin_menu()
-            )
-            return
-
-        # ---------- Subadmin ----------
-        if action == "subadmin":
-            parts = text.split(maxsplit=1)
-
-            if len(parts) != 2:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            try:
-                target = int(parts[0])
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            permissions = {
-                x.strip()
-                for x in parts[1].split(",")
-                if x.strip()
-            }
-
-            valid = {
-                "signals",
-                "uid",
-                "users",
-                "wallet",
-                "withdraw",
-                "broadcast",
-                "settings",
-                "analytics"
-            }
-
-            permissions &= valid
-
-            with DB_LOCK:
-                conn = db()
-                conn.execute("""
-                    INSERT INTO admins(user_id,permissions)
-                    VALUES(?,?)
-                    ON CONFLICT(user_id)
-                    DO UPDATE SET permissions=excluded.permissions
-                """, (
-                    target,
-                    ",".join(sorted(permissions))
-                ))
-                conn.commit()
-                conn.close()
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                "✅ Sub-admin permissions updated.",
-                reply_markup=admin_menu()
-            )
-            return
-
-        # ---------- Setting ----------
-        if action == "setting":
-            parts = text.split(maxsplit=1)
-
-            if len(parts) != 2:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            key, value = parts
-
-            set_setting(key, value)
-
-            STATES.pop(uid, None)
-
-            bot.send_message(
-                uid,
-                "✅ Setting saved.",
-                reply_markup=admin_menu()
-            )
-            return
-
-        # ---------- User manage ----------
-        if action == "user_manage":
-            try:
-                target = int(text)
-            except Exception:
-                bot.send_message(uid, T("invalid"))
-                return
-
-            target_user = user_row(target)
-
-            if not target_user:
+            if not draft.get("direction"):
                 bot.send_message(
-                    uid,
-                    "❌ User not found.",
-                    reply_markup=admin_menu()
+                    user_id,
+                    "⬆️ Choose UP or DOWN first.",
+                    reply_markup=kb([
+                        ["⬆️ UP", "⬇️ DOWN"],
+                        ["📤 Send Live Signal"],
+                        ["✏️ Send Live Text"],
+                        ["⛔ End Live Mode"]
+                    ])
                 )
-                STATES.pop(uid, None)
                 return
 
-            STATES.pop(uid, None)
+            content = (
+                f"📅 <b>{now_bd().date()}</b>\n"
+                f"💱 <b>{draft['pair']}</b>\n"
+                f"⏰ <b>{draft['time']}</b>\n"
+                f"{direction_text(draft['direction'])}"
+            )
+
+            sent = send_live_to_vips(
+                content,
+                user_id
+            )
+
+            LIVE_DRAFT.pop(user_id, None)
 
             bot.send_message(
-                uid,
-                (
-                    "👤 <b>USER</b>\n\n"
-                    f"ID: <code>{target}</code>\n"
-                    f"Name: {escape(target_user['first_name'] or '')}\n"
-                    f"Status: <b>{target_user['status']}</b>\n"
-                    f"Wallet: <b>${money(target_user['wallet_cents'])}</b>\n"
-                    f"VIP Until: {escape(target_user['vip_until'] or 'None')}\n"
-                    f"Referrals: {target_user['refs_count']}\n\n"
-                    f"/vip {target} 30\n"
-                    f"/free_limit {target} 10\n"
-                    f"/wallet {target} 5"
-                ),
-                reply_markup=admin_menu()
-            )
-            return
-
-    # No active state -> route menus
-    if is_admin(uid):
-        if text == T("btn_admin"):
-            bot.send_message(
-                uid,
-                "👑 <b>ADMIN PANEL</b>",
-                reply_markup=admin_menu()
-            )
-            return
-
-        admin_buttons = [
-            T("btn_add_signal"),
-            T("btn_signals"),
-            T("btn_live_session"),
-            T("btn_users"),
-            T("btn_uid_pending"),
-            T("btn_vip_manage"),
-            T("btn_wallet_manage"),
-            T("btn_withdraw"),
-            T("btn_broadcast"),
-            T("btn_text_editor"),
-            T("btn_notice_edit"),
-            T("btn_rules_edit"),
-            T("btn_subadmins"),
-            T("btn_settings"),
-            T("btn_analytics"),
-            T("btn_maintenance"),
-            T("btn_backup"),
-            T("btn_user_manage")
-        ]
-
-        if text in admin_buttons:
-            admin_action(message)
-            return
-
-    # User menu
-    if text == T("btn_withdraw"):
-        start_withdraw(message)
-        return
-
-    handle_user_button(message)
-
-
-# ============================================================
-# SAVE FUTURE SIGNAL
-# ============================================================
-
-def save_future_signal(admin_id, selected_users):
-
-    state = STATES[admin_id]
-
-    try:
-        target = parse_signal_datetime(
-            state["date"],
-            state["time"]
-        )
-    except Exception:
-        bot.send_message(
-            admin_id,
-            "❌ Date/time format ভুল। Signal বাতিল করা হয়েছে।",
-            reply_markup=admin_menu()
-        )
-        STATES.pop(admin_id, None)
-        return
-
-    if target <= now_bd():
-        bot.send_message(
-            admin_id,
-            "❌ Signal time future হতে হবে।",
-            reply_markup=admin_menu()
-        )
-        STATES.pop(admin_id, None)
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        conn.execute("""
-            INSERT INTO signals(
-                signal_date,
-                signal_time,
-                pair,
-                direction,
-                confidence,
-                audience,
-                selected_users,
-                created_at
-            )
-            VALUES(?,?,?,?,?,?,?,?)
-        """, (
-            target.strftime("%Y-%m-%d"),
-            target.strftime("%H:%M"),
-            state["pair"],
-            state["direction"],
-            state["confidence"],
-            state["audience"],
-            selected_users,
-            now_utc().isoformat()
-        ))
-
-        conn.commit()
-        conn.close()
-
-    STATES.pop(admin_id, None)
-
-    bot.send_message(
-        admin_id,
-        (
-            "✅ <b>Future Signal Added</b>\n\n"
-            f"📅 {target.strftime('%Y-%m-%d')}\n"
-            f"🕐 {target.strftime('%H:%M')}\n"
-            f"📌 {escape(state['pair'])}\n"
-            f"📊 {state['direction']}\n"
-            f"🎯 {escape(state['confidence'])}\n"
-            f"👥 {state['audience']}"
-        ),
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# ADMIN COMMANDS
-# ============================================================
-
-@bot.message_handler(commands=["approve_uid"])
-def approve_uid(message):
-
-    if not can(message.from_user.id, "uid"):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        return
-
-    try:
-        target_user = int(parts[1])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        row = conn.execute("""
-            SELECT * FROM uid_submissions
-            WHERE user_id=? AND status='PENDING'
-            ORDER BY id DESC
-            LIMIT 1
-        """, (target_user,)).fetchone()
-
-        if not row:
-            conn.close()
-            bot.send_message(
-                message.chat.id,
-                "❌ Pending UID not found."
-            )
-            return
-
-        duplicate = conn.execute("""
-            SELECT id FROM uid_submissions
-            WHERE uid=?
-            AND status='APPROVED'
-            AND user_id!=?
-        """, (
-            row["uid"],
-            target_user
-        )).fetchone()
-
-        if duplicate:
-            conn.close()
-
-            bot.send_message(
-                message.chat.id,
-                T("uid_duplicate")
-            )
-            return
-
-        conn.execute("""
-            UPDATE uid_submissions
-            SET status='APPROVED',
-                reviewed_at=?,
-                reviewed_by=?
-            WHERE id=?
-        """, (
-            now_utc().isoformat(),
-            message.from_user.id,
-            row["id"]
-        ))
-
-        conn.execute("""
-            UPDATE users
-            SET status='VIP'
-            WHERE user_id=?
-        """, (target_user,))
-
-        conn.commit()
-        conn.close()
-
-    bot.send_message(
-        target_user,
-        "⭐ <b>VIP Activated</b>\n\nYour UID has been approved."
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "✅ UID approved."
-    )
-
-
-@bot.message_handler(commands=["reject_uid"])
-def reject_uid(message):
-
-    if not can(message.from_user.id, "uid"):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        return
-
-    try:
-        target_user = int(parts[1])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        conn.execute("""
-            UPDATE uid_submissions
-            SET status='REJECTED',
-                reviewed_at=?,
-                reviewed_by=?
-            WHERE user_id=?
-            AND status='PENDING'
-        """, (
-            now_utc().isoformat(),
-            message.from_user.id,
-            target_user
-        ))
-
-        conn.commit()
-        conn.close()
-
-    try:
-        bot.send_message(
-            target_user,
-            "❌ আপনার UID rejected হয়েছে। আবার submit করতে পারেন।"
-        )
-    except Exception:
-        pass
-
-    bot.send_message(
-        message.chat.id,
-        "✅ UID rejected."
-    )
-
-
-@bot.message_handler(commands=["approve_withdraw"])
-def approve_withdraw(message):
-
-    if not can(message.from_user.id, "withdraw"):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        return
-
-    try:
-        wid = int(parts[1])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        row = conn.execute("""
-            SELECT * FROM withdrawals
-            WHERE id=? AND status='PENDING'
-        """, (wid,)).fetchone()
-
-        if not row:
-            conn.close()
-            bot.send_message(
-                message.chat.id,
-                "❌ Withdrawal not found."
-            )
-            return
-
-        conn.execute("""
-            UPDATE withdrawals
-            SET status='APPROVED',
-                reviewed_at=?,
-                reviewed_by=?
-            WHERE id=?
-        """, (
-            now_utc().isoformat(),
-            message.from_user.id,
-            wid
-        ))
-
-        conn.execute("""
-            INSERT INTO wallet_transactions(
-                user_id,type,amount_cents,
-                balance_after_cents,note,created_at
-            )
-            SELECT
                 user_id,
-                'WITHDRAW_APPROVED',
-                -amount_cents,
-                wallet_cents,
-                'Withdrawal approved',
-                ?
-            FROM users
-            WHERE user_id=?
-        """, (
-            now_utc().isoformat(),
-            row["user_id"]
-        ))
-
-        conn.commit()
-        conn.close()
-
-    try:
-        bot.send_message(
-            row["user_id"],
-            f"✅ Withdrawal approved: ${money(row['amount_cents'])}"
-        )
-    except Exception:
-        pass
-
-    bot.send_message(
-        message.chat.id,
-        "✅ Withdrawal approved."
-    )
-
-
-@bot.message_handler(commands=["reject_withdraw"])
-def reject_withdraw(message):
-
-    if not can(message.from_user.id, "withdraw"):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        return
-
-    try:
-        wid = int(parts[1])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        row = conn.execute("""
-            SELECT * FROM withdrawals
-            WHERE id=? AND status='PENDING'
-        """, (wid,)).fetchone()
-
-        if not row:
-            conn.close()
+                f"⚡ Live signal sent to <b>{sent}</b> VIP user(s).",
+                reply_markup=admin_keyboard()
+            )
             return
 
-        current = conn.execute(
-            "SELECT wallet_cents FROM users WHERE user_id=?",
-            (row["user_id"],)
-        ).fetchone()["wallet_cents"]
+        if text == "✏️ Send Live Text":
 
-        new_balance = current + row["amount_cents"]
+            if not active_live_session():
+                start_live_session(user_id)
 
-        conn.execute("""
-            UPDATE users
-            SET wallet_cents=?
-            WHERE user_id=?
-        """, (
-            new_balance,
-            row["user_id"]
-        ))
+            set_state(user_id, "LIVE_TEXT")
 
-        conn.execute("""
-            UPDATE withdrawals
-            SET status='REJECTED',
-                reviewed_at=?,
-                reviewed_by=?
-            WHERE id=?
-        """, (
-            now_utc().isoformat(),
-            message.from_user.id,
-            wid
-        ))
-
-        conn.execute("""
-            INSERT INTO wallet_transactions(
-                user_id,type,amount_cents,
-                balance_after_cents,note,created_at
+            bot.send_message(
+                user_id,
+                "✏️ Enter any live signal/text.\n"
+                "It will be sent to VIP users with Live Signal ON.",
+                reply_markup=back_keyboard()
             )
-            VALUES(?,?,?,?,?,?)
-        """, (
-            row["user_id"],
-            "WITHDRAW_REFUND",
-            row["amount_cents"],
-            new_balance,
-            "Withdrawal rejected/refunded",
-            now_utc().isoformat()
-        ))
-
-        conn.commit()
-        conn.close()
-
-    try:
-        bot.send_message(
-            row["user_id"],
-            f"❌ Withdrawal rejected.\n"
-            f"${money(row['amount_cents'])} refunded."
-        )
-    except Exception:
-        pass
-
-    bot.send_message(
-        message.chat.id,
-        "✅ Withdrawal rejected/refunded."
-    )
-
-
-@bot.message_handler(commands=["vip"])
-def vip_command(message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 3:
-        return
-
-    try:
-        uid = int(parts[1])
-        days = int(parts[2])
-    except Exception:
-        return
-
-    until = now_utc() + timedelta(days=days)
-
-    with DB_LOCK:
-        conn = db()
-        conn.execute("""
-            UPDATE users
-            SET status='VIP',vip_until=?
-            WHERE user_id=?
-        """, (
-            until.isoformat(),
-            uid
-        ))
-        conn.commit()
-        conn.close()
-
-    bot.send_message(
-        message.chat.id,
-        "✅ VIP updated."
-    )
-
-
-@bot.message_handler(commands=["free_limit"])
-def free_limit_command(message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 3:
-        return
-
-    try:
-        uid = int(parts[1])
-        limit = int(parts[2])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        conn.execute("""
-            INSERT INTO user_limits(user_id,free_limit)
-            VALUES(?,?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET free_limit=excluded.free_limit
-        """, (
-            uid,
-            max(0, limit)
-        ))
-
-        conn.commit()
-        conn.close()
-
-    bot.send_message(
-        message.chat.id,
-        "✅ User free-signal limit updated."
-    )
-
-
-@bot.message_handler(commands=["wallet"])
-def wallet_command(message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 3:
-        return
-
-    try:
-        uid = int(parts[1])
-        amount = parse_money(parts[2])
-    except Exception:
-        return
-
-    with DB_LOCK:
-        conn = db()
-
-        row = conn.execute(
-            "SELECT wallet_cents FROM users WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-
-        if not row:
-            conn.close()
             return
 
-        new_balance = row["wallet_cents"] + amount
+        if text == "⛔ End Live Mode":
 
-        conn.execute("""
-            UPDATE users
-            SET wallet_cents=?
-            WHERE user_id=?
-        """, (
-            new_balance,
-            uid
-        ))
+            end_live_session()
+            LIVE_DRAFT.pop(user_id, None)
+            clear_state(user_id)
 
-        conn.execute("""
-            INSERT INTO wallet_transactions(
-                user_id,type,amount_cents,
-                balance_after_cents,note,created_at
+            bot.send_message(
+                user_id,
+                get_setting("live_ended"),
+                reply_markup=admin_keyboard()
             )
-            VALUES(?,?,?,?,?,?)
-        """, (
-            uid,
-            "ADMIN_COMMAND",
-            amount,
-            new_balance,
-            "Admin wallet command",
-            now_utc().isoformat()
-        ))
+            return
 
-        conn.commit()
-        conn.close()
+        # VIP
+        if text == "⭐ VIP Management":
+
+            if not has_permission(user_id, "p_vip"):
+                return
+
+            bot.send_message(
+                user_id,
+                "⭐ <b>VIP Management</b>",
+                reply_markup=vip_keyboard()
+            )
+            return
+
+        if text == "➕ Add VIP":
+
+            set_state(user_id, "VIP_USER")
+
+            bot.send_message(
+                user_id,
+                "👤 Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "🔄 Renew VIP":
+
+            set_state(user_id, "VIP_USER")
+
+            bot.send_message(
+                user_id,
+                "👤 Enter Telegram User ID to renew:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "❌ Remove VIP":
+
+            set_state(user_id, "REMOVE_VIP")
+
+            bot.send_message(
+                user_id,
+                "👤 Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "📋 VIP List":
+
+            vip_users = [
+                u for u in db_execute(
+                    "SELECT telegram_id,first_name,vip_until FROM users",
+                    fetchall=True
+                )
+                if is_vip(u["telegram_id"])
+            ]
+
+            if not vip_users:
+                output = "📭 No active VIP users."
+            else:
+                output = "⭐ <b>VIP Users</b>\n\n"
+
+                for u in vip_users:
+                    output += (
+                        f"<code>{u['telegram_id']}</code> | "
+                        f"{u['first_name']}\n"
+                        f"Until: {u['vip_until']}\n\n"
+                    )
+
+            bot.send_message(
+                user_id,
+                output,
+                reply_markup=vip_keyboard()
+            )
+            return
+
+        # UID
+        if text == "🆔 UID Requests":
+
+            if not has_permission(user_id, "p_users"):
+                return
+
+            rows = db_execute(
+                """
+                SELECT * FROM uid_submissions
+                WHERE status='PENDING'
+                ORDER BY id
+                LIMIT 30
+                """,
+                fetchall=True
+            )
+
+            if not rows:
+                bot.send_message(
+                    user_id,
+                    "📭 No pending UID requests.",
+                    reply_markup=admin_keyboard()
+                )
+                return
+
+            lines = ["🆔 <b>Pending UID Requests</b>\n"]
+
+            for r in rows:
+                lines.append(
+                    f"Request #{r['id']}\n"
+                    f"User: <code>{r['telegram_id']}</code>\n"
+                    f"UID: <code>{r['uid']}</code>\n"
+                )
+
+            bot.send_message(
+                user_id,
+                "\n".join(lines),
+                reply_markup=kb([
+                    ["✅ Approve UID", "❌ Reject UID"],
+                    ["🔙 Back", "🏠 Main Menu"]
+                ])
+            )
+            return
+
+        if text == "✅ Approve UID":
+
+            set_state(user_id, "APPROVE_UID")
+
+            bot.send_message(
+                user_id,
+                "Enter UID Request ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "❌ Reject UID":
+
+            set_state(user_id, "REJECT_UID")
+
+            bot.send_message(
+                user_id,
+                "Enter UID Request ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # WALLET ADMIN
+        if text == "💰 Wallet / Withdraw":
+
+            if not has_permission(user_id, "p_wallet"):
+                return
+
+            bot.send_message(
+                user_id,
+                "💰 <b>Wallet / Withdraw</b>",
+                reply_markup=wallet_admin_keyboard()
+            )
+            return
+
+        if text == "💸 Pending Withdrawals":
+
+            rows = db_execute(
+                """
+                SELECT * FROM withdrawals
+                WHERE status='PENDING'
+                ORDER BY id
+                LIMIT 30
+                """,
+                fetchall=True
+            )
+
+            if not rows:
+                output = "📭 No pending withdrawals."
+            else:
+                lines = ["💸 <b>Pending Withdrawals</b>\n"]
+
+                for r in rows:
+                    lines.append(
+                        f"#{r['id']} | User: <code>{r['telegram_id']}</code>\n"
+                        f"Amount: ${money(r['amount_cents'])}\n"
+                        f"Method: {r['method']}\n"
+                        f"Account: <code>{r['account']}</code>\n"
+                    )
+
+                output = "\n".join(lines)
+
+            bot.send_message(
+                user_id,
+                output,
+                reply_markup=kb([
+                    ["✅ Approve Withdrawal"],
+                    ["❌ Reject Withdrawal"],
+                    ["🔙 Back", "🏠 Main Menu"]
+                ])
+            )
+            return
+
+        if text == "✅ Approve Withdrawal":
+
+            set_state(user_id, "APPROVE_WITHDRAW")
+
+            bot.send_message(
+                user_id,
+                "Enter withdrawal ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "❌ Reject Withdrawal":
+
+            set_state(user_id, "REJECT_WITHDRAW")
+
+            bot.send_message(
+                user_id,
+                "Enter withdrawal ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "💰 Add Balance":
+
+            set_state(user_id, "ADMIN_BALANCE_USER")
+
+            bot.send_message(
+                user_id,
+                "Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "➖ Remove Balance":
+
+            set_state(user_id, "ADMIN_REMOVE_USER")
+
+            bot.send_message(
+                user_id,
+                "Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "⚙️ Withdrawal Settings":
+
+            bot.send_message(
+                user_id,
+                (
+                    "⚙️ <b>Withdrawal Settings</b>\n\n"
+                    f"Status: <b>{'ON' if get_setting('withdrawals') == '1' else 'OFF'}</b>\n"
+                    f"Minimum: <b>${get_setting('min_withdraw')}</b>\n"
+                    f"Hold: <b>{get_setting('withdraw_hold_hours')}h</b>"
+                ),
+                reply_markup=kb([
+                    ["💸 Toggle Withdrawals"],
+                    ["💵 Minimum Withdraw"],
+                    ["⏳ Hold Hours"],
+                    ["🎁 Referral Bonus"],
+                    ["🔙 Back"]
+                ])
+            )
+            return
+
+        if text == "💸 Toggle Withdrawals":
+
+            new = "0" if get_setting("withdrawals") == "1" else "1"
+            set_setting("withdrawals", new)
+
+            bot.send_message(
+                user_id,
+                f"💸 Withdrawals: <b>{'ON' if new == '1' else 'OFF'}</b>",
+                reply_markup=wallet_admin_keyboard()
+            )
+            return
+
+        if text == "💵 Minimum Withdraw":
+
+            set_state(user_id, "MIN_WITHDRAW")
+
+            bot.send_message(
+                user_id,
+                "Enter minimum withdrawal in USD:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "🎁 Referral Bonus":
+
+            set_state(user_id, "REFERRAL_BONUS")
+
+            bot.send_message(
+                user_id,
+                "Enter referral bonus in USD:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # BROADCAST
+        if text == "📢 Broadcast":
+
+            if not has_permission(user_id, "p_broadcast"):
+                return
+
+            set_state(user_id, "BROADCAST_TARGET")
+
+            bot.send_message(
+                user_id,
+                "Choose broadcast audience:",
+                reply_markup=kb([
+                    ["👥 All Users"],
+                    ["⭐ VIP Users"],
+                    ["🔙 Back"]
+                ])
+            )
+            return
+
+        # TEXT EDITOR
+        if text == "📝 Bot Text Editor":
+
+            if not has_permission(user_id, "p_text"):
+                return
+
+            bot.send_message(
+                user_id,
+                "📝 <b>Bot Text Editor</b>\n\nChoose a text:",
+                reply_markup=text_editor_keyboard()
+            )
+            return
+
+        if text in TEXT_KEYS:
+
+            key = TEXT_KEYS[text]
+
+            set_state(
+                user_id,
+                "EDIT_TEXT",
+                {"key": key}
+            )
+
+            bot.send_message(
+                user_id,
+                "✏️ Send the new text.\n\n"
+                "Supported placeholders for signal template:\n"
+                "<code>{date}</code>\n"
+                "<code>{time}</code>\n"
+                "<code>{pair}</code>\n"
+                "<code>{direction}</code>\n"
+                "<code>{confidence}</code>\n"
+                "<code>{trade_amount}</code>\n"
+                "<code>{stage}</code>\n"
+                "<code>{remaining_signals}</code>",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # SETTINGS
+        if text == "⚙️ Settings":
+
+            if not has_permission(user_id, "p_settings"):
+                return
+
+            bot.send_message(
+                user_id,
+                "⚙️ <b>Bot Settings</b>",
+                reply_markup=kb([
+                    ["🛠 Maintenance"],
+                    ["📢 Notice"],
+                    ["📖 Trading Rules"],
+                    ["🔢 Free Signal Limit"],
+                    ["🎁 Referral Bonus"],
+                    ["🔔 VIP Reminder"],
+                    ["🗳 Vote Reveal"],
+                    ["🔙 Back", "🏠 Main Menu"]
+                ])
+            )
+            return
+
+        if text == "🛠 Maintenance":
+
+            new = "0" if get_setting("maintenance") == "1" else "1"
+
+            set_setting("maintenance", new)
+
+            bot.send_message(
+                user_id,
+                f"🛠 Maintenance: <b>{'ON' if new == '1' else 'OFF'}</b>",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if text == "📢 Notice":
+
+            set_state(user_id, "NOTICE_INPUT")
+
+            bot.send_message(
+                user_id,
+                "📢 Enter new notice:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "📖 Trading Rules":
+
+            set_state(user_id, "EDIT_TEXT", {"key": "trading_rules"})
+
+            bot.send_message(
+                user_id,
+                "📖 Enter new trading rules:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "🔢 Free Signal Limit":
+
+            set_state(user_id, "FREE_LIMIT")
+
+            bot.send_message(
+                user_id,
+                "Enter maximum free signals per 2-day cycle:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "🗳 Vote Reveal":
+
+            new = "0" if get_setting("vote_reveal") == "1" else "1"
+            set_setting("vote_reveal", new)
+
+            bot.send_message(
+                user_id,
+                f"🗳 Vote reveal: <b>{'ON' if new == '1' else 'OFF'}</b>",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        # SUB ADMINS
+        if text == "👨‍💼 Sub-Admins":
+
+            if not is_admin(user_id):
+                return
+
+            bot.send_message(
+                user_id,
+                "👨‍💼 <b>Sub-Admin Manager</b>",
+                reply_markup=kb([
+                    ["➕ Add Sub-Admin"],
+                    ["📋 Sub-Admin List"],
+                    ["❌ Remove Sub-Admin"],
+                    ["🔙 Back"]
+                ])
+            )
+            return
+
+        if text == "➕ Add Sub-Admin":
+
+            set_state(user_id, "SUBADMIN_ID")
+
+            bot.send_message(
+                user_id,
+                "Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        if text == "📋 Sub-Admin List":
+
+            rows = db_execute(
+                """
+                SELECT * FROM admins
+                WHERE telegram_id != ?
+                """,
+                (ADMIN_ID,),
+                fetchall=True
+            )
+
+            if not rows:
+                output = "📭 No sub-admins."
+            else:
+                output = "👨‍💼 <b>Sub-Admins</b>\n\n"
+
+                for r in rows:
+                    output += (
+                        f"<code>{r['telegram_id']}</code> | "
+                        f"{r['role']}\n"
+                    )
+
+            bot.send_message(
+                user_id,
+                output,
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if text == "❌ Remove Sub-Admin":
+
+            set_state(user_id, "REMOVE_SUBADMIN")
+
+            bot.send_message(
+                user_id,
+                "Enter Telegram User ID:",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # VOTE RESULTS
+        if text == "📊 Vote Results":
+
+            if not has_permission(user_id, "p_signals"):
+                return
+
+            rows = db_execute(
+                """
+                SELECT * FROM signals
+                ORDER BY id DESC
+                LIMIT 10
+                """,
+                fetchall=True
+            )
+
+            if not rows:
+                bot.send_message(
+                    user_id,
+                    "📭 No signals.",
+                    reply_markup=admin_keyboard()
+                )
+                return
+
+            lines = ["📊 <b>Vote Results</b>\n"]
+
+            for s in rows:
+
+                votes = db_execute(
+                    """
+                    SELECT vote,COUNT(*) AS c
+                    FROM signal_votes
+                    WHERE signal_id=?
+                    GROUP BY vote
+                    """,
+                    (s["id"],),
+                    fetchall=True
+                )
+
+                counts = {
+                    "UP": 0,
+                    "DOWN": 0,
+                    "SKIP": 0
+                }
+
+                for v in votes:
+                    counts[v["vote"]] = v["c"]
+
+                lines.append(
+                    f"#{s['id']} {s['pair']} "
+                    f"{s['signal_date']} {s['signal_time']}\n"
+                    f"👍 UP: {counts['UP']} | "
+                    f"👎 DOWN: {counts['DOWN']} | "
+                    f"⏭ SKIP: {counts['SKIP']}\n"
+                )
+
+            bot.send_message(
+                user_id,
+                "\n".join(lines),
+                reply_markup=admin_keyboard()
+            )
+            return
+
+        if text == "📋 Signal History":
+
+            rows = db_execute(
+                """
+                SELECT * FROM signals
+                ORDER BY id DESC
+                LIMIT 30
+                """,
+                fetchall=True
+            )
+
+            lines = ["📋 <b>Signal History</b>\n"]
+
+            for s in rows:
+                lines.append(
+                    f"#{s['id']} | {s['signal_date']} "
+                    f"{s['signal_time']} | "
+                    f"{s['pair']} | "
+                    f"{s['direction']} | "
+                    f"{s['status']}"
+                )
+
+            bot.send_message(
+                user_id,
+                "\n".join(lines) if rows else "📭 Empty.",
+                reply_markup=admin_keyboard()
+            )
+            return
+
+    # --------------------------------------------------------
+    # FALLBACK
+    # --------------------------------------------------------
 
     bot.send_message(
-        message.chat.id,
-        f"✅ Wallet: ${money(new_balance)}"
-    )
-
-
-# ============================================================
-# ANALYTICS
-# ============================================================
-
-def show_analytics(admin_id):
-
-    with DB_LOCK:
-        conn = db()
-
-        users = conn.execute(
-            "SELECT COUNT(*) c FROM users"
-        ).fetchone()["c"]
-
-        vip = conn.execute(
-            "SELECT COUNT(*) c FROM users WHERE status='VIP'"
-        ).fetchone()["c"]
-
-        signals = conn.execute(
-            "SELECT COUNT(*) c FROM signals"
-        ).fetchone()["c"]
-
-        deliveries = conn.execute(
-            "SELECT COUNT(*) c FROM signal_deliveries"
-        ).fetchone()["c"]
-
-        votes = conn.execute(
-            "SELECT COUNT(*) c FROM signal_votes"
-        ).fetchone()["c"]
-
-        withdrawals = conn.execute(
-            "SELECT COUNT(*) c FROM withdrawals"
-        ).fetchone()["c"]
-
-        pending = conn.execute("""
-            SELECT COUNT(*) c
-            FROM withdrawals
-            WHERE status='PENDING'
-        """).fetchone()["c"]
-
-        conn.close()
-
-    bot.send_message(
-        admin_id,
-        (
-            "📈 <b>ANALYTICS</b>\n\n"
-            f"👥 Users: <b>{users}</b>\n"
-            f"⭐ VIP: <b>{vip}</b>\n"
-            f"📊 Signals: <b>{signals}</b>\n"
-            f"📨 Deliveries: <b>{deliveries}</b>\n"
-            f"🗳 Votes: <b>{votes}</b>\n"
-            f"💸 Withdrawals: <b>{withdrawals}</b>\n"
-            f"⏳ Pending Withdrawals: <b>{pending}</b>"
-        ),
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# BACKUP
-# ============================================================
-
-def create_backup():
-
-    try:
-        filename = os.path.join(
-            BACKUP_DIR,
-            f"bot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        user_id,
+        get_setting("invalid_text"),
+        reply_markup=(
+            admin_keyboard()
+            if is_admin(user_id) or admin_row(user_id)
+            else user_keyboard(user_id)
         )
-
-        with DB_LOCK:
-            source = sqlite3.connect(DB_FILE)
-            target = sqlite3.connect(filename)
-
-            source.backup(target)
-
-            target.close()
-            source.close()
-
-        files = sorted(
-            [
-                os.path.join(BACKUP_DIR, x)
-                for x in os.listdir(BACKUP_DIR)
-                if x.endswith(".db")
-            ],
-            key=os.path.getmtime,
-            reverse=True
-        )
-
-        for old in files[10:]:
-            try:
-                os.remove(old)
-            except Exception:
-                pass
-
-        logger.info("Backup created: %s", filename)
-
-    except Exception:
-        logger.exception("Backup failed")
+    )
 
 
 # ============================================================
 # SCHEDULER
 # ============================================================
 
-def scheduler_loop():
+def eligible_users_for_signal(signal):
 
-    last_backup = 0
+    users = db_execute(
+        "SELECT telegram_id FROM users",
+        fetchall=True
+    )
+
+    result = []
+
+    for u in users:
+        user_id = u["telegram_id"]
+
+        if signal["audience"] == "VIP":
+            if not is_vip(user_id):
+                continue
+
+        elif signal["audience"] == "SELECTED":
+            selected = db_execute(
+                """
+                SELECT 1
+                FROM selected_signal_users
+                WHERE signal_id=? AND telegram_id=?
+                """,
+                (signal["id"], user_id),
+                fetchone=True
+            )
+
+            if not selected:
+                continue
+
+        else:
+            if not is_vip(user_id):
+                if free_remaining(user_id) <= 0:
+                    continue
+
+        result.append(user_id)
+
+    return result
+
+
+def deliver_signal(signal):
+
+    users = eligible_users_for_signal(signal)
+
+    for user_id in users:
+
+        already = db_execute(
+            """
+            SELECT id FROM signal_access
+            WHERE signal_id=? AND telegram_id=?
+            """,
+            (signal["id"], user_id),
+            fetchone=True
+        )
+
+        if already:
+            continue
+
+        consume = (
+            1
+            if signal["audience"] == "ALL"
+            and not is_vip(user_id)
+            else 0
+        )
+
+        try:
+            user = user_row(user_id)
+
+            if user and not user["notification_on"]:
+                continue
+
+            bot.send_message(
+                user_id,
+                signal_message(signal, user_id)
+            )
+
+            db_execute(
+                """
+                INSERT OR IGNORE INTO signal_access(
+                    signal_id,telegram_id,delivered_at,consumed_quota
+                )
+                VALUES(?,?,?,?)
+                """,
+                (
+                    signal["id"],
+                    user_id,
+                    now_str(),
+                    consume
+                )
+            )
+
+            process_referral_bonus(user_id)
+
+        except Exception:
+            logger.exception(
+                "Could not deliver signal %s to %s",
+                signal["id"],
+                user_id
+            )
+
+
+def signal_scheduler():
 
     while True:
 
         try:
-
-            # ------------------------------
-            # Future signals
-            # ------------------------------
-
             now = now_bd()
 
-            with DB_LOCK:
-                conn = db()
+            date = now.strftime("%Y-%m-%d")
+            current_time = now.strftime("%H:%M")
 
-                signals = conn.execute("""
-                    SELECT *
-                    FROM signals
-                    WHERE sent=0
-                    ORDER BY id ASC
-                """).fetchall()
+            rows = db_execute(
+                """
+                SELECT * FROM signals
+                WHERE signal_date=?
+                  AND signal_time<=?
+                  AND status='PENDING'
+                ORDER BY signal_date,signal_time,id
+                """,
+                (date, current_time),
+                fetchall=True
+            )
 
-                users = conn.execute("""
-                    SELECT *
-                    FROM users
-                    WHERE blocked=0
-                """).fetchall()
+            for signal in rows:
 
-                conn.close()
+                deliver_signal(signal)
 
-            for signal in signals:
+                db_execute(
+                    """
+                    UPDATE signals
+                    SET status='SENT',sent_at=?
+                    WHERE id=?
+                    """,
+                    (now_str(), signal["id"])
+                )
 
-                try:
-                    due = signal_due_datetime(signal)
-                except Exception:
-                    continue
-
-                if due > now:
-                    continue
-
-                for u in users:
-
-                    uid = u["user_id"]
-
-                    if not user_can_receive_signal(uid, signal):
-                        continue
-
-                    if not u["notifications"]:
-                        continue
-
-                    quota = (
-                        signal["audience"] == "ALL"
-                        and not vip_active(uid)
-                    )
-
-                    send_signal_to_user(
-                        uid,
-                        signal,
-                        =quota
-                    )
-
-                with DB_LOCK:
-                    conn = db()
-
-                    conn.execute("""
-                        UPDATE signals
-                        SET sent=1
-                        WHERE id=?
-                    """, (signal["id"],))
-
-                    conn.commit()
-                    conn.close()
-
-            # ------------------------------
-            # VIP expiry
-            # ------------------------------
-
-            expiry_limit = now_utc() + timedelta(days=3)
-
-            with DB_LOCK:
-                conn = db()
-
-                expiring = conn.execute("""
-                    SELECT user_id,vip_until
-                    FROM users
-                    WHERE status='VIP'
-                    AND vip_until IS NOT NULL
-                """).fetchall()
-
-                conn.close()
-
-            for u in expiring:
-
-                try:
-                    expiry = datetime.fromisoformat(
-                        u["vip_until"]
-                    )
-
-                    if now_utc() < expiry <= expiry_limit:
-                        bot.send_message(
-                            u["user_id"],
-                            (
-                                "⏳ <b>VIP Expiry Reminder</b>\n\n"
-                                f"Your VIP expires on:\n"
-                                f"<b>{escape(u['vip_until'])}</b>"
-                            )
-                        )
-
-                except Exception:
-                    pass
-
-            # ------------------------------
-            # Backup every 6 hours
-            # ------------------------------
-
-            if time.time() - last_backup >= 21600:
-
-                create_backup()
-
-                last_backup = time.time()
+            check_vip_expiry_reminders()
 
         except Exception:
             logger.exception("Scheduler error")
@@ -3301,39 +4173,181 @@ def scheduler_loop():
         time.sleep(5)
 
 
+def check_vip_expiry_reminders():
+
+    reminder_days = int(
+        get_setting("vip_reminder_days", "3")
+    )
+
+    users = db_execute(
+        """
+        SELECT telegram_id,vip_until
+        FROM users
+        WHERE vip_until IS NOT NULL
+        """,
+        fetchall=True
+    )
+
+    now = now_bd()
+
+    for u in users:
+
+        try:
+            expiry = datetime.fromisoformat(u["vip_until"])
+
+            if expiry <= now:
+                continue
+
+            remaining = expiry - now
+
+            if remaining.days > reminder_days:
+                continue
+
+            expiry_date = expiry.date().isoformat()
+            reminder_date = now.date().isoformat()
+
+            exists = db_execute(
+                """
+                SELECT 1 FROM vip_reminders
+                WHERE telegram_id=?
+                  AND expiry_date=?
+                  AND reminder_date=?
+                """,
+                (
+                    u["telegram_id"],
+                    expiry_date,
+                    reminder_date
+                ),
+                fetchone=True
+            )
+
+            if exists:
+                continue
+
+            bot.send_message(
+                u["telegram_id"],
+                f"⚠️ Your VIP expires on <b>{expiry_date}</b>."
+            )
+
+            db_execute(
+                """
+                INSERT OR IGNORE INTO vip_reminders(
+                    telegram_id,expiry_date,reminder_date
+                )
+                VALUES(?,?,?)
+                """,
+                (
+                    u["telegram_id"],
+                    expiry_date,
+                    reminder_date
+                )
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+def backup_database():
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    stamp = now_bd().strftime("%Y%m%d_%H%M%S")
+
+    destination = os.path.join(
+        BACKUP_DIR,
+        f"sm_quatex_{stamp}.db"
+    )
+
+    with DB_LOCK:
+        source = get_db()
+        backup = sqlite3.connect(destination)
+
+        try:
+            source.backup(backup)
+        finally:
+            backup.close()
+            source.close()
+
+    files = sorted(
+        [
+            os.path.join(BACKUP_DIR, x)
+            for x in os.listdir(BACKUP_DIR)
+            if x.endswith(".db")
+        ]
+    )
+
+    while len(files) > 10:
+        os.remove(files.pop(0))
+
+
+def backup_scheduler():
+
+    while True:
+
+        try:
+            backup_database()
+        except Exception:
+            logger.exception("Backup error")
+
+        time.sleep(6 * 60 * 60)
+
+
 # ============================================================
 # ERROR HANDLER
 # ============================================================
 
-@bot.message_handler(func=lambda m: False)
-def unused_handler(message):
-    pass
+def safe_notify_error(chat_id):
 
-
-# ============================================================
-# START DATABASE + SCHEDULER
-# IMPORTANT: polling is LAST
-# ============================================================
-
-init_db()
-
-scheduler_thread = threading.Thread(
-    target=scheduler_loop,
-    daemon=True
-)
-
-scheduler_thread.start()
-
-logger.info("SM QUATEX SURE SHORT started.")
-
-while True:
     try:
-        bot.infinity_polling(
-            skip_pending=True,
-            timeout=30,
-            long_polling_timeout=30
+        bot.send_message(
+            chat_id,
+            get_setting("error_text")
         )
-
     except Exception:
-        logger.exception("Polling crashed. Restarting in 5 seconds.")
-        time.sleep(5)
+        pass
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+def start_background_threads():
+
+    scheduler = threading.Thread(
+        target=signal_scheduler,
+        daemon=True
+    )
+
+    scheduler.start()
+
+    backup = threading.Thread(
+        target=backup_scheduler,
+        daemon=True
+    )
+
+    backup.start()
+
+
+if __name__ == "__main__":
+
+    logger.info("Starting SM QUATEX SURE SHORT...")
+
+    start_background_threads()
+
+    logger.info("Bot polling started.")
+
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=30,
+                long_polling_timeout=30
+            )
+
+        except Exception:
+            logger.exception("Polling crashed. Restarting...")
+            time.sleep(5)
