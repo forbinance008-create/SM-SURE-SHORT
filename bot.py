@@ -1,5433 +1,4271 @@
+# ============================================================
+# SM QUATEX SURE SHORT
+# FULL TELEGRAM BOT - ALL IN ONE FILE
+# pyTelegramBotAPI + SQLite
+# Bangladesh Time: Asia/Dhaka
+# ============================================================
+
 import os
 import re
+import time
 import sqlite3
 import threading
-import time
-import traceback
+import logging
 import shutil
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from html import escape
 
 import telebot
 from telebot import types
 
 
-# =========================================================
-# BASIC CONFIG
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6470135702"))
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN is missing. Add BOT_TOKEN in Railway Variables."
-    )
+    raise RuntimeError("BOT_TOKEN environment variable is missing")
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
-
-BD_TZ = ZoneInfo("Asia/Dhaka")
+TZ = ZoneInfo("Asia/Dhaka")
+DB_FILE = "bot.db"
+BACKUP_DIR = "backups"
 
 bot = telebot.TeleBot(
     BOT_TOKEN,
-    parse_mode="HTML"
+    parse_mode="HTML",
+    threaded=True
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 DB_LOCK = threading.RLock()
-
-# Temporary conversation states.
-# Important business data is stored in SQLite.
 STATE = {}
+TEMP = {}
 
-
-# =========================================================
-# DEFAULT EDITABLE TEXT
-# =========================================================
-
-DEFAULTS = {
-    "welcome":
-        "👋 Welcome, <b>{user_name}</b>!\n\n"
-        "🌐 <b>SM QUATEX SURE SHORT</b>\n\n"
-        "Choose an option from the buttons below.",
-
-    "maintenance":
-        "🛠 <b>Maintenance Mode</b>\n\n"
-        "The bot is temporarily unavailable. Please try again later.",
-
-    "free_limit": "4",
-
-    "withdraw_enabled": "1",
-
-    "withdraw_min": "5.00",
-
-    "withdraw_hold": "0",
-
-    "ref_bonus": "0.50",
-
-    "reminder_days": "3",
-
-    "channel_username": "",
-
-    "signal_template":
-        "📅 <b>{date}</b>\n\n"
-        "💱 <b>{pair}</b>\n"
-        "⏰ <b>{time}</b>\n"
-        "{arrow} <b>{direction}</b>\n"
-        "🎯 Confidence: <b>{confidence}%</b>\n\n"
-        "🆔 Signal #{signal_id}",
-
-    "notice":
-        "📢 <b>Notice</b>\n\n"
-        "No notice has been added yet.",
-
-    "trading_rules":
-        "📖 <b>Trading Rules</b>\n\n"
-        "1. Check your balance before trading.\n"
-        "2. Follow the scheduled signal time.\n"
-        "3. Use your own risk settings.\n"
-        "4. Record WIN / LOSS correctly.\n"
-        "5. Recovery calculations are not guarantees.",
-
-    "help":
-        "❓ <b>Help</b>\n\n"
-        "📡 Future Signals = scheduled signals.\n"
-        "⚡ Live Signals = VIP live-session messages.\n"
-        "💰 Money Management = balance, target, loss limit and trade amount tracker.\n"
-        "📈 Signal Result = record WIN / LOSS.\n"
-        "🗳 Vote Signal = vote on the latest delivered signal.",
-
-    "wallet":
-        "💼 <b>Wallet</b>\n\n"
-        "Balance: <b>${balance}</b>",
-
-    "vip":
-        "👤 <b>VIP / UID</b>\n\n"
-        "⭐ VIP: {vip_status}\n"
-        "🆔 UID: {uid}",
-
-    "referral":
-        "👥 <b>Referral</b>\n\n"
-        "Your referral link:\n"
-        "{ref_link}\n\n"
-        "Successful referrals: {count}\n"
-        "Referral bonus: ${bonus}",
-
-    "notifications":
-        "🔔 Notifications: <b>{status}</b>",
-
-    "live_vip_only":
-        "⭐ <b>Live Signals are VIP-only.</b>",
-
-    "invalid":
-        "❌ Invalid input.\n\n"
-        "Please use the buttons or enter the requested value.",
-
-    "saved":
-        "✅ Saved successfully.",
-
-    "admin_only":
-        "⛔ Admin access only.",
-
-    "mm_intro":
-        "💰 <b>Money Management</b>\n\n"
-        "এটা খুব সহজভাবে আপনার trading money হিসাব রাখবে:\n\n"
-        "💵 Balance = আপনার trading balance\n"
-        "🎯 Profit Target = দিনে কত USD profit হলে stop করবেন\n"
-        "🛑 Loss Limit = দিনে কত USD loss হলে stop করবেন\n"
-        "💲 Base Trade = সাধারণ trade amount\n\n"
-        "⚡ Quick Setup চাপলে শুধু ৪টা তথ্য দিলেই setup শেষ।"
+LIVE = {
+    "active": False,
+    "started_at": None,
+    "admin_id": None,
+    "count": 0
 }
 
-
-# =========================================================
-# MENUS
-# =========================================================
-
-USER_MENU = [
-    "📡 Future Signals",
-    "⚡ Live Signals",
-    "💰 Money Management",
-    "💼 Wallet",
-    "💸 Withdraw",
-    "👤 VIP / UID",
-    "👥 Referral",
-    "📊 Dashboard",
-    "🗳 Vote Signal",
-    "📈 Signal Result",
-    "📜 Signal History",
-    "📖 Trading Rules",
-    "🔔 Notifications",
-    "❓ Help"
-]
+LAST_BACKUP_DAY = ""
 
 
-ADMIN_MENU = [
-    "📡 Future Signals",
-    "⚡ Live Signals",
-    "💰 Money Management",
-    "💼 Wallet",
-    "💸 Withdraw",
-    "👤 VIP / UID",
-    "👥 Referral",
-    "📊 Dashboard",
-    "🗳 Vote Signal",
-    "📈 Signal Result",
-    "📜 Signal History",
-    "📖 Trading Rules",
-    "🔔 Notifications",
-    "❓ Help",
-    "🛠 Admin Panel"
-]
-
-
-ADMIN_PANEL = [
-    "➕ Add Future Signals",
-    "📋 Future Signal List",
-    "⚡ Live Session",
-    "📢 Broadcast",
-    "⭐ VIP Management",
-    "🆔 UID Requests",
-    "💸 Withdraw Requests",
-    "👥 Sub-admins",
-    "⚙️ Bot Settings",
-    "📝 Bot Text Editor",
-    "📊 Vote Results",
-    "📣 Notice",
-    "🟢 Maintenance ON",
-    "🔴 Maintenance OFF",
-    "🔙 Back",
-    "🏠 Main Menu"
-]
-
-
-MM_MENU = [
-    "⚡ Quick Setup",
-    "💵 Set Balance",
-    "🎯 Profit Target",
-    "🛑 Loss Limit",
-    "💲 Base Trade",
-    "🔁 M1 Trade",
-    "📈 M2 Recovery",
-    "🔢 Max Trades/Day",
-    "▶️ Start/Stop Trading",
-    "📋 MM Status",
-    "🔙 Back",
-    "🏠 Main Menu"
-]
-
-
-VIP_MENU = [
-    "🆔 Set Quotex UID",
-    "⭐ VIP Status",
-    "🔙 Back",
-    "🏠 Main Menu"
-]
-
-
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
 def db():
     c = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        check_same_thread=False
+        DB_FILE,
+        check_same_thread=False,
+        timeout=30
     )
     c.row_factory = sqlite3.Row
     return c
 
 
-def init_db():
-
+def q(sql, params=(), fetch=False):
     with DB_LOCK:
-
         c = db()
-
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                balance_cents INTEGER DEFAULT 0,
-                vip_until TEXT,
-                uid TEXT UNIQUE,
-                referred_by INTEGER,
-                referral_paid INTEGER DEFAULT 0,
-                notify INTEGER DEFAULT 1,
-                live_notify INTEGER DEFAULT 1,
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS signals(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_date TEXT,
-                signal_time TEXT,
-                pair TEXT,
-                direction TEXT,
-                confidence TEXT,
-                audience TEXT DEFAULT 'ALL',
-                selected_users TEXT DEFAULT '',
-                sent INTEGER DEFAULT 0,
-                sent_at TEXT,
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS signal_access(
-                user_id INTEGER,
-                signal_id INTEGER,
-                delivered_at TEXT,
-                quota_used INTEGER DEFAULT 0,
-                PRIMARY KEY(user_id, signal_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS signal_results(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                signal_id INTEGER,
-                result TEXT,
-                amount_cents INTEGER,
-                created_at TEXT,
-                UNIQUE(user_id, signal_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS signal_votes(
-                user_id INTEGER,
-                signal_id INTEGER,
-                vote TEXT,
-                created_at TEXT,
-                PRIMARY KEY(user_id, signal_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS uid_requests(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                uid TEXT UNIQUE,
-                status TEXT DEFAULT 'PENDING',
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS withdrawals(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount_cents INTEGER,
-                status TEXT DEFAULT 'PENDING',
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS wallet_tx(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount_cents INTEGER,
-                kind TEXT,
-                note TEXT,
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS admins(
-                user_id INTEGER PRIMARY KEY,
-                role TEXT DEFAULT 'SUBADMIN',
-                p_signals INTEGER DEFAULT 0,
-                p_users INTEGER DEFAULT 0,
-                p_money INTEGER DEFAULT 0,
-                p_broadcast INTEGER DEFAULT 0,
-                p_settings INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS settings(
-                k TEXT PRIMARY KEY,
-                v TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS mm_profiles(
-                user_id INTEGER PRIMARY KEY,
-                balance_cents INTEGER DEFAULT 0,
-                profit_target_cents INTEGER DEFAULT 1000,
-                loss_limit_cents INTEGER DEFAULT 500,
-                base_trade_cents INTEGER DEFAULT 200,
-                m1_trade_cents INTEGER DEFAULT 300,
-                m2_trade_cents INTEGER DEFAULT 500,
-                max_trades INTEGER DEFAULT 10,
-                trades_today INTEGER DEFAULT 0,
-                daily_pl_cents INTEGER DEFAULT 0,
-                day TEXT,
-                stage TEXT DEFAULT 'BASE',
-                session_loss_cents INTEGER DEFAULT 0,
-                recovery_bank_cents INTEGER DEFAULT 0,
-                stop_trading INTEGER DEFAULT 0,
-                balance_confirmed INTEGER DEFAULT 0,
-                payout_pct REAL DEFAULT 80.0
-            );
-
-            CREATE TABLE IF NOT EXISTS live_sessions(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT,
-                ended_at TEXT,
-                status TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS live_signals(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER,
-                pair TEXT,
-                signal_time TEXT,
-                direction TEXT,
-                confidence TEXT,
-                message TEXT,
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS reminders(
-                user_id INTEGER,
-                reminder_date TEXT,
-                kind TEXT,
-                PRIMARY KEY(user_id, reminder_date, kind)
-            );
-
-            CREATE TABLE IF NOT EXISTS selected_signal_users(
-                signal_id INTEGER,
-                user_id INTEGER,
-                PRIMARY KEY(signal_id, user_id)
-            );
-            """
-        )
-
-        for k, v in DEFAULTS.items():
-
-            c.execute(
-                "INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)",
-                (k, v)
-            )
-
+        cur = c.cursor()
+        cur.execute(sql, params)
+        result = cur.fetchall() if fetch else None
         c.commit()
         c.close()
+        return result
 
 
-# =========================================================
-# HELPERS
-# =========================================================
-
-def get_setting(key):
-
-    with DB_LOCK:
-
-        c = db()
-
-        r = c.execute(
-            "SELECT v FROM settings WHERE k=?",
-            (key,)
-        ).fetchone()
-
-        c.close()
-
-    return r["v"] if r else DEFAULTS.get(key, "")
-
-
-def set_setting(key, value):
-
-    with DB_LOCK:
-
-        c = db()
-
-        c.execute(
-            """
-            INSERT INTO settings(k,v)
-            VALUES(?,?)
-            ON CONFLICT(k)
-            DO UPDATE SET v=excluded.v
-            """,
-            (key, str(value))
-        )
-
-        c.commit()
-        c.close()
-
-
-def money(c):
-    return f"{c / 100:.2f}"
-
-
-def cents(value):
-
-    value = str(value)
-    value = value.replace("$", "")
-    value = value.replace(",", "")
-    value = value.strip()
-
-    return int(round(float(value) * 100))
+def one(sql, params=()):
+    r = q(sql, params, True)
+    return r[0] if r else None
 
 
 def now():
-    return datetime.now(BD_TZ)
+    return datetime.now(TZ)
 
 
-def iso():
-    return now().isoformat()
+def now_str():
+    return now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_user(uid):
-
-    with DB_LOCK:
-
-        c = db()
-
-        r = c.execute(
-            "SELECT * FROM users WHERE id=?",
-            (uid,)
-        ).fetchone()
-
-        c.close()
-
-    return r
+def today():
+    return now().strftime("%Y-%m-%d")
 
 
-def ensure_user(m):
+def init_db():
 
-    uid = m.from_user.id
+    q("""
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT DEFAULT '',
+        first_name TEXT DEFAULT '',
+        balance REAL DEFAULT 0,
+        is_vip INTEGER DEFAULT 0,
+        vip_until TEXT,
+        uid TEXT UNIQUE,
+        pending_uid TEXT,
+        referred_by INTEGER,
+        notifications INTEGER DEFAULT 1,
+        live_signal INTEGER DEFAULT 1,
+        free_limit_override INTEGER DEFAULT -1,
+        created_at TEXT
+    )
+    """)
 
-    with DB_LOCK:
+    q("""
+    CREATE TABLE IF NOT EXISTS admins(
+        user_id INTEGER PRIMARY KEY,
+        role TEXT DEFAULT 'sub_admin',
+        permissions TEXT DEFAULT ''
+    )
+    """)
 
-        c = db()
+    q("""
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
 
-        r = c.execute(
-            "SELECT id FROM users WHERE id=?",
-            (uid,)
-        ).fetchone()
+    q("""
+    CREATE TABLE IF NOT EXISTS signals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_date TEXT,
+        signal_time TEXT,
+        pair TEXT,
+        direction TEXT,
+        confidence TEXT DEFAULT '',
+        status TEXT DEFAULT 'scheduled',
+        auto_sent INTEGER DEFAULT 0,
+        created_at TEXT
+    )
+    """)
 
-        if not r:
+    q("""
+    CREATE TABLE IF NOT EXISTS deliveries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER,
+        user_id INTEGER,
+        delivery_type TEXT,
+        delivered_at TEXT,
+        UNIQUE(signal_id,user_id)
+    )
+    """)
 
-            c.execute(
-                """
-                INSERT INTO users(
-                    id,
-                    username,
-                    first_name,
-                    created_at
-                )
-                VALUES(?,?,?,?,?)
-                """.replace("VALUES(?,?,?,?,?)", "VALUES(?,?,?,?)"),
-                (
-                    uid,
-                    m.from_user.username or "",
-                    m.from_user.first_name or "",
-                    iso()
-                )
-            )
+    q("""
+    CREATE TABLE IF NOT EXISTS votes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER,
+        user_id INTEGER,
+        vote TEXT,
+        created_at TEXT,
+        UNIQUE(signal_id,user_id)
+    )
+    """)
 
-        else:
+    q("""
+    CREATE TABLE IF NOT EXISTS signal_results(
+        signal_id INTEGER PRIMARY KEY,
+        result TEXT,
+        updated_at TEXT
+    )
+    """)
 
-            c.execute(
-                """
-                UPDATE users
-                SET username=?, first_name=?
-                WHERE id=?
-                """,
-                (
-                    m.from_user.username or "",
-                    m.from_user.first_name or "",
-                    uid
-                )
-            )
+    q("""
+    CREATE TABLE IF NOT EXISTS withdrawals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        processed_at TEXT
+    )
+    """)
 
-        c.execute(
-            """
-            INSERT OR IGNORE INTO mm_profiles(
-                user_id,
-                day
-            )
-            VALUES(?,?)
-            """,
-            (
-                uid,
-                now().date().isoformat()
-            )
+    q("""
+    CREATE TABLE IF NOT EXISTS wallet_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        type TEXT,
+        description TEXT,
+        created_at TEXT
+    )
+    """)
+
+    q("""
+    CREATE TABLE IF NOT EXISTS referrals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER UNIQUE,
+        bonus REAL DEFAULT 0,
+        created_at TEXT
+    )
+    """)
+
+    q("""
+    CREATE TABLE IF NOT EXISTS live_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id INTEGER,
+        pair TEXT DEFAULT '',
+        signal_time TEXT DEFAULT '',
+        direction TEXT DEFAULT '',
+        message TEXT,
+        created_at TEXT
+    )
+    """)
+
+    q("""
+    CREATE TABLE IF NOT EXISTS notification_targets(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER UNIQUE,
+        title TEXT DEFAULT '',
+        chat_type TEXT DEFAULT '',
+        enabled INTEGER DEFAULT 1,
+        created_at TEXT
+    )
+    """)
+
+    q("""
+    CREATE TABLE IF NOT EXISTS mm(
+        user_id INTEGER PRIMARY KEY,
+        trading_balance REAL DEFAULT 0,
+        profit_target REAL DEFAULT 0,
+        loss_limit REAL DEFAULT 0,
+        base_trade REAL DEFAULT 0,
+        m1_trade REAL DEFAULT 0,
+        max_trades_day INTEGER DEFAULT 0,
+        stop_trading INTEGER DEFAULT 0,
+        daily_pl REAL DEFAULT 0,
+        daily_trades INTEGER DEFAULT 0,
+        recovery_state TEXT DEFAULT 'BASE',
+        session_loss REAL DEFAULT 0,
+        last_day TEXT
+    )
+    """)
+
+    defaults = {
+
+        # General
+        "maintenance": "0",
+        "free_limit": "4",
+        "withdraw_enabled": "1",
+        "withdraw_hold": "1",
+        "min_withdraw": "5",
+        "referral_bonus": "1",
+        "auto_send": "1",
+        "auto_send_minutes": "5",
+        "future_audience": "ALL",
+        "vote_public": "0",
+        "vip_reminder_days": "3",
+        "confidence_default": "95–99%",
+
+        # Text
+        "welcome":
+            "🚀 <b>SM QUATEX SURE SHORT</b>\n\n"
+            "Welcome <b>{user_name}</b>!\n\n"
+            "Select an option below.",
+
+        "notice":
+            "📢 <b>Notice</b>\n\nNo new notice.",
+
+        "trading_contract":
+            "📜 <b>Trading Contract</b>\n\n"
+            "Please follow the signal time and direction carefully.",
+
+        "trading_rules":
+            "📋 <b>Trading Rules</b>\n\n"
+            "• Follow the signal time\n"
+            "• Use your own risk management\n"
+            "• Do not overtrade\n"
+            "• Use Money Management if needed",
+
+        "help":
+            "❓ <b>Help</b>\n\n"
+            "Use the buttons below to access every feature.",
+
+        "invalid":
+            "❌ Invalid input. Please try again.",
+
+        "maintenance_msg":
+            "🛠 <b>Maintenance Mode</b>\n\n"
+            "Please try again later.",
+
+        "no_signal":
+            "📭 No signal available right now.",
+
+        "quota":
+            "📊 Free signal remaining: <b>{remaining_signals}</b>",
+
+        "vip_msg":
+            "💎 <b>VIP MEMBER</b>\n\n"
+            "VIP access is active.",
+
+        "signal_template":
+            "📅 <b>{date}</b>\n\n"
+            "💹 <b>{pair}</b>\n"
+            "⏰ <b>{time}</b>\n\n"
+            "📌 <b>{direction}</b>\n"
+            "🎯 <b>Signal Confidence: {confidence}</b>",
+
+        "live_template":
+            "⚡ <b>LIVE SIGNAL</b>\n\n"
+            "💹 <b>{pair}</b>\n"
+            "⏰ <b>{time}</b>\n\n"
+            "📌 <b>{direction}</b>\n"
+            "🎯 <b>{confidence}</b>",
+
+        "mm_template":
+            "💰 <b>Money Management</b>\n\n"
+            "💵 Balance: ${balance}\n"
+            "🎯 Profit Target: ${profit_target}\n"
+            "🛑 Loss Limit: ${loss_limit}\n"
+            "💲 Base Trade: ${base_trade}\n"
+            "🔄 M1 Trade: ${m1_trade}\n"
+            "📊 Today's P/L: ${daily_pl}\n"
+            "🎮 Today's Trades: {daily_trades}\n"
+            "➡️ Next Trade: ${next_trade}\n"
+            "🔹 Mode: {recovery_state}",
+
+        "win_text":
+            "✅ <b>WIN</b>\n\n"
+            "Next trade: <b>${next_trade}</b>",
+
+        "loss_text":
+            "❌ <b>LOSS</b>\n\n"
+            "Next trade: <b>${next_trade}</b>",
+
+        "skip_text":
+            "⏭ <b>SKIPPED</b>\n\n"
+            "Next trade: <b>${next_trade}</b>",
+
+        "stop_text":
+            "🛑 Trading stopped for today.",
+
+        "vip_expiry":
+            "💎 Your VIP expires on <b>{vip_until}</b>.",
+
+        "main_menu":
+            "🏠 Main Menu",
+
+        "back":
+            "🔙 Back",
+
+        # Main buttons
+        "b_future": "📥 Get Signal",
+        "b_live": "⚡ Live Signal",
+        "b_mm": "💰 Money Management",
+        "b_uid": "🆔 Quotex UID",
+        "b_wallet": "💳 Wallet",
+        "b_withdraw": "💸 Withdraw",
+        "b_referral": "👥 Referral",
+        "b_history": "📜 Signal History",
+        "b_vote": "🗳 Vote Signal",
+        "b_notice": "📢 Notice",
+        "b_rules": "📋 Trading Rules",
+        "b_contract": "📜 Trading Contract",
+        "b_help": "❓ Help",
+        "b_notify": "🔔 Notifications",
+        "b_vip": "💎 VIP",
+        "b_result": "📈 Signal Result",
+        "b_admin": "⚙️ Admin Panel",
+
+        # MM buttons
+        "mm_balance": "💵 Trading Balance",
+        "mm_profit": "🎯 Profit Target",
+        "mm_loss": "🛑 Loss Limit",
+        "mm_base": "💲 Base Trade",
+        "mm_m1": "🔄 M1 Trade",
+        "mm_max": "📊 Max Trades/Day",
+        "mm_stop": "⛔ Stop Trading",
+
+        # Admin
+        "a_future": "📡 Future Signals",
+        "a_live": "⚡ Live Session",
+        "a_users": "👥 Users",
+        "a_vip": "💎 VIP Management",
+        "a_withdraw": "💸 Withdrawals",
+        "a_broadcast": "📣 Broadcast",
+        "a_notice": "📢 Edit Notice",
+        "a_text": "📝 Bot Text Editor",
+        "a_settings": "⚙️ Settings",
+        "a_subadmin": "👮 Admin Management",
+        "a_targets": "📢 Notification Targets",
+        "a_stats": "📊 Statistics",
+        "a_backup": "💾 Backup",
+        "a_vote": "🗳 Vote Stats",
+
+        "live_start": "▶️ Start Live Session",
+        "live_send": "📤 Send Live Signal",
+        "live_text": "✏️ Send Live Text",
+        "live_stats": "📊 Live Stats",
+        "live_end": "🛑 End Live Session",
+
+        "future_import": "📥 Import Signals",
+        "future_list": "📋 Signal List",
+        "future_clear": "🗑 Clear Today's Signals",
+        "future_auto": "🤖 Auto Send",
+
+        "uid_submit": "🆔 Submit UID",
+
+        "result_win": "✅ WIN",
+        "result_loss": "❌ LOSS",
+        "result_skip": "⏭ SKIP",
+    }
+
+    for k, v in defaults.items():
+        q(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            (k, v)
         )
 
-        c.commit()
-        c.close()
+    q(
+        "INSERT OR IGNORE INTO admins(user_id,role,permissions) VALUES(?,?,?)",
+        (
+            ADMIN_ID,
+            "owner",
+            "all"
+        )
+    )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def get_setting(key, default=""):
+    r = one(
+        "SELECT value FROM settings WHERE key=?",
+        (key,)
+    )
+    return r["value"] if r else default
+
+
+def set_setting(key, value):
+    q("""
+    INSERT INTO settings(key,value)
+    VALUES(?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, str(value)))
+
+
+def txt(key):
+    return get_setting(key, key)
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+def register_user(message, ref=None):
+
+    uid = message.from_user.id
+    username = message.from_user.username or ""
+    first = message.from_user.first_name or ""
+
+    old = one(
+        "SELECT * FROM users WHERE user_id=?",
+        (uid,)
+    )
+
+    if not old:
+        referred_by = None
+
+        if ref:
+            try:
+                rid = int(ref)
+                if rid != uid and one(
+                    "SELECT user_id FROM users WHERE user_id=?",
+                    (rid,)
+                ):
+                    referred_by = rid
+            except:
+                pass
+
+        q("""
+        INSERT INTO users(
+            user_id,username,first_name,referred_by,created_at
+        )
+        VALUES(?,?,?,?,?)
+        """, (
+            uid,
+            username,
+            first,
+            referred_by,
+            now_str()
+        ))
+
+        if referred_by:
+            bonus = float(get_setting("referral_bonus", "1"))
+
+            q("""
+            INSERT OR IGNORE INTO referrals(
+                referrer_id,referred_id,bonus,created_at
+            )
+            VALUES(?,?,?,?)
+            """, (
+                referred_by,
+                uid,
+                bonus,
+                now_str()
+            ))
+
+            add_balance(
+                referred_by,
+                bonus,
+                "REFERRAL",
+                f"Referral bonus from {uid}"
+            )
+
+    else:
+        q("""
+        UPDATE users
+        SET username=?,first_name=?
+        WHERE user_id=?
+        """, (
+            username,
+            first,
+            uid
+        ))
+
+    return one(
+        "SELECT * FROM users WHERE user_id=?",
+        (uid,)
+    )
+
+
+def user(uid):
+    return one(
+        "SELECT * FROM users WHERE user_id=?",
+        (uid,)
+    )
+
+
+def is_vip(uid):
+
+    u = user(uid)
+
+    if not u:
+        return False
+
+    if not u["is_vip"]:
+        return False
+
+    if u["vip_until"]:
+        try:
+            expiry = datetime.fromisoformat(u["vip_until"])
+
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=TZ)
+
+            if expiry < now():
+                q(
+                    "UPDATE users SET is_vip=0 WHERE user_id=?",
+                    (uid,)
+                )
+                return False
+        except:
+            pass
+
+    return True
+
+
+# ============================================================
+# ADMIN PERMISSION
+# ============================================================
+
+def admin_info(uid):
+    return one(
+        "SELECT * FROM admins WHERE user_id=?",
+        (uid,)
+    )
 
 
 def is_admin(uid):
+    return admin_info(uid) is not None
+
+
+def can(uid, permission):
 
     if uid == ADMIN_ID:
         return True
 
-    with DB_LOCK:
+    a = admin_info(uid)
 
-        c = db()
+    if not a:
+        return False
 
-        r = c.execute(
-            "SELECT 1 FROM admins WHERE user_id=?",
-            (uid,)
-        ).fetchone()
+    if a["permissions"] == "all":
+        return True
 
-        c.close()
-
-    return bool(r)
-
-
-def money_format(c):
-    return f"{c / 100:.2f}"
+    return permission in [
+        x.strip()
+        for x in a["permissions"].split(",")
+        if x.strip()
+    ]
 
 
-def user_keyboard(admin=False):
+# ============================================================
+# KEYBOARD HELPERS
+# ============================================================
 
-    values = ADMIN_MENU if admin else USER_MENU
-
-    return make_keyboard(values, 2)
-
-
-def make_keyboard(values, width=2):
-
+def kb(rows, resize=True):
     k = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=width
+        resize_keyboard=resize
     )
 
-    for i in range(0, len(values), width):
-
-        row = values[i:i + width]
-
+    for row in rows:
         k.row(*row)
 
     return k
 
 
-def back_keyboard(values):
+def main_keyboard(uid):
 
-    return make_keyboard(
-        values + [
-            "🔙 Back",
-            "🏠 Main Menu"
-        ],
-        2
-    )
+    rows = [
+        [txt("b_future"), txt("b_live")],
+        [txt("b_mm"), txt("b_uid")],
+        [txt("b_wallet"), txt("b_withdraw")],
+        [txt("b_referral"), txt("b_history")],
+        [txt("b_vote"), txt("b_result")],
+        [txt("b_notice"), txt("b_rules")],
+        [txt("b_contract"), txt("b_help")],
+        [txt("b_notify"), txt("b_vip")]
+    ]
+
+    if is_admin(uid):
+        rows.append([txt("b_admin")])
+
+    return kb(rows)
 
 
-def send(uid, text, keyboard=None):
+def back_keyboard():
+    return kb([
+        [txt("back"), txt("main_menu")]
+    ])
+
+
+def admin_keyboard(uid):
+
+    rows = [
+        [txt("a_future"), txt("a_live")],
+        [txt("a_users"), txt("a_vip")],
+        [txt("a_withdraw"), txt("a_broadcast")],
+        [txt("a_notice"), txt("a_text")],
+        [txt("a_settings"), txt("a_subadmin")],
+        [txt("a_targets"), txt("a_stats")],
+        [txt("a_vote"), txt("a_backup")],
+        [txt("main_menu")]
+    ]
+
+    return kb(rows)
+
+
+def future_admin_keyboard():
+    return kb([
+        [txt("future_import")],
+        [txt("future_list")],
+        [txt("future_clear")],
+        [txt("future_auto")],
+        [txt("back"), txt("main_menu")]
+    ])
+
+
+def live_admin_keyboard():
+    return kb([
+        [txt("live_start")],
+        [txt("live_send"), txt("live_text")],
+        [txt("live_stats")],
+        [txt("live_end")],
+        [txt("back"), txt("main_menu")]
+    ])
+
+
+# ============================================================
+# MESSAGE SENDER
+# ============================================================
+
+def send(chat_id, text, keyboard=None):
 
     try:
-
         bot.send_message(
-            uid,
+            chat_id,
             text,
             reply_markup=keyboard
         )
-
-    except Exception:
-
-        pass
-
-
-def require_input(uid, action):
-
-    STATE[uid] = {
-        "action": action
-    }
-
-
-def clear_state(uid):
-
-    STATE.pop(uid, None)
-
-
-def vip_active(user):
-
-    if not user:
+        return True
+    except Exception as e:
+        logging.warning(
+            "Send failed %s: %s",
+            chat_id,
+            e
+        )
         return False
 
-    if not user["vip_until"]:
+
+def safe_send(chat_id, text):
+    try:
+        bot.send_message(chat_id, text)
+        return True
+    except:
         return False
+
+
+# ============================================================
+# MAINTENANCE
+# ============================================================
+
+def maintenance_on():
+    return get_setting("maintenance", "0") == "1"
+
+
+# ============================================================
+# QUOTA - 2 DAY CALENDAR CYCLE
+# ============================================================
+
+def cycle_start():
+
+    d = now().date()
+
+    if d.day % 2 == 0:
+        return d
+    return d - timedelta(days=1)
+
+
+def cycle_key():
+    return cycle_start().strftime("%Y-%m-%d")
+
+
+def user_limit(uid):
+
+    u = user(uid)
+
+    if not u:
+        return int(get_setting("free_limit", "4"))
+
+    if u["free_limit_override"] >= 0:
+        return u["free_limit_override"]
+
+    return int(get_setting("free_limit", "4"))
+
+
+def used_in_cycle(uid):
+
+    start = cycle_start().strftime("%Y-%m-%d")
+
+    row = one("""
+    SELECT COUNT(*) AS c
+    FROM deliveries d
+    JOIN signals s ON s.id=d.signal_id
+    WHERE d.user_id=?
+      AND d.delivery_type IN ('manual','auto')
+      AND s.signal_date>=?
+    """, (
+        uid,
+        start
+    ))
+
+    return int(row["c"]) if row else 0
+
+
+def remaining(uid):
+
+    if is_vip(uid):
+        return 999999
+
+    return max(
+        0,
+        user_limit(uid) - used_in_cycle(uid)
+    )
+
+
+# ============================================================
+# SIGNAL PARSER
+# ============================================================
+
+SIGNAL_RE = re.compile(
+    r"^\s*(\d{1,2}:\d{2})\s*[-|]\s*"
+    r"([A-Za-z0-9/_-]+(?:-[A-Za-z0-9]+)?)\s*[-|]\s*"
+    r"(UP|DOWN|BUY|SELL)\b",
+    re.I
+)
+
+
+def normalize_direction(d):
+    d = d.upper()
+
+    if d in ("UP", "BUY"):
+        return "⬆️ UP"
+
+    return "⬇️ DOWN"
+
+
+def parse_signals(text):
+
+    found = []
+
+    for line in text.splitlines():
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        m = SIGNAL_RE.match(line)
+
+        if not m:
+            continue
+
+        tm = m.group(1)
+        pair = m.group(2).upper()
+        direction = normalize_direction(m.group(3))
+
+        try:
+            datetime.strptime(tm, "%H:%M")
+        except:
+            continue
+
+        found.append(
+            (
+                tm,
+                pair,
+                direction
+            )
+        )
+
+    return found
+
+
+# ============================================================
+# SIGNAL FORMAT
+# ============================================================
+
+def signal_text(signal):
+
+    return txt("signal_template").format(
+        date=signal["signal_date"],
+        pair=escape(signal["pair"]),
+        time=signal["signal_time"],
+        direction=signal["direction"],
+        confidence=escape(
+            signal["confidence"]
+            or get_setting(
+                "confidence_default",
+                "95–99%"
+            )
+        )
+    )
+
+
+# ============================================================
+# AUDIENCE
+# ============================================================
+
+def audience_users():
+
+    mode = get_setting(
+        "future_audience",
+        "ALL"
+    )
+
+    if mode == "VIP":
+        return q(
+            "SELECT user_id FROM users WHERE is_vip=1",
+            fetch=True
+        )
+
+    if mode == "SELECTED":
+        ids = get_setting(
+            "selected_users",
+            ""
+        )
+
+        if not ids:
+            return []
+
+        result = []
+
+        for x in ids.split(","):
+            try:
+                r = one(
+                    "SELECT user_id FROM users WHERE user_id=?",
+                    (int(x),)
+                )
+                if r:
+                    result.append(r)
+            except:
+                pass
+
+        return result
+
+    return q(
+        "SELECT user_id FROM users",
+        fetch=True
+    )
+
+
+# ============================================================
+# DELIVERY
+# ============================================================
+
+def delivered(signal_id, uid):
+
+    return one("""
+    SELECT id FROM deliveries
+    WHERE signal_id=? AND user_id=?
+    """, (
+        signal_id,
+        uid
+    )) is not None
+
+
+def record_delivery(signal_id, uid, dtype):
 
     try:
-
-        return (
-            datetime.fromisoformat(
-                user["vip_until"]
-            ) > now()
+        q("""
+        INSERT OR IGNORE INTO deliveries(
+            signal_id,user_id,delivery_type,delivered_at
         )
-
-    except Exception:
-
+        VALUES(?,?,?,?)
+        """, (
+            signal_id,
+            uid,
+            dtype,
+            now_str()
+        ))
+        return True
+    except:
         return False
 
 
-# =========================================================
-# QUOTA
-# =========================================================
+def can_receive_signal(uid):
 
-def quota_cycle():
+    if is_vip(uid):
+        return True
 
-    days = (
-        date.today() -
-        date(1970, 1, 1)
-    ).days
-
-    return days // 2
+    return remaining(uid) > 0
 
 
-def quota_used(uid):
+def next_signal(uid):
 
-    cycle_start = (
-        date(1970, 1, 1) +
-        timedelta(
-            days=quota_cycle() * 2
+    rows = q("""
+    SELECT *
+    FROM signals
+    WHERE signal_date=?
+      AND status='scheduled'
+    ORDER BY signal_time,id
+    """, (
+        today(),
+    ), True)
+
+    for s in rows:
+
+        if delivered(s["id"], uid):
+            continue
+
+        return s
+
+    return None
+
+
+# ============================================================
+# SEND SIGNAL TO USER
+# ============================================================
+
+def deliver_signal(uid, signal, dtype="manual"):
+
+    if delivered(signal["id"], uid):
+        return False
+
+    if not can_receive_signal(uid):
+        return False
+
+    text = signal_text(signal)
+
+    send(
+        uid,
+        text,
+        kb([
+            [txt("b_vote"), txt("b_result")],
+            [txt("b_future")],
+            [txt("back"), txt("main_menu")]
+        ])
+    )
+
+    record_delivery(
+        signal["id"],
+        uid,
+        dtype
+    )
+
+    return True
+
+
+# ============================================================
+# AUTO SEND
+# ============================================================
+
+def auto_send_signals():
+
+    if get_setting("auto_send", "1") != "1":
+        return
+
+    minute = int(
+        get_setting(
+            "auto_send_minutes",
+            "5"
         )
-    ).isoformat()
+    )
 
-    with DB_LOCK:
+    current = now()
 
-        c = db()
+    rows = q("""
+    SELECT *
+    FROM signals
+    WHERE signal_date=?
+      AND auto_sent=0
+      AND status='scheduled'
+    ORDER BY signal_time,id
+    """, (
+        today(),
+    ), True)
 
-        r = c.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM signal_access
-            WHERE user_id=?
-            AND quota_used=1
-            AND substr(delivered_at,1,10)>=?
-            """,
-            (
-                uid,
-                cycle_start
+    for s in rows:
+
+        try:
+            dt = datetime.strptime(
+                s["signal_date"] + " " + s["signal_time"],
+                "%Y-%m-%d %H:%M"
+            ).replace(tzinfo=TZ)
+        except:
+            continue
+
+        start = dt - timedelta(minutes=minute)
+
+        if start <= current < dt:
+
+            for u in audience_users():
+
+                uid = int(u["user_id"])
+
+                if not u["notifications"]:
+                    continue
+
+                deliver_signal(
+                    uid,
+                    s,
+                    "auto"
+                )
+
+            targets = q("""
+            SELECT * FROM notification_targets
+            WHERE enabled=1
+            """, fetch=True)
+
+            message = signal_text(s)
+
+            for t in targets:
+                safe_send(
+                    int(t["chat_id"]),
+                    message
+                )
+
+            q(
+                "UPDATE signals SET auto_sent=1 WHERE id=?",
+                (s["id"],)
             )
-        ).fetchone()
-
-        c.close()
-
-    return r["n"]
 
 
-def free_remaining(uid):
-
-    user = get_user(uid)
-
-    if vip_active(user):
-        return "Unlimited"
-
-    limit = int(
-        get_setting("free_limit") or 4
-    )
-
-    return str(
-        max(
-            0,
-            limit - quota_used(uid)
-        )
-    )
-
-
-# =========================================================
+# ============================================================
 # MONEY MANAGEMENT
-# =========================================================
+# ============================================================
 
-def mm_reset(uid):
+def ensure_mm(uid):
 
-    with DB_LOCK:
+    row = one(
+        "SELECT * FROM mm WHERE user_id=?",
+        (uid,)
+    )
 
-        c = db()
+    if not row:
+        q("""
+        INSERT INTO mm(
+            user_id,last_day
+        )
+        VALUES(?,?)
+        """, (
+            uid,
+            today()
+        ))
 
-        row = c.execute(
-            """
-            SELECT *
-            FROM mm_profiles
-            WHERE user_id=?
-            """,
-            (uid,)
-        ).fetchone()
+    row = one(
+        "SELECT * FROM mm WHERE user_id=?",
+        (uid,)
+    )
 
-        today = now().date().isoformat()
+    if row["last_day"] != today():
 
-        if not row:
+        q("""
+        UPDATE mm
+        SET daily_pl=0,
+            daily_trades=0,
+            stop_trading=0,
+            recovery_state='BASE',
+            session_loss=0,
+            last_day=?
+        WHERE user_id=?
+        """, (
+            today(),
+            uid
+        ))
 
-            c.execute(
-                """
-                INSERT INTO mm_profiles(
-                    user_id,
-                    day
-                )
-                VALUES(?,?)
-                """,
-                (uid, today)
-            )
-
-            c.commit()
-            c.close()
-
-            return
-
-        if row["day"] != today:
-
-            c.execute(
-                """
-                UPDATE mm_profiles
-                SET
-                    day=?,
-                    trades_today=0,
-                    daily_pl_cents=0,
-                    stop_trading=0,
-                    balance_confirmed=0,
-                    stage='BASE',
-                    session_loss_cents=0
-                WHERE user_id=?
-                """,
-                (
-                    today,
-                    uid
-                )
-            )
-
-            c.commit()
-
-        c.close()
-
-
-def mm_row(uid):
-
-    mm_reset(uid)
-
-    with DB_LOCK:
-
-        c = db()
-
-        r = c.execute(
-            """
-            SELECT *
-            FROM mm_profiles
-            WHERE user_id=?
-            """,
-            (uid,)
-        ).fetchone()
-
-        c.close()
-
-    return r
+    return one(
+        "SELECT * FROM mm WHERE user_id=?",
+        (uid,)
+    )
 
 
 def next_trade_amount(uid):
 
-    r = mm_row(uid)
+    m = ensure_mm(uid)
 
-    if r["stage"] == "M1":
+    if m["recovery_state"] == "M1":
+        return float(m["m1_trade"])
 
-        return r["m1_trade_cents"]
-
-    if r["stage"] == "M2":
-
-        needed = (
-            r["session_loss_cents"] +
-            r["base_trade_cents"]
-        )
-
-        payout = max(
-            r["payout_pct"] / 100,
-            0.01
-        )
-
-        calculated = int(
-            needed / payout + 0.9999
-        )
-
-        return max(
-            r["m2_trade_cents"],
-            calculated
-        )
-
-    if r["recovery_bank_cents"] > 0:
-
-        needed = (
-            r["recovery_bank_cents"] +
-            r["base_trade_cents"]
-        )
-
-        payout = max(
-            r["payout_pct"] / 100,
-            0.01
-        )
-
-        return int(
-            needed / payout + 0.9999
-        )
-
-    return r["base_trade_cents"]
+    return float(m["base_trade"])
 
 
 def mm_status(uid):
 
-    r = mm_row(uid)
+    m = ensure_mm(uid)
+
+    return txt("mm_template").format(
+        balance=f"{m['trading_balance']:.2f}",
+        profit_target=f"{m['profit_target']:.2f}",
+        loss_limit=f"{m['loss_limit']:.2f}",
+        base_trade=f"{m['base_trade']:.2f}",
+        m1_trade=f"{m['m1_trade']:.2f}",
+        daily_pl=f"{m['daily_pl']:.2f}",
+        daily_trades=m["daily_trades"],
+        next_trade=f"{next_trade_amount(uid):.2f}",
+        recovery_state=m["recovery_state"]
+    )
+
+
+def mm_can_trade(uid):
+
+    m = ensure_mm(uid)
+
+    if m["stop_trading"]:
+        return False
+
+    if m["max_trades_day"] > 0:
+        if m["daily_trades"] >= m["max_trades_day"]:
+            return False
+
+    if m["profit_target"] > 0:
+        if m["daily_pl"] >= m["profit_target"]:
+            return False
+
+    if m["loss_limit"] > 0:
+        if m["daily_pl"] <= -abs(m["loss_limit"]):
+            return False
+
+    return True
+
+
+def record_result(uid, result):
+
+    m = ensure_mm(uid)
 
     amount = next_trade_amount(uid)
 
-    return (
-        "💰 <b>Money Management Status</b>\n\n"
+    if amount <= 0:
+        return 0, "BASE"
 
-        f"💵 Balance: <b>${money(r['balance_cents'])}</b>\n"
+    if result == "WIN":
 
-        f"🎯 Daily Profit Target: "
-        f"<b>+${money(r['profit_target_cents'])}</b>\n"
+        pl = amount
 
-        f"🛑 Daily Loss Limit: "
-        f"<b>-${money(r['loss_limit_cents'])}</b>\n"
+        new_pl = m["daily_pl"] + pl
 
-        f"💲 Next Trade Amount: "
-        f"<b>${money(amount)}</b>\n"
+        q("""
+        UPDATE mm
+        SET daily_pl=?,
+            daily_trades=daily_trades+1,
+            recovery_state='BASE',
+            session_loss=0
+        WHERE user_id=?
+        """, (
+            new_pl,
+            uid
+        ))
 
-        f"🔹 Current Stage: <b>{r['stage']}</b>\n"
+        if (
+            m["profit_target"] > 0
+            and new_pl >= m["profit_target"]
+        ):
+            q(
+                "UPDATE mm SET stop_trading=1 WHERE user_id=?",
+                (uid,)
+            )
 
-        f"📈 Today's P/L: "
-        f"<b>${money(r['daily_pl_cents'])}</b>\n"
+        return amount, "BASE"
 
-        f"🔢 Trades: "
-        f"<b>{r['trades_today']}/{r['max_trades']}</b>\n"
+    if result == "LOSS":
 
-        f"⛔ Stop Trading: "
-        f"<b>{'ON' if r['stop_trading'] else 'OFF'}</b>\n\n"
+        pl = -amount
 
-        "ℹ️ <b>Recovery:</b>\n"
-        "Base LOSS → M1\n"
-        "M1 LOSS → M2\n"
-        "WIN → recovery reset"
+        new_pl = m["daily_pl"] + pl
+
+        if m["recovery_state"] == "BASE":
+
+            q("""
+            UPDATE mm
+            SET daily_pl=?,
+                daily_trades=daily_trades+1,
+                recovery_state='M1',
+                session_loss=session_loss+?
+            WHERE user_id=?
+            """, (
+                new_pl,
+                amount,
+                uid
+            ))
+
+            next_amt = float(m["m1_trade"])
+
+            if (
+                m["max_trades_day"] > 0
+                and m["daily_trades"] + 1 >= m["max_trades_day"]
+            ):
+                q(
+                    "UPDATE mm SET stop_trading=1 WHERE user_id=?",
+                    (uid,)
+                )
+
+            return next_amt, "M1"
+
+        # M1 LOSS -> no M2
+        q("""
+        UPDATE mm
+        SET daily_pl=?,
+            daily_trades=daily_trades+1,
+            recovery_state='BASE',
+            session_loss=session_loss+?,
+            stop_trading=CASE
+                WHEN ? > 0 AND ? <= -? THEN 1
+                ELSE stop_trading
+            END
+        WHERE user_id=?
+        """, (
+            new_pl,
+            amount,
+            m["loss_limit"],
+            new_pl,
+            abs(m["loss_limit"]),
+            uid
+        ))
+
+        return float(m["base_trade"]), "BASE"
+
+    return amount, m["recovery_state"]
+
+
+# ============================================================
+# WALLET
+# ============================================================
+
+def add_balance(uid, amount, typ, description):
+
+    u = user(uid)
+
+    if not u:
+        return
+
+    new_balance = float(u["balance"]) + float(amount)
+
+    q(
+        "UPDATE users SET balance=? WHERE user_id=?",
+        (new_balance, uid)
     )
 
-
-# =========================================================
-# SIGNAL FORMAT
-# =========================================================
-
-def format_signal(row):
-
-    direction = row["direction"].upper()
-
-    arrow = (
-        "🟢⬆️"
-        if direction in ("UP", "BUY")
-        else
-        "🔴⬇️"
+    q("""
+    INSERT INTO wallet_history(
+        user_id,amount,type,description,created_at
     )
-
-    template = get_setting(
-        "signal_template"
-    )
-
-    return template.format(
-        date=row["signal_date"],
-        time=row["signal_time"],
-        pair=row["pair"],
-        direction=direction,
-        confidence=row["confidence"] or "—",
-        signal_id=row["id"],
-        arrow=arrow,
-        trade_amount="",
-        stage="",
-        remaining_signals=""
-    )
-
-
-# =========================================================
-# MAIN MENU
-# =========================================================
-
-def main_menu(uid):
-
-    send(
+    VALUES(?,?,?,?,?)
+    """, (
         uid,
-        "🏠 <b>Main Menu</b>\n\nChoose an option:",
-        user_keyboard(
-            is_admin(uid)
+        amount,
+        typ,
+        description,
+        now_str()
+    ))
+
+
+# ============================================================
+# VIP
+# ============================================================
+
+def set_vip(uid, days):
+
+    expiry = now() + timedelta(days=days)
+
+    q("""
+    UPDATE users
+    SET is_vip=1,vip_until=?
+    WHERE user_id=?
+    """, (
+        expiry.isoformat(),
+        uid
+    ))
+
+    return expiry
+
+
+def remove_vip(uid):
+
+    q("""
+    UPDATE users
+    SET is_vip=0,vip_until=NULL
+    WHERE user_id=?
+    """, (
+        uid,
+    ))
+
+
+def vip_reminders():
+
+    days = int(
+        get_setting(
+            "vip_reminder_days",
+            "3"
         )
     )
 
+    target_date = now().date() + timedelta(days=days)
 
-def admin_panel(uid):
+    users = q("""
+    SELECT * FROM users
+    WHERE is_vip=1
+      AND vip_until IS NOT NULL
+    """, fetch=True)
 
-    send(
-        uid,
-        "🛠 <b>ADMIN PANEL</b>\n\n"
-        "সব Admin কাজ নিচের button দিয়েই করা যাবে:",
-        make_keyboard(
-            ADMIN_PANEL,
-            2
+    for u in users:
+
+        try:
+            expiry = datetime.fromisoformat(
+                u["vip_until"]
+            ).date()
+        except:
+            continue
+
+        if expiry == target_date:
+
+            send(
+                u["user_id"],
+                txt("vip_expiry").format(
+                    vip_until=expiry
+                ),
+                main_keyboard(u["user_id"])
+            )
+
+
+# ============================================================
+# VOTING
+# ============================================================
+
+def vote_for(uid, signal_id, vote):
+
+    try:
+        q("""
+        INSERT INTO votes(
+            signal_id,user_id,vote,created_at
         )
+        VALUES(?,?,?,?)
+        """, (
+            signal_id,
+            uid,
+            vote,
+            now_str()
+        ))
+        return True
+    except:
+        return False
+
+
+def vote_stats(signal_id):
+
+    rows = q("""
+    SELECT vote,COUNT(*) c
+    FROM votes
+    WHERE signal_id=?
+    GROUP BY vote
+    """, (
+        signal_id,
+    ), True)
+
+    data = {
+        "UP": 0,
+        "DOWN": 0,
+        "SKIP": 0
+    }
+
+    for r in rows:
+        data[r["vote"]] = r["c"]
+
+    return data
+
+
+# ============================================================
+# SIGNAL RESULT
+# ============================================================
+
+def latest_action_signal(uid):
+
+    r = one("""
+    SELECT s.*
+    FROM signals s
+    JOIN deliveries d ON d.signal_id=s.id
+    WHERE d.user_id=?
+    ORDER BY d.id DESC
+    LIMIT 1
+    """, (
+        uid,
+    ))
+
+    return r
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
+def backup_db():
+
+    global LAST_BACKUP_DAY
+
+    d = today()
+
+    if LAST_BACKUP_DAY == d:
+        return
+
+    if not os.path.exists(DB_FILE):
+        return
+
+    os.makedirs(
+        BACKUP_DIR,
+        exist_ok=True
     )
 
+    filename = os.path.join(
+        BACKUP_DIR,
+        f"bot_{d}.db"
+    )
 
-# =========================================================
+    try:
+        shutil.copy2(
+            DB_FILE,
+            filename
+        )
+        LAST_BACKUP_DAY = d
+        logging.info(
+            "Database backup created"
+        )
+    except Exception as e:
+        logging.error(
+            "Backup error: %s",
+            e
+        )
+
+
+# ============================================================
+# SCHEDULER
+# ============================================================
+
+def scheduler():
+
+    while True:
+
+        try:
+            auto_send_signals()
+            vip_reminders()
+            backup_db()
+        except Exception as e:
+            logging.exception(
+                "Scheduler error: %s",
+                e
+            )
+
+        time.sleep(10)
+
+
+# ============================================================
 # /START
-# =========================================================
+# ============================================================
 
 @bot.message_handler(commands=["start"])
-def start_handler(message):
+def start(message):
 
-    ensure_user(message)
+    args = message.text.split(maxsplit=1)
+
+    ref = None
+
+    if len(args) > 1:
+        ref = args[1]
+
+    register_user(
+        message,
+        ref
+    )
 
     uid = message.from_user.id
 
-    # Referral
-    if message.text and " " in message.text:
-
-        payload = message.text.split(
-            " ",
-            1
-        )[1].strip()
-
-        if payload.startswith("ref_"):
-
-            ref_id = payload[4:]
-
-            if ref_id.isdigit():
-
-                ref_id = int(ref_id)
-
-                if ref_id != uid:
-
-                    with DB_LOCK:
-
-                        c = db()
-
-                        u = c.execute(
-                            """
-                            SELECT referred_by
-                            FROM users
-                            WHERE id=?
-                            """,
-                            (uid,)
-                        ).fetchone()
-
-                        if (
-                            u and
-                            not u["referred_by"]
-                        ):
-
-                            c.execute(
-                                """
-                                UPDATE users
-                                SET referred_by=?
-                                WHERE id=?
-                                """,
-                                (
-                                    ref_id,
-                                    uid
-                                )
-                            )
-
-                            c.commit()
-
-                        c.close()
-
-    if (
-        get_setting("maintenance") == "1"
-        and not is_admin(uid)
-    ):
-
+    if maintenance_on() and not is_admin(uid):
         send(
             uid,
-            get_setting("maintenance")
+            txt("maintenance_msg")
         )
-
         return
 
-    user = get_user(uid)
+    u = user(uid)
 
-    text = get_setting(
-        "welcome"
-    ).format(
-        user_name=(
-            message.from_user.first_name
-            or "there"
+    text = txt("welcome").format(
+        user_name=escape(
+            u["first_name"] or "User"
         ),
-        balance=money(
-            user["balance_cents"]
-        )
+        balance=f"{u['balance']:.2f}",
+        remaining_signals=remaining(uid)
     )
 
     send(
         uid,
         text,
-        user_keyboard(
-            is_admin(uid)
-        )
+        main_keyboard(uid)
     )
 
 
-# =========================================================
-# /ADMIN
-# =========================================================
+# ============================================================
+# MAIN MENU
+# ============================================================
 
-@bot.message_handler(commands=["admin"])
-def admin_command(message):
+@bot.message_handler(
+    func=lambda m: m.text == txt("main_menu")
+)
+def main_menu(message):
 
-    ensure_user(message)
+    register_user(message)
+
+    send(
+        message.chat.id,
+        txt("welcome").format(
+            user_name=escape(
+                message.from_user.first_name or "User"
+            ),
+            balance=f"{user(message.from_user.id)['balance']:.2f}",
+            remaining_signals=remaining(
+                message.from_user.id
+            )
+        ),
+        main_keyboard(message.from_user.id)
+    )
+
+
+# ============================================================
+# GET SIGNAL
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_future")
+)
+def get_signal(message):
 
     uid = message.from_user.id
 
-    if is_admin(uid):
+    if maintenance_on() and not is_admin(uid):
+        send(
+            uid,
+            txt("maintenance_msg")
+        )
+        return
 
-        admin_panel(uid)
+    signal = next_signal(uid)
+
+    if not signal:
+
+        send(
+            uid,
+            txt("no_signal"),
+            main_keyboard(uid)
+        )
+        return
+
+    if not is_vip(uid):
+
+        if remaining(uid) <= 0:
+
+            send(
+                uid,
+                txt("quota").format(
+                    remaining_signals=0
+                ),
+                main_keyboard(uid)
+            )
+            return
+
+    deliver_signal(
+        uid,
+        signal,
+        "manual"
+    )
+
+    if not is_vip(uid):
+
+        send(
+            uid,
+            txt("quota").format(
+                remaining_signals=remaining(uid)
+            ),
+            main_keyboard(uid)
+        )
+
+
+# ============================================================
+# NOTICE
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_notice")
+)
+def notice(message):
+
+    send(
+        message.chat.id,
+        txt("notice"),
+        back_keyboard()
+    )
+
+
+# ============================================================
+# RULES
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_rules")
+)
+def rules(message):
+
+    send(
+        message.chat.id,
+        txt("trading_rules"),
+        back_keyboard()
+    )
+
+
+# ============================================================
+# CONTRACT
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_contract")
+)
+def contract(message):
+
+    send(
+        message.chat.id,
+        txt("trading_contract"),
+        back_keyboard()
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_help")
+)
+def help_menu(message):
+
+    send(
+        message.chat.id,
+        txt("help"),
+        back_keyboard()
+    )
+
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_notify")
+)
+def notification_menu(message):
+
+    uid = message.from_user.id
+    u = user(uid)
+
+    status = "ON 🔔" if u["notifications"] else "OFF 🔕"
+
+    send(
+        uid,
+        f"🔔 <b>Notifications: {status}</b>",
+        kb([
+            ["🔔 ON", "🔕 OFF"],
+            [txt("back"), txt("main_menu")]
+        ])
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text in ["🔔 ON", "🔕 OFF"]
+)
+def notification_change(message):
+
+    uid = message.from_user.id
+
+    value = 1 if message.text == "🔔 ON" else 0
+
+    q(
+        "UPDATE users SET notifications=? WHERE user_id=?",
+        (value, uid)
+    )
+
+    send(
+        uid,
+        "✅ Notification setting updated.",
+        main_keyboard(uid)
+    )
+
+
+# ============================================================
+# UID
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_uid")
+)
+def uid_menu(message):
+
+    uid = message.from_user.id
+    u = user(uid)
+
+    if u["uid"]:
+        send(
+            uid,
+            f"🆔 Your Quotex UID:\n\n<b>{escape(u['uid'])}</b>",
+            main_keyboard(uid)
+        )
+        return
+
+    if u["pending_uid"]:
+        send(
+            uid,
+            f"⏳ UID pending approval:\n\n<b>{escape(u['pending_uid'])}</b>",
+            main_keyboard(uid)
+        )
+        return
+
+    STATE[uid] = "UID"
+
+    send(
+        uid,
+        "🆔 <b>Enter your Quotex UID:</b>",
+        back_keyboard()
+    )
+
+
+# ============================================================
+# MONEY MANAGEMENT
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_mm")
+)
+def money_management(message):
+
+    uid = message.from_user.id
+
+    send(
+        uid,
+        mm_status(uid),
+        kb([
+            [txt("mm_balance"), txt("mm_profit")],
+            [txt("mm_loss"), txt("mm_base")],
+            [txt("mm_m1"), txt("mm_max")],
+            [txt("mm_stop")],
+            [txt("back"), txt("main_menu")]
+        ])
+    )
+
+
+def mm_input(uid, field, prompt):
+
+    STATE[uid] = "MM_" + field
+
+    send(
+        uid,
+        prompt,
+        back_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_balance")
+)
+def mm_balance(message):
+    mm_input(
+        message.from_user.id,
+        "balance",
+        "💵 Enter Trading Balance in USD:"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_profit")
+)
+def mm_profit(message):
+    mm_input(
+        message.from_user.id,
+        "profit",
+        "🎯 Enter Profit Target in USD:"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_loss")
+)
+def mm_loss(message):
+    mm_input(
+        message.from_user.id,
+        "loss",
+        "🛑 Enter Loss Limit in USD:"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_base")
+)
+def mm_base(message):
+    mm_input(
+        message.from_user.id,
+        "base",
+        "💲 Enter Base Trade amount in USD:"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_m1")
+)
+def mm_m1(message):
+    mm_input(
+        message.from_user.id,
+        "m1",
+        "🔄 Enter M1 Trade amount in USD:"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_max")
+)
+def mm_max(message):
+    mm_input(
+        message.from_user.id,
+        "max",
+        "📊 Enter Max Trades per Day:\n\nUse 0 for unlimited."
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("mm_stop")
+)
+def mm_stop(message):
+
+    uid = message.from_user.id
+
+    m = ensure_mm(uid)
+
+    value = 0 if m["stop_trading"] else 1
+
+    q(
+        "UPDATE mm SET stop_trading=? WHERE user_id=?",
+        (value, uid)
+    )
+
+    send(
+        uid,
+        "✅ Stop Trading turned " +
+        ("ON" if value else "OFF"),
+        main_keyboard(uid)
+    )
+
+
+# ============================================================
+# WALLET
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_wallet")
+)
+def wallet(message):
+
+    uid = message.from_user.id
+    u = user(uid)
+
+    rows = q("""
+    SELECT * FROM wallet_history
+    WHERE user_id=?
+    ORDER BY id DESC
+    LIMIT 10
+    """, (
+        uid,
+    ), True)
+
+    text = (
+        f"💳 <b>Wallet</b>\n\n"
+        f"Balance: <b>${u['balance']:.2f}</b>\n\n"
+    )
+
+    if not rows:
+        text += "No transaction history."
+
+    else:
+        for r in rows:
+            text += (
+                f"• {r['type']}: "
+                f"${r['amount']:.2f}\n"
+                f"  {escape(r['description'])}\n"
+            )
+
+    send(
+        uid,
+        text,
+        main_keyboard(uid)
+    )
+
+
+# ============================================================
+# WITHDRAW
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_withdraw")
+)
+def withdraw(message):
+
+    uid = message.from_user.id
+
+    if get_setting("withdraw_enabled", "1") != "1":
+
+        send(
+            uid,
+            "❌ Withdraw is currently disabled.",
+            main_keyboard(uid)
+        )
+        return
+
+    u = user(uid)
+
+    minimum = float(
+        get_setting(
+            "min_withdraw",
+            "5"
+        )
+    )
+
+    send(
+        uid,
+        f"💸 <b>Withdraw</b>\n\n"
+        f"Balance: ${u['balance']:.2f}\n"
+        f"Minimum: ${minimum:.2f}\n\n"
+        f"Enter amount:",
+        back_keyboard()
+    )
+
+    STATE[uid] = "WITHDRAW"
+
+
+# ============================================================
+# REFERRAL
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_referral")
+)
+def referral(message):
+
+    uid = message.from_user.id
+
+    u = user(uid)
+
+    me = bot.get_me()
+
+    link = (
+        f"https://t.me/{me.username}?start={uid}"
+    )
+
+    count = one("""
+    SELECT COUNT(*) c
+    FROM referrals
+    WHERE referrer_id=?
+    """, (
+        uid,
+    ))
+
+    send(
+        uid,
+        f"👥 <b>Referral</b>\n\n"
+        f"Your referrals: <b>{count['c']}</b>\n\n"
+        f"Your link:\n"
+        f"<code>{link}</code>\n\n"
+        f"Bonus: ${get_setting('referral_bonus','1')}",
+        main_keyboard(uid)
+    )
+
+
+# ============================================================
+# VIP USER
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_vip")
+)
+def vip_user(message):
+
+    uid = message.from_user.id
+    u = user(uid)
+
+    if is_vip(uid):
+
+        send(
+            uid,
+            txt("vip_msg") +
+            "\n\n" +
+            txt("vip_expiry").format(
+                vip_until=u["vip_until"]
+            ),
+            main_keyboard(uid)
+        )
 
     else:
 
         send(
             uid,
-            get_setting("admin_only")
+            "💎 You are currently a normal member.\n\n"
+            "Contact admin for VIP access.",
+            main_keyboard(uid)
         )
 
 
-# =========================================================
-# USER FEATURES
-# =========================================================
+# ============================================================
+# SIGNAL HISTORY
+# ============================================================
 
-def future_menu(message):
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_history")
+)
+def history(message):
 
     uid = message.from_user.id
 
-    send(
+    rows = q("""
+    SELECT s.*,d.delivery_type
+    FROM signals s
+    JOIN deliveries d ON d.signal_id=s.id
+    WHERE d.user_id=?
+    ORDER BY d.id DESC
+    LIMIT 20
+    """, (
         uid,
-        "📡 <b>Future Signals</b>\n\n"
-        f"📊 Free signals remaining: "
-        f"<b>{free_remaining(uid)}</b>\n\n"
-        "Choose:",
-        make_keyboard(
-            [
-                "📅 Today's Signals",
-                "📜 Signal History",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-def todays_signals(uid):
-
-    today = now().strftime("%d-%m-%Y")
-
-    with DB_LOCK:
-
-        c = db()
-
-        rows = c.execute(
-            """
-            SELECT *
-            FROM signals
-            WHERE signal_date=?
-            ORDER BY signal_time
-            """,
-            (today,)
-        ).fetchall()
-
-        c.close()
+    ), True)
 
     if not rows:
 
         send(
             uid,
-            "📅 <b>Today's Signals</b>\n\n"
-            "📭 No signal available for today.",
-            user_keyboard(
-                is_admin(uid)
-            )
+            "📜 No signal history.",
+            main_keyboard(uid)
         )
-
-        return
-
-    text = "📅 <b>Today's Signals</b>\n\n"
-
-    for row in rows:
-
-        arrow = (
-            "🟢⬆️"
-            if row["direction"] == "UP"
-            else
-            "🔴⬇️"
-        )
-
-        text += (
-            f"#{row['id']} "
-            f"⏰ {row['signal_time']} "
-            f"💱 {row['pair']} "
-            f"{arrow} "
-            f"{row['direction']} "
-            f"🎯 {row['confidence']}%\n"
-        )
-
-    send(
-        uid,
-        text,
-        user_keyboard(
-            is_admin(uid)
-        )
-    )
-
-
-def live_menu_user(message):
-
-    uid = message.from_user.id
-
-    user = get_user(uid)
-
-    if not vip_active(user):
-
-        send(
-            uid,
-            get_setting("live_vip_only"),
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
-        return
-
-    send(
-        uid,
-        "⚡ <b>Live Signals</b>\n\n"
-        "VIP live signals will appear here.\n\n"
-        "You can control your Live notification:",
-        make_keyboard(
-            [
-                "🔔 Live ON",
-                "🔕 Live OFF",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-def wallet_menu(message):
-
-    uid = message.from_user.id
-
-    user = get_user(uid)
-
-    send(
-        uid,
-        get_setting(
-            "wallet"
-        ).format(
-            balance=money(
-                user["balance_cents"]
-            )
-        ),
-        make_keyboard(
-            [
-                "📜 Wallet History",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-def withdraw_menu(message):
-
-    uid = message.from_user.id
-
-    if get_setting(
-        "withdraw_enabled"
-    ) != "1":
-
-        send(
-            uid,
-            "💸 <b>Withdraw is currently OFF.</b>",
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
-        return
-
-    send(
-        uid,
-        "💸 <b>Withdraw</b>\n\n"
-        f"Minimum withdrawal: "
-        f"<b>${get_setting('withdraw_min')}</b>\n\n"
-        "Press the button and enter your USD amount.",
-        make_keyboard(
-            [
-                "💵 Withdraw Amount",
-                "📜 Withdraw History",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-def vip_menu(message):
-
-    uid = message.from_user.id
-
-    user = get_user(uid)
-
-    status = (
-        "Active until "
-        + user["vip_until"][:10]
-        if vip_active(user)
-        else
-        "Not Active"
-    )
-
-    send(
-        uid,
-        get_setting("vip").format(
-            vip_status=status,
-            uid=user["uid"] or "Not set"
-        ),
-        back_keyboard(VIP_MENU)
-    )
-
-
-def referral_menu(message):
-
-    uid = message.from_user.id
-
-    user = get_user(uid)
-
-    with DB_LOCK:
-
-        c = db()
-
-        r = c.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM users
-            WHERE referred_by=?
-            """,
-            (uid,)
-        ).fetchone()
-
-        c.close()
-
-    try:
-        username = bot.get_me().username
-    except Exception:
-        username = "YOUR_BOT"
-
-    link = (
-        f"https://t.me/{username}"
-        f"?start=ref_{uid}"
-    )
-
-    send(
-        uid,
-        get_setting(
-            "referral"
-        ).format(
-            ref_link=link,
-            count=r["n"],
-            bonus=get_setting("ref_bonus")
-        ),
-        user_keyboard(
-            is_admin(uid)
-        )
-    )
-
-
-def dashboard(uid):
-
-    user = get_user(uid)
-
-    with DB_LOCK:
-
-        c = db()
-
-        win = c.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM signal_results
-            WHERE user_id=?
-            AND result='WIN'
-            """,
-            (uid,)
-        ).fetchone()["n"]
-
-        loss = c.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM signal_results
-            WHERE user_id=?
-            AND result='LOSS'
-            """,
-            (uid,)
-        ).fetchone()["n"]
-
-        c.close()
-
-    return (
-        "📊 <b>Dashboard</b>\n\n"
-        f"💰 Wallet: ${money(user['balance_cents'])}\n"
-        f"⭐ VIP: {'Active' if vip_active(user) else 'No'}\n"
-        f"📈 WIN: {win}\n"
-        f"📉 LOSS: {loss}\n"
-        f"📡 Free signals: {free_remaining(uid)}"
-    )
-
-
-def history_menu(message):
-
-    uid = message.from_user.id
-
-    with DB_LOCK:
-
-        c = db()
-
-        rows = c.execute(
-            """
-            SELECT
-                s.*,
-                x.result
-            FROM signal_access a
-            JOIN signals s
-                ON s.id=a.signal_id
-            LEFT JOIN signal_results x
-                ON x.signal_id=s.id
-                AND x.user_id=?
-            WHERE a.user_id=?
-            ORDER BY s.id DESC
-            LIMIT 15
-            """,
-            (
-                uid,
-                uid
-            )
-        ).fetchall()
-
-        c.close()
-
-    if not rows:
-
-        send(
-            uid,
-            "📜 No signal history yet.",
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
         return
 
     text = "📜 <b>Signal History</b>\n\n"
 
-    for r in rows:
+    for s in rows:
+
+        result = one(
+            "SELECT result FROM signal_results WHERE signal_id=?",
+            (s["id"],)
+        )
+
+        r = result["result"] if result else "PENDING"
 
         text += (
-            f"#{r['id']} "
-            f"{r['signal_date']} "
-            f"{r['signal_time']} "
-            f"{r['pair']} "
-            f"{r['direction']} — "
-            f"{r['result'] or 'Pending'}\n"
+            f"#{s['id']} "
+            f"{s['signal_date']} "
+            f"{s['signal_time']}\n"
+            f"{s['pair']} — {s['direction']}\n"
+            f"Result: <b>{r}</b>\n\n"
         )
 
     send(
         uid,
         text,
-        user_keyboard(
-            is_admin(uid)
-        )
+        main_keyboard(uid)
     )
 
 
-def notification_menu(message):
-
-    uid = message.from_user.id
-
-    user = get_user(uid)
-
-    send(
-        uid,
-        get_setting(
-            "notifications"
-        ).format(
-            status=(
-                "ON"
-                if user["notify"]
-                else
-                "OFF"
-            )
-        ),
-        make_keyboard(
-            [
-                "🔔 ON",
-                "🔕 OFF",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-# =========================================================
-# MONEY MANAGEMENT MENU
-# =========================================================
-
-def money_management_menu(message):
-
-    uid = message.from_user.id
-
-    send(
-        uid,
-        get_setting("mm_intro")
-        + "\n\n"
-        "👉 নতুন হলে শুধু "
-        "<b>⚡ Quick Setup</b> চাপুন.",
-        back_keyboard(MM_MENU)
-    )
-
-
-def mm_action(message, text):
-
-    uid = message.from_user.id
-
-    if text == "⚡ Quick Setup":
-
-        STATE[uid] = {
-            "action": "mm_quick_balance",
-            "quick": {}
-        }
-
-        send(
-            uid,
-            "⚡ <b>Quick Setup — Step 1/4</b>\n\n"
-            "আপনার current trading balance কত USD?\n\n"
-            "Example: <b>100</b>"
-        )
-
-        return
-
-    if text == "💵 Set Balance":
-
-        require_input(
-            uid,
-            "mm_balance"
-        )
-
-        send(
-            uid,
-            "💵 আপনার current trading balance USD-তে দিন.\n\n"
-            "Example: <b>100</b>"
-        )
-
-        return
-
-    if text == "🎯 Profit Target":
-
-        require_input(
-            uid,
-            "mm_target"
-        )
-
-        send(
-            uid,
-            "🎯 প্রতিদিন কত USD profit হলে trading stop করতে চান?\n\n"
-            "Example: <b>10</b>"
-        )
-
-        return
-
-    if text == "🛑 Loss Limit":
-
-        require_input(
-            uid,
-            "mm_loss"
-        )
-
-        send(
-            uid,
-            "🛑 প্রতিদিন কত USD loss হলে trading stop করতে চান?\n\n"
-            "Example: <b>5</b>"
-        )
-
-        return
-
-    if text == "💲 Base Trade":
-
-        require_input(
-            uid,
-            "mm_base"
-        )
-
-        send(
-            uid,
-            "💲 আপনার normal/base trade amount কত USD?\n\n"
-            "Example: <b>2</b>"
-        )
-
-        return
-
-    if text == "🔁 M1 Trade":
-
-        require_input(
-            uid,
-            "mm_m1"
-        )
-
-        send(
-            uid,
-            "🔁 Base loss হলে M1 কত USD হবে?\n\n"
-            "Example: <b>3</b>"
-        )
-
-        return
-
-    if text == "📈 M2 Recovery":
-
-        require_input(
-            uid,
-            "mm_m2"
-        )
-
-        send(
-            uid,
-            "📈 M2-এর minimum amount USD-তে দিন.\n\n"
-            "Session-এর accumulated loss অনুযায়ী bot recovery amount calculate করবে."
-        )
-
-        return
-
-    if text == "🔢 Max Trades/Day":
-
-        require_input(
-            uid,
-            "mm_max"
-        )
-
-        send(
-            uid,
-            "🔢 দিনে সর্বোচ্চ কতটি trade করতে চান?\n\n"
-            "Example: <b>10</b>"
-        )
-
-        return
-
-    if text == "▶️ Start/Stop Trading":
-
-        with DB_LOCK:
-
-            c = db()
-
-            r = c.execute(
-                """
-                SELECT stop_trading
-                FROM mm_profiles
-                WHERE user_id=?
-                """,
-                (uid,)
-            ).fetchone()
-
-            new_value = (
-                0
-                if r["stop_trading"]
-                else
-                1
-            )
-
-            c.execute(
-                """
-                UPDATE mm_profiles
-                SET stop_trading=?
-                WHERE user_id=?
-                """,
-                (
-                    new_value,
-                    uid
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        send(
-            uid,
-            mm_status(uid),
-            back_keyboard(MM_MENU)
-        )
-
-        return
-
-    if text == "📋 MM Status":
-
-        send(
-            uid,
-            mm_status(uid),
-            back_keyboard(MM_MENU)
-        )
-
-
-# =========================================================
-# VIP / UID
-# =========================================================
-
-def vip_action(message, text):
-
-    uid = message.from_user.id
-
-    if text == "🆔 Set Quotex UID":
-
-        require_input(
-            uid,
-            "uid"
-        )
-
-        send(
-            uid,
-            "🆔 আপনার Quotex UID পাঠান.\n\n"
-            "একটি UID শুধুমাত্র একটি Telegram account-এর সাথে link করা যাবে."
-        )
-
-        return
-
-    if text == "⭐ VIP Status":
-
-        vip_menu(message)
-
-
-# =========================================================
+# ============================================================
 # VOTE
-# =========================================================
+# ============================================================
 
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_vote")
+)
 def vote_menu(message):
 
     uid = message.from_user.id
 
-    with DB_LOCK:
+    signal = latest_action_signal(uid)
 
-        c = db()
-
-        row = c.execute(
-            """
-            SELECT s.*
-            FROM signals s
-            JOIN signal_access a
-                ON a.signal_id=s.id
-            WHERE a.user_id=?
-            ORDER BY s.id DESC
-            LIMIT 1
-            """,
-            (uid,)
-        ).fetchone()
-
-        c.close()
-
-    if not row:
+    if not signal:
 
         send(
             uid,
-            "🗳 No delivered signal to vote on.",
-            user_keyboard(
-                is_admin(uid)
-            )
+            txt("no_signal"),
+            main_keyboard(uid)
         )
-
         return
 
-    with DB_LOCK:
+    existing = one("""
+    SELECT * FROM votes
+    WHERE signal_id=? AND user_id=?
+    """, (
+        signal["id"],
+        uid
+    ))
 
-        c = db()
-
-        voted = c.execute(
-            """
-            SELECT 1
-            FROM signal_votes
-            WHERE user_id=?
-            AND signal_id=?
-            """,
-            (
-                uid,
-                row["id"]
-            )
-        ).fetchone()
-
-        c.close()
-
-    if voted:
+    if existing:
 
         send(
             uid,
-            "✅ You already voted on the latest signal.",
-            user_keyboard(
-                is_admin(uid)
-            )
+            "✅ You already voted for this signal.",
+            main_keyboard(uid)
         )
-
         return
 
-    STATE[uid] = {
-        "action": "vote",
-        "signal_id": row["id"]
+    DATA[uid] = {
+        "vote_signal": signal["id"]
     }
 
     send(
         uid,
-        "🗳 <b>Vote Signal</b>\n\n"
-        "আপনার prediction দিন:",
-        make_keyboard(
-            [
-                "👍 UP",
-                "👎 DOWN",
-                "⏭ SKIP",
-                "🔙 Back"
-            ],
-            2
-        )
+        f"🗳 <b>Vote for Signal #{signal['id']}</b>",
+        kb([
+            ["⬆️ UP", "⬇️ DOWN"],
+            ["🤝 SKIP"],
+            [txt("back"), txt("main_menu")]
+        ])
     )
 
 
-def save_vote(message, text):
+@bot.message_handler(
+    func=lambda m: m.text in ["⬆️ UP", "⬇️ DOWN", "🤝 SKIP"]
+)
+def vote_submit(message):
 
     uid = message.from_user.id
 
-    state = STATE.get(
-        uid,
-        {}
-    )
-
-    signal_id = state.get(
-        "signal_id"
+    signal_id = DATA.get(uid, {}).get(
+        "vote_signal"
     )
 
     if not signal_id:
-        main_menu(uid)
         return
 
     vote = {
-        "👍 UP": "UP",
-        "👎 DOWN": "DOWN",
-        "⏭ SKIP": "SKIP"
-    }.get(text)
+        "⬆️ UP": "UP",
+        "⬇️ DOWN": "DOWN",
+        "🤝 SKIP": "SKIP"
+    }[message.text]
 
-    if not vote:
-        return
-
-    with DB_LOCK:
-
-        c = db()
-
-        c.execute(
-            """
-            INSERT OR IGNORE INTO signal_votes(
-                user_id,
-                signal_id,
-                vote,
-                created_at
-            )
-            VALUES(?,?,?,?)
-            """,
-            (
-                uid,
-                signal_id,
-                vote,
-                iso()
-            )
-        )
-
-        c.commit()
-        c.close()
-
-    clear_state(uid)
-
-    send(
+    if vote_for(
         uid,
-        "✅ Vote recorded.\n\n"
-        "📊 Vote result is visible to admin.",
-        user_keyboard(
-            is_admin(uid)
+        signal_id,
+        vote
+    ):
+        send(
+            uid,
+            "✅ Vote submitted.",
+            main_keyboard(uid)
         )
-    )
+    else:
+        send(
+            uid,
+            "⚠️ You already voted.",
+            main_keyboard(uid)
+        )
+
+    DATA.pop(uid, None)
 
 
-# =========================================================
-# SIGNAL RESULT
-# =========================================================
+# ============================================================
+# RESULT
+# ============================================================
 
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_result")
+)
 def result_menu(message):
 
     uid = message.from_user.id
 
-    with DB_LOCK:
+    signal = latest_action_signal(uid)
 
-        c = db()
-
-        row = c.execute(
-            """
-            SELECT s.*
-            FROM signals s
-            JOIN signal_access a
-                ON a.signal_id=s.id
-            LEFT JOIN signal_results x
-                ON x.signal_id=s.id
-                AND x.user_id=?
-            WHERE a.user_id=?
-            AND x.id IS NULL
-            ORDER BY s.id DESC
-            LIMIT 1
-            """,
-            (
-                uid,
-                uid
-            )
-        ).fetchone()
-
-        c.close()
-
-    if not row:
+    if not signal:
 
         send(
             uid,
-            "📈 No pending signal result.",
-            user_keyboard(
-                is_admin(uid)
-            )
+            txt("no_signal"),
+            main_keyboard(uid)
         )
-
         return
 
-    mm = mm_row(uid)
+    old = one(
+        "SELECT result FROM signal_results WHERE signal_id=?",
+        (signal["id"],)
+    )
 
-    amount = next_trade_amount(uid)
+    if old:
 
-    STATE[uid] = {
-        "action": "result",
-        "signal_id": row["id"]
+        send(
+            uid,
+            f"Signal #{signal['id']} result: "
+            f"<b>{old['result']}</b>",
+            main_keyboard(uid)
+        )
+        return
+
+    DATA[uid] = {
+        "result_signal": signal["id"]
     }
 
     send(
         uid,
-        f"📈 <b>Signal #{row['id']}</b>\n\n"
-        f"💱 Pair: {row['pair']}\n"
-        f"⏰ Time: {row['signal_time']}\n"
-        f"🔹 Stage: {mm['stage']}\n"
-        f"💲 Trade Amount: ${money(amount)}\n\n"
-        "Trade result কী হয়েছে?",
-        make_keyboard(
-            [
-                "✅ WIN",
-                "❌ LOSS",
-                "⏭ SKIP",
-                "🔙 Back"
-            ],
-            2
-        )
+        f"📈 <b>Signal #{signal['id']} Result</b>",
+        kb([
+            [txt("result_win"), txt("result_loss")],
+            [txt("result_skip")],
+            [txt("back"), txt("main_menu")]
+        ])
     )
 
 
-def save_result(message, text):
+@bot.message_handler(
+    func=lambda m: m.text in [
+        txt("result_win"),
+        txt("result_loss"),
+        txt("result_skip")
+    ]
+)
+def result_submit(message):
 
     uid = message.from_user.id
 
-    state = STATE.get(
-        uid,
-        {}
-    )
-
-    signal_id = state.get(
-        "signal_id"
+    signal_id = DATA.get(uid, {}).get(
+        "result_signal"
     )
 
     if not signal_id:
-        main_menu(uid)
         return
 
-    result = {
-        "✅ WIN": "WIN",
-        "❌ LOSS": "LOSS",
-        "⏭ SKIP": "SKIP"
-    }.get(text)
-
-    if not result:
-        return
-
-    mm = mm_row(uid)
-
-    amount = next_trade_amount(uid)
-
-    with DB_LOCK:
-
-        c = db()
-
-        c.execute(
-            """
-            INSERT OR IGNORE INTO signal_results(
-                user_id,
-                signal_id,
-                result,
-                amount_cents,
-                created_at
-            )
-            VALUES(?,?,?,?,?)
-            """,
-            (
-                uid,
-                signal_id,
-                result,
-                amount,
-                iso()
-            )
-        )
-
-        if result in ("WIN", "LOSS"):
-
-            delta = (
-                amount
-                if result == "WIN"
-                else
-                -amount
-            )
-
-            c.execute(
-                """
-                UPDATE mm_profiles
-                SET
-                    balance_cents=balance_cents+?,
-                    daily_pl_cents=daily_pl_cents+?,
-                    trades_today=trades_today+1
-                WHERE user_id=?
-                """,
-                (
-                    delta,
-                    delta,
-                    uid
-                )
-            )
-
-            if result == "LOSS":
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET
-                        session_loss_cents=
-                            session_loss_cents+?,
-                        recovery_bank_cents=
-                            recovery_bank_cents+?,
-                        stage=
-                            CASE
-                                WHEN stage='BASE'
-                                    THEN 'M1'
-                                WHEN stage='M1'
-                                    THEN 'M2'
-                                ELSE
-                                    'BASE'
-                            END
-                    WHERE user_id=?
-                    """,
-                    (
-                        amount,
-                        amount,
-                        uid
-                    )
-                )
-
-            else:
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET
-                        stage='BASE',
-                        session_loss_cents=0,
-                        recovery_bank_cents=0
-                    WHERE user_id=?
-                    """,
-                    (uid,)
-                )
-
-            r = c.execute(
-                """
-                SELECT *
-                FROM mm_profiles
-                WHERE user_id=?
-                """,
-                (uid,)
-            ).fetchone()
-
-            if (
-                r["daily_pl_cents"]
-                >= r["profit_target_cents"]
-            ):
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET stop_trading=1
-                    WHERE user_id=?
-                    """,
-                    (uid,)
-                )
-
-            elif (
-                r["daily_pl_cents"]
-                <= -r["loss_limit_cents"]
-            ):
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET stop_trading=1
-                    WHERE user_id=?
-                    """,
-                    (uid,)
-                )
-
-            elif (
-                r["trades_today"]
-                >= r["max_trades"]
-            ):
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET stop_trading=1
-                    WHERE user_id=?
-                    """,
-                    (uid,)
-                )
-
-        c.commit()
-        c.close()
-
-    clear_state(uid)
-
-    send(
-        uid,
-        f"✅ <b>{result}</b> saved.\n\n"
-        + mm_status(uid),
-        user_keyboard(
-            is_admin(uid)
-        )
-    )
-
-
-# =========================================================
-# NOTIFICATIONS
-# =========================================================
-
-def set_notification(message, text):
-
-    uid = message.from_user.id
-
-    value = (
-        1
-        if text == "🔔 ON"
-        else
-        0
-    )
-
-    with DB_LOCK:
-
-        c = db()
-
-        c.execute(
-            """
-            UPDATE users
-            SET notify=?
-            WHERE id=?
-            """,
-            (
-                value,
-                uid
-            )
-        )
-
-        c.commit()
-        c.close()
-
-    notification_menu(message)
-
-
-# =========================================================
-# ADMIN - FUTURE SIGNAL PARSER
-# =========================================================
-
-def parse_signals(text, default_date):
-
-    result = []
-
-    for raw in text.splitlines():
-
-        line = raw.strip()
-
-        if not line:
-            continue
-
-        # Format:
-        # 12:30 EURUSD UP 95
-
-        match = re.match(
-            r"""
-            ^
-            (\d{1,2}:\d{2})
-            [|,\s]+
-            ([^|,\s]+)
-            [|,\s]+
-            (UP|DOWN|BUY|SELL)
-            (?:[|,\s]+(\d+(?:\.\d+)?))?
-            $
-            """,
-            line,
-            re.I | re.X
-        )
-
-        if not match:
-            continue
-
-        tm, pair, direction, confidence = (
-            match.groups()
-        )
-
-        try:
-
-            datetime.strptime(
-                f"{default_date} {tm}",
-                "%d-%m-%Y %H:%M"
-            )
-
-        except Exception:
-
-            continue
-
-        direction = direction.upper()
-
-        if direction == "BUY":
-            direction = "UP"
-
-        if direction == "SELL":
-            direction = "DOWN"
-
-        result.append(
-            (
-                default_date,
-                tm,
-                pair.upper(),
-                direction,
-                confidence or ""
-            )
-        )
-
-    return result
-
-
-# =========================================================
-# SIGNAL DELIVERY
-# =========================================================
-
-def audience_allowed(signal, uid):
-
-    user = get_user(uid)
-
-    if signal["audience"] == "VIP":
-
-        return vip_active(user)
-
-    if signal["audience"] == "SELECTED":
-
-        with DB_LOCK:
-
-            c = db()
-
-            r = c.execute(
-                """
-                SELECT 1
-                FROM selected_signal_users
-                WHERE signal_id=?
-                AND user_id=?
-                """,
-                (
-                    signal["id"],
-                    uid
-                )
-            ).fetchone()
-
-            c.close()
-
-        return bool(r)
-
-    return True
-
-
-def deliver_signal(signal):
-
-    with DB_LOCK:
-
-        c = db()
-
-        users = c.execute(
-            "SELECT * FROM users"
-        ).fetchall()
-
-        c.close()
-
-    for user in users:
-
-        uid = user["id"]
-
-        if not user["notify"]:
-            continue
-
-        if not audience_allowed(
-            signal,
-            uid
-        ):
-            continue
-
-        with DB_LOCK:
-
-            c = db()
-
-            already = c.execute(
-                """
-                SELECT 1
-                FROM signal_access
-                WHERE user_id=?
-                AND signal_id=?
-                """,
-                (
-                    uid,
-                    signal["id"]
-                )
-            ).fetchone()
-
-            if already:
-
-                c.close()
-
-                continue
-
-            quota_used_value = 0
-
-            if (
-                signal["audience"] == "ALL"
-                and not vip_active(user)
-            ):
-
-                limit = int(
-                    get_setting("free_limit")
-                    or 4
-                )
-
-                if quota_used(uid) >= limit:
-
-                    c.close()
-
-                    continue
-
-                quota_used_value = 1
-
-            c.execute(
-                """
-                INSERT INTO signal_access(
-                    user_id,
-                    signal_id,
-                    delivered_at,
-                    quota_used
-                )
-                VALUES(?,?,?,?)
-                """,
-                (
-                    uid,
-                    signal["id"],
-                    iso(),
-                    quota_used_value
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        send(
-            uid,
-            format_signal(signal),
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
-        # Referral bonus after first actual delivered signal.
-        if (
-            quota_used_value == 1
-            and user["referred_by"]
-            and not user["referral_paid"]
-        ):
-
-            bonus = cents(
-                get_setting("ref_bonus")
-                or "0"
-            )
-
-            if bonus > 0:
-
-                with DB_LOCK:
-
-                    c = db()
-
-                    c.execute(
-                        """
-                        UPDATE users
-                        SET balance_cents=
-                            balance_cents+?
-                        WHERE id=?
-                        """,
-                        (
-                            bonus,
-                            user["referred_by"]
-                        )
-                    )
-
-                    c.execute(
-                        """
-                        INSERT INTO wallet_tx(
-                            user_id,
-                            amount_cents,
-                            kind,
-                            note,
-                            created_at
-                        )
-                        VALUES(?,?,?,?,?)
-                        """,
-                        (
-                            user["referred_by"],
-                            bonus,
-                            "REFERRAL",
-                            "Referral bonus",
-                            iso()
-                        )
-                    )
-
-                    c.execute(
-                        """
-                        UPDATE users
-                        SET referral_paid=1
-                        WHERE id=?
-                        """,
-                        (uid,)
-                    )
-
-                    c.commit()
-                    c.close()
-
-
-# =========================================================
-# ADMIN PANEL
-# =========================================================
-
-def admin_action(message, text):
-
-    uid = message.from_user.id
-
-    # ---------------------------------------------
-    # ADD FUTURE SIGNALS
-    # ---------------------------------------------
-
-    if text == "➕ Add Future Signals":
-
-        require_input(
-            uid,
-            "future_date"
-        )
-
-        send(
-            uid,
-            "📅 <b>Future Signal Date</b>\n\n"
-            "একবার date দিন:\n\n"
-            "<b>DD-MM-YYYY</b>\n\n"
-            "Example:\n"
-            "<b>21-09-2026</b>"
-        )
-
-        return
-
-    # ---------------------------------------------
-    # FUTURE LIST
-    # ---------------------------------------------
-
-    if text == "📋 Future Signal List":
-
-        with DB_LOCK:
-
-            c = db()
-
-            rows = c.execute(
-                """
-                SELECT *
-                FROM signals
-                WHERE sent=0
-                ORDER BY signal_date, signal_time
-                LIMIT 50
-                """
-            ).fetchall()
-
-            c.close()
-
-        if not rows:
-
-            send(
-                uid,
-                "📋 <b>Future Signal List</b>\n\n"
-                "No upcoming signals.",
-                make_keyboard(
-                    ADMIN_PANEL,
-                    2
-                )
-            )
-
-            return
-
-        body = "📋 <b>Upcoming Signals</b>\n\n"
-
-        for r in rows:
-
-            body += (
-                f"#{r['id']} | "
-                f"{r['signal_date']} | "
-                f"{r['signal_time']} | "
-                f"{r['pair']} | "
-                f"{r['direction']} | "
-                f"{r['confidence']}%\n"
-            )
-
-        send(
-            uid,
-            body,
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # ---------------------------------------------
-    # LIVE SESSION
-    # ---------------------------------------------
-
-    if text == "⚡ Live Session":
-
-        start_live_session(uid)
-
-        return
-
-    # ---------------------------------------------
-    # BROADCAST
-    # ---------------------------------------------
-
-    if text == "📢 Broadcast":
-
-        require_input(
-            uid,
-            "broadcast"
-        )
-
-        send(
-            uid,
-            "📢 আপনার broadcast message পাঠান."
-        )
-
-        return
-
-    # ---------------------------------------------
-    # VIP
-    # ---------------------------------------------
-
-    if text == "⭐ VIP Management":
-
-        send(
-            uid,
-            "⭐ <b>VIP Management</b>\n\n"
-            "Choose:",
-            make_keyboard(
-                [
-                    "➕ Add/Renew VIP",
-                    "📋 VIP List",
-                    "🔙 Back",
-                    "🏠 Main Menu"
-                ],
-                2
-            )
-        )
-
-        return
-
-    if text == "➕ Add/Renew VIP":
-
-        require_input(
-            uid,
-            "vip_user"
-        )
-
-        send(
-            uid,
-            "⭐ যে user-কে VIP দিতে চান তার Telegram ID দিন."
-        )
-
-        return
-
-    if text == "📋 VIP List":
-
-        with DB_LOCK:
-
-            c = db()
-
-            rows = c.execute(
-                """
-                SELECT id,uid,vip_until
-                FROM users
-                WHERE vip_until IS NOT NULL
-                ORDER BY vip_until DESC
-                LIMIT 50
-                """
-            ).fetchall()
-
-            c.close()
-
-        if not rows:
-
-            body = "⭐ VIP List\n\nEmpty."
-
-        else:
-
-            body = "⭐ <b>VIP List</b>\n\n"
-
-            for r in rows:
-
-                body += (
-                    f"👤 {r['id']} | "
-                    f"{r['vip_until'][:10]} | "
-                    f"UID: {r['uid'] or '-'}\n"
-                )
-
-        send(
-            uid,
-            body,
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # ---------------------------------------------
-    # UID REQUEST
-    # ---------------------------------------------
-
-    if text == "🆔 UID Requests":
-
-        uid_requests_admin(uid)
-
-        return
-
-    # ---------------------------------------------
-    # WITHDRAW REQUEST
-    # ---------------------------------------------
-
-    if text == "💸 Withdraw Requests":
-
-        withdraw_requests_admin(uid)
-
-        return
-
-    # ---------------------------------------------
-    # SUB ADMIN
-    # ---------------------------------------------
-
-    if text == "👥 Sub-admins":
-
-        require_input(
-            uid,
-            "subadmin_id"
-        )
-
-        send(
-            uid,
-            "👥 Sub-admin-এর Telegram numeric ID দিন."
-        )
-
-        return
-
-    # ---------------------------------------------
-    # BOT SETTINGS
-    # ---------------------------------------------
-
-    if text == "⚙️ Bot Settings":
-
-        settings_menu(uid)
-
-        return
-
-    # ---------------------------------------------
-    # TEXT EDITOR
-    # ---------------------------------------------
-
-    if text == "📝 Bot Text Editor":
-
-        text_editor(uid)
-
-        return
-
-    # ---------------------------------------------
-    # VOTE RESULTS
-    # ---------------------------------------------
-
-    if text == "📊 Vote Results":
-
-        vote_results_admin(uid)
-
-        return
-
-    # ---------------------------------------------
-    # NOTICE
-    # ---------------------------------------------
-
-    if text == "📣 Notice":
-
-        require_input(
-            uid,
-            "notice"
-        )
-
-        send(
-            uid,
-            "📣 নতুন notice text পাঠান."
-        )
-
-        return
-
-    # ---------------------------------------------
-    # MAINTENANCE
-    # ---------------------------------------------
-
-    if text == "🟢 Maintenance ON":
-
-        set_setting(
-            "maintenance",
-            "1"
-        )
-
-        send(
-            uid,
-            "🟢 Maintenance Mode ON.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    if text == "🔴 Maintenance OFF":
-
-        set_setting(
-            "maintenance",
-            "0"
-        )
-
-        send(
-            uid,
-            "🔴 Maintenance Mode OFF.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # ---------------------------------------------
-    # SETTINGS SUBMENU
-    # ---------------------------------------------
-
-    if text == "🔢 Free Limit":
-
-        require_input(
-            uid,
-            "set_free_limit"
-        )
-
-        send(
-            uid,
-            "🔢 2-day cycle-এ non-VIP user কতটি free signal পাবে?\n\n"
-            "Example: 4"
-        )
-
-        return
-
-    if text == "💸 Withdraw ON/OFF":
-
-        current = get_setting(
-            "withdraw_enabled"
-        )
-
-        set_setting(
-            "withdraw_enabled",
-            "0" if current == "1" else "1"
-        )
-
-        settings_menu(uid)
-
-        return
-
-    if text == "💵 Minimum Withdraw":
-
-        require_input(
-            uid,
-            "set_withdraw_min"
-        )
-
-        send(
-            uid,
-            "💵 Minimum withdrawal USD amount দিন."
-        )
-
-        return
-
-    if text == "👥 Referral Bonus":
-
-        require_input(
-            uid,
-            "set_ref_bonus"
-        )
-
-        send(
-            uid,
-            "👥 Referral bonus USD amount দিন."
-        )
-
-        return
-
-
-# =========================================================
-# ADMIN SETTINGS
-# =========================================================
-
-def settings_menu(uid):
-
-    send(
-        uid,
-        "⚙️ <b>Bot Settings</b>\n\n"
-        f"📊 Free Limit: {get_setting('free_limit')}\n"
-        f"💸 Withdraw: {get_setting('withdraw_enabled')}\n"
-        f"💵 Minimum Withdraw: ${get_setting('withdraw_min')}\n"
-        f"👥 Referral Bonus: ${get_setting('ref_bonus')}",
-        make_keyboard(
-            [
-                "🔢 Free Limit",
-                "💸 Withdraw ON/OFF",
-                "💵 Minimum Withdraw",
-                "👥 Referral Bonus",
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
-    )
-
-
-# =========================================================
-# BOT TEXT EDITOR
-# =========================================================
-
-def text_editor(uid):
-
-    keys = [
-        "welcome",
-        "maintenance",
-        "signal_template",
-        "notice",
-        "trading_rules",
-        "help",
-        "mm_intro",
-        "wallet",
-        "vip",
-        "referral",
-        "notifications",
-        "live_vip_only",
-        "invalid",
-        "saved",
-        "admin_only"
-    ]
-
-    labels = [
-        f"📝 {x}"
-        for x in keys
-    ]
-
-    STATE[uid] = {
-        "action": "text_choose",
-        "keys": keys
+    result_map = {
+        txt("result_win"): "WIN",
+        txt("result_loss"): "LOSS",
+        txt("result_skip"): "SKIP"
     }
 
-    send(
-        uid,
-        "📝 <b>Bot Text Editor</b>\n\n"
-        "যে text পরিবর্তন করতে চান সেই button চাপুন.",
-        make_keyboard(
-            labels + [
-                "🔙 Back",
-                "🏠 Main Menu"
-            ],
-            2
-        )
+    result = result_map[message.text]
+
+    old = one(
+        "SELECT result FROM signal_results WHERE signal_id=?",
+        (signal_id,)
     )
 
-
-# =========================================================
-# UID ADMIN
-# =========================================================
-
-def uid_requests_admin(uid):
-
-    with DB_LOCK:
-
-        c = db()
-
-        rows = c.execute(
-            """
-            SELECT *
-            FROM uid_requests
-            WHERE status='PENDING'
-            ORDER BY id
-            """
-        ).fetchall()
-
-        c.close()
-
-    if not rows:
-
+    if old:
         send(
             uid,
-            "🆔 No pending UID requests.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
+            "⚠️ Result already submitted.",
+            main_keyboard(uid)
         )
-
         return
 
-    row = rows[0]
-
-    STATE[uid] = {
-        "action": "uid_decision",
-        "req": row["id"]
-    }
-
-    send(
-        uid,
-        f"🆔 <b>UID Request #{row['id']}</b>\n\n"
-        f"👤 User: {row['user_id']}\n"
-        f"🆔 UID: {row['uid']}\n\n"
-        "Choose:",
-        make_keyboard(
-            [
-                "✅ Approve UID",
-                "❌ Reject UID",
-                "🔙 Back"
-            ],
-            2
-        )
+    q("""
+    INSERT INTO signal_results(
+        signal_id,result,updated_at
     )
+    VALUES(?,?,?)
+    """, (
+        signal_id,
+        result,
+        now_str()
+    ))
 
-
-# =========================================================
-# WITHDRAW ADMIN
-# =========================================================
-
-def withdraw_requests_admin(uid):
-
-    with DB_LOCK:
-
-        c = db()
-
-        rows = c.execute(
-            """
-            SELECT *
-            FROM withdrawals
-            WHERE status='PENDING'
-            ORDER BY id
-            """
-        ).fetchall()
-
-        c.close()
-
-    if not rows:
-
-        send(
+    if result == "WIN":
+        next_amount, mode = record_result(
             uid,
-            "💸 No pending withdrawal requests.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
+            "WIN"
         )
 
-        return
-
-    row = rows[0]
-
-    STATE[uid] = {
-        "action": "withdraw_decision",
-        "req": row["id"]
-    }
-
-    send(
-        uid,
-        f"💸 <b>Withdrawal #{row['id']}</b>\n\n"
-        f"👤 User: {row['user_id']}\n"
-        f"💵 Amount: ${money(row['amount_cents'])}\n\n"
-        "Choose:",
-        make_keyboard(
-            [
-                "✅ Approve Withdraw",
-                "❌ Reject Withdraw",
-                "🔙 Back"
-            ],
-            2
+        text = txt("win_text").format(
+            next_trade=f"{next_amount:.2f}"
         )
-    )
 
+    elif result == "LOSS":
 
-# =========================================================
-# VOTE ADMIN
-# =========================================================
-
-def vote_results_admin(uid):
-
-    with DB_LOCK:
-
-        c = db()
-
-        rows = c.execute(
-            """
-            SELECT *
-            FROM signals
-            ORDER BY id DESC
-            LIMIT 15
-            """
-        ).fetchall()
-
-        c.close()
-
-    if not rows:
-
-        send(
+        next_amount, mode = record_result(
             uid,
-            "📊 No signals yet.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
+            "LOSS"
         )
 
-        return
+        text = txt("loss_text").format(
+            next_trade=f"{next_amount:.2f}"
+        )
 
-    text = "📊 <b>Vote Results</b>\n\n"
+    else:
 
-    for row in rows:
+        m = ensure_mm(uid)
 
-        with DB_LOCK:
-
-            c = db()
-
-            votes = c.execute(
-                """
-                SELECT vote, COUNT(*) AS n
-                FROM signal_votes
-                WHERE signal_id=?
-                GROUP BY vote
-                """,
-                (row["id"],)
-            ).fetchall()
-
-            c.close()
-
-        parts = []
-
-        for v in votes:
-
-            parts.append(
-                f"{v['vote']}={v['n']}"
-            )
-
-        text += (
-            f"#{row['id']} "
-            f"{row['pair']} "
-            f"{row['direction']} : "
-            + (
-                ", ".join(parts)
-                if parts
-                else
-                "No votes"
-            )
-            + "\n"
+        text = txt("skip_text").format(
+            next_trade=f"{next_trade_amount(uid):.2f}"
         )
 
     send(
         uid,
         text,
-        make_keyboard(
-            ADMIN_PANEL,
-            2
-        )
+        main_keyboard(uid)
+    )
+
+    DATA.pop(uid, None)
+
+
+# ============================================================
+# LIVE USER
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_live")
+)
+def live_user(message):
+
+    send(
+        message.chat.id,
+        "⚡ <b>Live Signal</b>\n\n"
+        "Live signals will appear here when a session is active.",
+        main_keyboard(message.from_user.id)
     )
 
 
-# =========================================================
-# LIVE SESSION
-# =========================================================
+# ============================================================
+# ADMIN PANEL
+# ============================================================
 
-def start_live_session(uid):
+@bot.message_handler(
+    func=lambda m: m.text == txt("b_admin")
+)
+def admin_panel(message):
 
-    with DB_LOCK:
+    uid = message.from_user.id
 
-        c = db()
-
-        c.execute(
-            """
-            UPDATE live_sessions
-            SET
-                status='ENDED',
-                ended_at=?
-            WHERE status='ACTIVE'
-            """,
-            (iso(),)
-        )
-
-        c.execute(
-            """
-            INSERT INTO live_sessions(
-                started_at,
-                status
-            )
-            VALUES(?,'ACTIVE')
-            """,
-            (iso(),)
-        )
-
-        c.commit()
-        c.close()
-
-    STATE[uid] = {
-        "action": "live_menu"
-    }
+    if not is_admin(uid):
+        return
 
     send(
         uid,
-        "⚡ <b>LIVE SESSION STARTED</b>\n\n"
-        "VIP users with Live ON will receive live messages.\n\n"
-        "You can:\n"
-        "📌 set Pair\n"
-        "⏰ set Time\n"
-        "⬆️ / ⬇️ Direction\n"
-        "🎯 Confidence\n"
-        "📤 Send Live Signal\n"
-        "✏️ Send Live Text",
-        make_keyboard(
-            [
-                "📌 Pair",
-                "⏰ Time",
-                "⬆️ UP",
-                "⬇️ DOWN",
-                "🎯 Confidence",
-                "📤 Send Live Signal",
-                "✏️ Send Live Text",
-                "⛔ End Live Mode",
-                "🏠 Main Menu"
-            ],
-            2
-        )
+        "⚙️ <b>ADMIN PANEL</b>\n\n"
+        "Select an option:",
+        admin_keyboard(uid)
     )
 
 
-def live_broadcast(uid, text):
+# ============================================================
+# ADMIN FUTURE SIGNAL
+# ============================================================
 
-    with DB_LOCK:
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_future")
+)
+def admin_future(message):
 
-        c = db()
+    if not can(message.from_user.id, "signals"):
+        return
 
-        users = c.execute(
-            "SELECT * FROM users"
-        ).fetchall()
-
-        session = c.execute(
-            """
-            SELECT id
-            FROM live_sessions
-            WHERE status='ACTIVE'
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-        c.close()
-
-    for user in users:
-
-        if (
-            vip_active(user)
-            and user["live_notify"]
-        ):
-
-            send(
-                user["id"],
-                text
-            )
-
-    if session:
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                INSERT INTO live_signals(
-                    session_id,
-                    message,
-                    created_at
-                )
-                VALUES(?,?,?)
-                """,
-                (
-                    session["id"],
-                    text,
-                    iso()
-                )
-            )
-
-            c.commit()
-            c.close()
+    send(
+        message.chat.id,
+        "📡 <b>Future Signals</b>\n\n"
+        "You can import ALL signals at once.\n\n"
+        "Example:\n\n"
+        "13:04 - USD/BDT-OTC - UP\n"
+        "13:14 - USD/PHP-OTC - DOWN\n"
+        "13:21 - USD/COP-OTC - UP\n\n"
+        "Blank lines and headers are ignored.",
+        future_admin_keyboard()
+    )
 
 
-# =========================================================
-# SCHEDULER
-# =========================================================
+@bot.message_handler(
+    func=lambda m: m.text == txt("future_import")
+)
+def future_import(message):
 
-def scheduler():
+    uid = message.from_user.id
 
-    last_backup = 0
+    if not can(uid, "signals"):
+        return
 
-    while True:
+    STATE[uid] = "IMPORT_SIGNALS"
 
-        try:
-
-            current = now()
-
-            today = current.strftime(
-                "%d-%m-%Y"
-            )
-
-            current_time = current.strftime(
-                "%H:%M"
-            )
-
-            with DB_LOCK:
-
-                c = db()
-
-                rows = c.execute(
-                    """
-                    SELECT *
-                    FROM signals
-                    WHERE sent=0
-                    AND signal_date=?
-                    AND signal_time<=?
-                    ORDER BY signal_time
-                    """,
-                    (
-                        today,
-                        current_time
-                    )
-                ).fetchall()
-
-                for row in rows:
-
-                    deliver_signal(row)
-
-                    c.execute(
-                        """
-                        UPDATE signals
-                        SET
-                            sent=1,
-                            sent_at=?
-                        WHERE id=?
-                        """,
-                        (
-                            iso(),
-                            row["id"]
-                        )
-                    )
-
-                c.commit()
-                c.close()
-
-            if (
-                time.time() -
-                last_backup
-                > 21600
-            ):
-
-                backup_db()
-
-                last_backup = time.time()
-
-        except Exception:
-
-            traceback.print_exc()
-
-        time.sleep(3)
+    send(
+        uid,
+        "📥 <b>Paste ALL today's signals in one message.</b>\n\n"
+        "The bot will automatically detect:\n"
+        "TIME - PAIR - UP/DOWN\n\n"
+        "Example:\n"
+        "13:04 - USD/BDT-OTC - UP\n"
+        "13:14 - USD/PHP-OTC - DOWN",
+        back_keyboard()
+    )
 
 
-# =========================================================
-# DATABASE BACKUP
-# =========================================================
+@bot.message_handler(
+    func=lambda m: m.text == txt("future_list")
+)
+def future_list(message):
 
-def backup_db():
+    rows = q("""
+    SELECT * FROM signals
+    WHERE signal_date=?
+    ORDER BY signal_time,id
+    """, (
+        today(),
+    ), True)
 
-    try:
+    if not rows:
+
+        send(
+            message.chat.id,
+            "📭 No signals for today.",
+            future_admin_keyboard()
+        )
+        return
+
+    text = "📋 <b>Today's Signals</b>\n\n"
+
+    for s in rows:
+
+        text += (
+            f"#{s['id']} "
+            f"{s['signal_time']} | "
+            f"{s['pair']} | "
+            f"{s['direction']} | "
+            f"{'AUTO SENT' if s['auto_sent'] else 'WAITING'}\n"
+        )
+
+    send(
+        message.chat.id,
+        text,
+        future_admin_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("future_clear")
+)
+def future_clear(message):
+
+    uid = message.from_user.id
+
+    if not can(uid, "signals"):
+        return
+
+    q(
+        "DELETE FROM signals WHERE signal_date=?",
+        (today(),)
+    )
+
+    send(
+        uid,
+        "🗑 Today's signals cleared.",
+        future_admin_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("future_auto")
+)
+def future_auto(message):
+
+    uid = message.from_user.id
+
+    current = get_setting(
+        "auto_send",
+        "1"
+    )
+
+    new = "0" if current == "1" else "1"
+
+    set_setting(
+        "auto_send",
+        new
+    )
+
+    status = "ON 🤖" if new == "1" else "OFF 🔕"
+
+    send(
+        uid,
+        f"🤖 Future Signal Auto Send: <b>{status}</b>\n\n"
+        f"Current setting sends signals "
+        f"{get_setting('auto_send_minutes','5')} minutes "
+        f"before trading time.",
+        future_admin_keyboard()
+    )
+
+
+# ============================================================
+# ADMIN LIVE SESSION
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_live")
+)
+def admin_live(message):
+
+    if not can(message.from_user.id, "live"):
+        return
+
+    send(
+        message.chat.id,
+        "⚡ <b>LIVE SESSION</b>\n\n"
+        f"Status: {'ACTIVE 🟢' if LIVE['active'] else 'OFF 🔴'}",
+        live_admin_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("live_start")
+)
+def live_start(message):
+
+    if not can(message.from_user.id, "live"):
+        return
+
+    LIVE["active"] = True
+    LIVE["started_at"] = now_str()
+    LIVE["admin_id"] = message.from_user.id
+    LIVE["count"] = 0
+
+    send(
+        message.chat.id,
+        "🟢 <b>Live Session Started</b>\n\n"
+        "Now use <b>Send Live Signal</b> or "
+        "<b>Send Live Text</b>.",
+        live_admin_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("live_send")
+)
+def live_send(message):
+
+    if not LIVE["active"]:
+        send(
+            message.chat.id,
+            "🔴 Live session is not active.",
+            live_admin_keyboard()
+        )
+        return
+
+    STATE[message.from_user.id] = "LIVE_SIGNAL"
+
+    send(
+        message.chat.id,
+        "📤 Send live signal:\n\n"
+        "Example:\n"
+        "13:59 - USD/BDT-OTC - DOWN",
+        back_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("live_text")
+)
+def live_text(message):
+
+    if not LIVE["active"]:
+        send(
+            message.chat.id,
+            "🔴 Live session is not active.",
+            live_admin_keyboard()
+        )
+        return
+
+    STATE[message.from_user.id] = "LIVE_TEXT"
+
+    send(
+        message.chat.id,
+        "✏️ Send the live message/text now.",
+        back_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("live_stats")
+)
+def live_stats(message):
+
+    count = LIVE["count"]
+
+    row = one("""
+    SELECT COUNT(*) c
+    FROM live_history
+    WHERE date(created_at)=?
+    """, (
+        today(),
+    ))
+
+    send(
+        message.chat.id,
+        f"📊 <b>Live Statistics</b>\n\n"
+        f"Current session: <b>{count}</b>\n"
+        f"Today's total: <b>{row['c']}</b>",
+        live_admin_keyboard()
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("live_end")
+)
+def live_end(message):
+
+    LIVE["active"] = False
+    LIVE["started_at"] = None
+    LIVE["admin_id"] = None
+
+    send(
+        message.chat.id,
+        "🛑 <b>Live Session Ended</b>",
+        admin_keyboard(message.from_user.id)
+    )
+
+
+# ============================================================
+# ADMIN USERS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_users")
+)
+def admin_users(message):
+
+    rows = q("""
+    SELECT COUNT(*) c FROM users
+    """, True)
+
+    vip = q("""
+    SELECT COUNT(*) c FROM users
+    WHERE is_vip=1
+    """, True)
+
+    pending = q("""
+    SELECT COUNT(*) c FROM users
+    WHERE pending_uid IS NOT NULL
+    """, True)
+
+    send(
+        message.chat.id,
+        f"👥 <b>Users</b>\n\n"
+        f"Total: <b>{rows[0]['c']}</b>\n"
+        f"VIP: <b>{vip[0]['c']}</b>\n"
+        f"Pending UID: <b>{pending[0]['c']}</b>",
+        admin_keyboard(message.from_user.id)
+    )
+
+
+# ============================================================
+# ADMIN VIP
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_vip")
+)
+def admin_vip(message):
+
+    send(
+        message.chat.id,
+        "💎 <b>VIP Management</b>\n\n"
+        "Use:\n"
+        "ADD 123456789 30\n"
+        "→ Add VIP for 30 days\n\n"
+        "REMOVE 123456789\n"
+        "→ Remove VIP",
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "VIP_ADMIN"
+
+
+# ============================================================
+# ADMIN WITHDRAWALS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_withdraw")
+)
+def admin_withdrawals(message):
+
+    rows = q("""
+    SELECT * FROM withdrawals
+    WHERE status='pending'
+    ORDER BY id ASC
+    """, fetch=True)
+
+    if not rows:
+
+        send(
+            message.chat.id,
+            "📭 No pending withdrawals.",
+            admin_keyboard(message.from_user.id)
+        )
+        return
+
+    text = "💸 <b>Pending Withdrawals</b>\n\n"
+
+    for r in rows:
+
+        text += (
+            f"#{r['id']} | "
+            f"User: <code>{r['user_id']}</code> | "
+            f"${r['amount']:.2f}\n"
+        )
+
+    text += (
+        "\nUse:\n"
+        "APPROVE ID\n"
+        "REJECT ID"
+    )
+
+    send(
+        message.chat.id,
+        text,
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "WITHDRAW_ADMIN"
+
+
+# ============================================================
+# ADMIN BROADCAST
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_broadcast")
+)
+def admin_broadcast(message):
+
+    send(
+        message.chat.id,
+        "📣 <b>Broadcast</b>\n\n"
+        "Use:\n"
+        "ALL your message\n"
+        "VIP your message\n"
+        "SELECTED your message",
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "BROADCAST"
+
+
+# ============================================================
+# ADMIN NOTICE
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_notice")
+)
+def admin_notice(message):
+
+    send(
+        message.chat.id,
+        "📢 Send the new Notice text.\n\n"
+        "HTML formatting is supported.",
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "NOTICE_ADMIN"
+
+
+# ============================================================
+# ADMIN TEXT EDITOR
+# ============================================================
+
+TEXT_KEYS = {
+    "Welcome": "welcome",
+    "Notice": "notice",
+    "Trading Contract": "trading_contract",
+    "Trading Rules": "trading_rules",
+    "Help": "help",
+    "Invalid": "invalid",
+    "Maintenance": "maintenance_msg",
+    "Signal Template": "signal_template",
+    "Live Template": "live_template",
+    "Money Management": "mm_template",
+    "WIN Text": "win_text",
+    "LOSS Text": "loss_text",
+    "SKIP Text": "skip_text",
+    "VIP Expiry": "vip_expiry",
+    "Main Menu": "main_menu",
+    "Back": "back",
+    "Get Signal Button": "b_future",
+    "Live Signal Button": "b_live",
+    "Money Management Button": "b_mm",
+    "UID Button": "b_uid",
+    "Wallet Button": "b_wallet",
+    "Withdraw Button": "b_withdraw",
+    "Referral Button": "b_referral",
+    "History Button": "b_history",
+    "Vote Button": "b_vote",
+    "Result Button": "b_result",
+    "Notice Button": "b_notice",
+    "Rules Button": "b_rules",
+    "Contract Button": "b_contract",
+    "Help Button": "b_help",
+    "Notification Button": "b_notify",
+    "VIP Button": "b_vip",
+    "Admin Button": "b_admin",
+}
+
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_text")
+)
+def text_editor(message):
+
+    rows = []
+
+    names = list(TEXT_KEYS.keys())
+
+    for i in range(0, len(names), 2):
+        rows.append(
+            names[i:i+2]
+        )
+
+    rows.append(
+        [txt("back"), txt("main_menu")]
+    )
+
+    send(
+        message.chat.id,
+        "📝 <b>Bot Text Editor</b>\n\n"
+        "Select any text you want to edit.",
+        kb(rows)
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text in TEXT_KEYS
+)
+def choose_text(message):
+
+    key = TEXT_KEYS[message.text]
+
+    DATA[message.from_user.id] = {
+        "edit_key": key
+    }
+
+    STATE[message.from_user.id] = "TEXT_EDIT"
+
+    send(
+        message.chat.id,
+        "✏️ <b>Send the new text.</b>\n\n"
+        "Supported placeholders:\n"
+        "{user_name}\n"
+        "{date}\n"
+        "{time}\n"
+        "{pair}\n"
+        "{direction}\n"
+        "{confidence}\n"
+        "{balance}\n"
+        "{remaining_signals}\n"
+        "{next_trade}",
+        back_keyboard()
+    )
+
+
+# ============================================================
+# ADMIN SETTINGS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_settings")
+)
+def admin_settings(message):
+
+    send(
+        message.chat.id,
+        f"⚙️ <b>Settings</b>\n\n"
+        f"Free limit: {get_setting('free_limit')}\n"
+        f"Min withdraw: ${get_setting('min_withdraw')}\n"
+        f"Withdraw: {get_setting('withdraw_enabled')}\n"
+        f"Withdraw hold: {get_setting('withdraw_hold')}\n"
+        f"Referral bonus: ${get_setting('referral_bonus')}\n"
+        f"Auto Send: {get_setting('auto_send')}\n"
+        f"Auto minutes: {get_setting('auto_send_minutes')}\n"
+        f"Audience: {get_setting('future_audience')}\n"
+        f"Vote public: {get_setting('vote_public')}\n\n"
+        f"Use:\n"
+        f"FREE 4\n"
+        f"MINWD 5\n"
+        f"REF 1\n"
+        f"AUTO 1\n"
+        f"MINUTES 5\n"
+        f"AUDIENCE ALL\n"
+        f"MAINTENANCE 0\n"
+        f"VOTE_PUBLIC 0",
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "SETTINGS_ADMIN"
+
+
+# ============================================================
+# ADMIN SUB ADMIN
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_subadmin")
+)
+def subadmin_menu(message):
+
+    rows = q("""
+    SELECT * FROM admins
+    WHERE user_id!=?
+    ORDER BY user_id
+    """, (
+        ADMIN_ID,
+    ), True)
+
+    text = (
+        "👮 <b>Admin Management</b>\n\n"
+        "Add:\n"
+        "ADDADMIN 123456789 signals,vip,withdraw\n\n"
+        "Remove:\n"
+        "DELADMIN 123456789\n\n"
+        "Current:\n"
+    )
+
+    for r in rows:
+        text += (
+            f"{r['user_id']} — "
+            f"{r['permissions']}\n"
+        )
+
+    send(
+        message.chat.id,
+        text,
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "SUBADMIN"
+
+
+# ============================================================
+# NOTIFICATION TARGETS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_targets")
+)
+def targets_menu(message):
+
+    rows = q("""
+    SELECT * FROM notification_targets
+    ORDER BY id
+    """, fetch=True)
+
+    text = (
+        "📢 <b>Notification Targets</b>\n\n"
+        "Add target:\n"
+        "ADD -1001234567890 Group Name\n\n"
+        "Delete:\n"
+        "DEL -1001234567890\n\n"
+    )
+
+    for r in rows:
+        text += (
+            f"• {r['chat_id']} — "
+            f"{escape(r['title'])}\n"
+        )
+
+    send(
+        message.chat.id,
+        text,
+        back_keyboard()
+    )
+
+    STATE[message.from_user.id] = "TARGETS"
+
+
+# ============================================================
+# ADMIN STATS
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_stats")
+)
+def admin_stats(message):
+
+    users = one(
+        "SELECT COUNT(*) c FROM users"
+    )["c"]
+
+    vip = one(
+        "SELECT COUNT(*) c FROM users WHERE is_vip=1"
+    )["c"]
+
+    signals = one(
+        "SELECT COUNT(*) c FROM signals WHERE signal_date=?",
+        (today(),)
+    )["c"]
+
+    deliveries = one("""
+    SELECT COUNT(*) c
+    FROM deliveries d
+    JOIN signals s ON s.id=d.signal_id
+    WHERE s.signal_date=?
+    """, (
+        today(),
+    ))["c"]
+
+    votes = one(
+        "SELECT COUNT(*) c FROM votes"
+    )["c"]
+
+    pending = one("""
+    SELECT COUNT(*) c
+    FROM withdrawals
+    WHERE status='pending'
+    """)["c"]
+
+    send(
+        message.chat.id,
+        f"📊 <b>Bot Statistics</b>\n\n"
+        f"Users: {users}\n"
+        f"VIP: {vip}\n"
+        f"Today's Signals: {signals}\n"
+        f"Today's Deliveries: {deliveries}\n"
+        f"Votes: {votes}\n"
+        f"Pending Withdrawals: {pending}",
+        admin_keyboard(message.from_user.id)
+    )
+
+
+# ============================================================
+# ADMIN BACKUP
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_backup")
+)
+def admin_backup(message):
+
+    if os.path.exists(DB_FILE):
 
         os.makedirs(
             BACKUP_DIR,
             exist_ok=True
         )
 
-        filename = (
-            "bot_"
-            + now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-            + ".db"
-        )
-
-        destination = os.path.join(
+        filename = os.path.join(
             BACKUP_DIR,
-            filename
+            "manual_" +
+            now().strftime("%Y%m%d_%H%M%S") +
+            ".db"
         )
 
         shutil.copy2(
-            DB_PATH,
-            destination
+            DB_FILE,
+            filename
         )
 
-        files = sorted(
-            [
-                os.path.join(
-                    BACKUP_DIR,
-                    x
-                )
-                for x in os.listdir(
-                    BACKUP_DIR
-                )
-            ],
-            key=os.path.getmtime,
-            reverse=True
+        send(
+            message.chat.id,
+            "💾 Database backup created.",
+            admin_keyboard(message.from_user.id)
         )
 
-        for old in files[10:]:
 
-            try:
-                os.remove(old)
-            except Exception:
-                pass
+# ============================================================
+# ADMIN VOTE STATS
+# ============================================================
 
-    except Exception:
+@bot.message_handler(
+    func=lambda m: m.text == txt("a_vote")
+)
+def admin_vote_stats(message):
 
-        traceback.print_exc()
+    rows = q("""
+    SELECT s.id,s.signal_date,s.signal_time,s.pair,
+           s.direction,
+           SUM(CASE WHEN v.vote='UP' THEN 1 ELSE 0 END) up_count,
+           SUM(CASE WHEN v.vote='DOWN' THEN 1 ELSE 0 END) down_count,
+           SUM(CASE WHEN v.vote='SKIP' THEN 1 ELSE 0 END) skip_count
+    FROM signals s
+    LEFT JOIN votes v ON v.signal_id=s.id
+    GROUP BY s.id
+    ORDER BY s.id DESC
+    LIMIT 20
+    """, fetch=True)
+
+    if not rows:
+
+        send(
+            message.chat.id,
+            "No vote data.",
+            admin_keyboard(message.from_user.id)
+        )
+        return
+
+    text = "🗳 <b>Vote Statistics</b>\n\n"
+
+    for r in rows:
+        text += (
+            f"#{r['id']} {r['pair']} "
+            f"{r['signal_time']}\n"
+            f"⬆️ {r['up_count']} | "
+            f"⬇️ {r['down_count']} | "
+            f"⏭ {r['skip_count']}\n\n"
+        )
+
+    send(
+        message.chat.id,
+        text,
+        admin_keyboard(message.from_user.id)
+    )
 
 
-# =========================================================
+# ============================================================
+# ADMIN LIVE BROADCAST
+# ============================================================
+
+def broadcast_live(text):
+
+    users = q("""
+    SELECT user_id
+    FROM users
+    WHERE live_signal=1
+      AND notifications=1
+    """, fetch=True)
+
+    sent = 0
+
+    for u in users:
+
+        if safe_send(
+            u["user_id"],
+            text
+        ):
+            sent += 1
+
+    targets = q("""
+    SELECT chat_id
+    FROM notification_targets
+    WHERE enabled=1
+    """, fetch=True)
+
+    for t in targets:
+        safe_send(
+            t["chat_id"],
+            text
+        )
+
+    return sent
+
+
+# ============================================================
 # STATE HANDLER
-# =========================================================
+# ============================================================
 
-def handle_state(message, action, text):
+@bot.message_handler(
+    func=lambda m: STATE.get(m.from_user.id) is not None
+)
+def state_handler(message):
 
     uid = message.from_user.id
+    state = STATE.get(uid)
 
-    # -----------------------------------------------------
-    # MONEY MANAGEMENT QUICK SETUP
-    # -----------------------------------------------------
+    if message.text in [
+        txt("back"),
+        txt("main_menu")
+    ]:
+        STATE.pop(uid, None)
+        TEMP.pop(uid, None)
+        DATA.pop(uid, None)
 
-    if action == "mm_quick_balance":
-
-        try:
-
-            STATE[uid]["quick"]["balance"] = cents(text)
-
-            STATE[uid]["action"] = (
-                "mm_quick_target"
-            )
-
+        if message.text == txt("main_menu"):
+            main_menu(message)
+        else:
             send(
                 uid,
-                "⚡ <b>Quick Setup — Step 2/4</b>\n\n"
-                "Daily Profit Target কত USD?\n\n"
-                "Example: <b>10</b>"
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid USD amount দিন.\nExample: 100"
+                "🔙 Back",
+                main_keyboard(uid)
             )
 
         return
 
-    if action == "mm_quick_target":
-
-        try:
-
-            STATE[uid]["quick"]["target"] = cents(text)
-
-            STATE[uid]["action"] = (
-                "mm_quick_loss"
-            )
-
-            send(
-                uid,
-                "⚡ <b>Quick Setup — Step 3/4</b>\n\n"
-                "Daily Loss Limit কত USD?\n\n"
-                "Example: <b>5</b>"
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid USD amount দিন."
-            )
-
-        return
-
-    if action == "mm_quick_loss":
-
-        try:
-
-            STATE[uid]["quick"]["loss"] = cents(text)
-
-            STATE[uid]["action"] = (
-                "mm_quick_base"
-            )
-
-            send(
-                uid,
-                "⚡ <b>Quick Setup — Step 4/4</b>\n\n"
-                "Normal/Base Trade কত USD?\n\n"
-                "Example: <b>2</b>"
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid USD amount দিন."
-            )
-
-        return
-
-    if action == "mm_quick_base":
-
-        try:
-
-            q = STATE[uid]["quick"]
-
-            q["base"] = cents(text)
-
-            with DB_LOCK:
-
-                c = db()
-
-                c.execute(
-                    """
-                    UPDATE mm_profiles
-                    SET
-                        balance_cents=?,
-                        profit_target_cents=?,
-                        loss_limit_cents=?,
-                        base_trade_cents=?,
-                        balance_confirmed=1
-                    WHERE user_id=?
-                    """,
-                    (
-                        q["balance"],
-                        q["target"],
-                        q["loss"],
-                        q["base"],
-                        uid
-                    )
-                )
-
-                c.commit()
-                c.close()
-
-            clear_state(uid)
-
-            send(
-                uid,
-                "✅ <b>Money Management Setup Complete</b>\n\n"
-                + mm_status(uid),
-                back_keyboard(MM_MENU)
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid USD amount দিন."
-            )
-
-        return
-
-    # -----------------------------------------------------
-    # NORMAL MM INPUTS
-    # -----------------------------------------------------
-
-    if action.startswith("mm_"):
-
-        try:
-
-            if action == "mm_max":
-
-                value = int(text)
-
-                if value < 1:
-                    raise ValueError
-
-                column = "max_trades"
-
-            else:
-
-                value = cents(text)
-
-                if value < 0:
-                    raise ValueError
-
-                column = {
-                    "mm_balance":
-                        "balance_cents",
-
-                    "mm_target":
-                        "profit_target_cents",
-
-                    "mm_loss":
-                        "loss_limit_cents",
-
-                    "mm_base":
-                        "base_trade_cents",
-
-                    "mm_m1":
-                        "m1_trade_cents",
-
-                    "mm_m2":
-                        "m2_trade_cents"
-                }[action]
-
-            with DB_LOCK:
-
-                c = db()
-
-                c.execute(
-                    f"""
-                    UPDATE mm_profiles
-                    SET {column}=?
-                    WHERE user_id=?
-                    """,
-                    (
-                        value,
-                        uid
-                    )
-                )
-
-                if action == "mm_balance":
-
-                    c.execute(
-                        """
-                        UPDATE mm_profiles
-                        SET balance_confirmed=1
-                        WHERE user_id=?
-                        """,
-                        (uid,)
-                    )
-
-                c.commit()
-                c.close()
-
-            clear_state(uid)
-
-            send(
-                uid,
-                "✅ Saved.\n\n"
-                + mm_status(uid),
-                back_keyboard(MM_MENU)
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid number দিন.\n\n"
-                "Example: 100 অথবা 2.50"
-            )
-
-        return
-
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # UID
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
-    if action == "uid":
+    if state == "UID":
 
-        uid_value = text.strip()
+        value = message.text.strip()
 
-        if (
-            len(uid_value) < 3
-            or len(uid_value) > 40
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{3,30}",
+            value
         ):
+            send(
+                uid,
+                txt("invalid"),
+                back_keyboard()
+            )
+            return
+
+        duplicate = one(
+            "SELECT user_id FROM users WHERE uid=? OR pending_uid=?",
+            (value, value)
+        )
+
+        if duplicate:
 
             send(
                 uid,
-                "❌ Invalid UID."
+                "❌ This Quotex UID is already used "
+                "or pending approval.",
+                main_keyboard(uid)
             )
 
+            STATE.pop(uid, None)
             return
 
-        with DB_LOCK:
-
-            c = db()
-
-            duplicate = c.execute(
-                """
-                SELECT id
-                FROM users
-                WHERE uid=?
-                AND id!=?
-                """,
-                (
-                    uid_value,
-                    uid
-                )
-            ).fetchone()
-
-            pending = c.execute(
-                """
-                SELECT id
-                FROM uid_requests
-                WHERE uid=?
-                AND status='PENDING'
-                AND user_id!=?
-                """,
-                (
-                    uid_value,
-                    uid
-                )
-            ).fetchone()
-
-            if duplicate or pending:
-
-                c.close()
-
-                send(
-                    uid,
-                    "❌ এই Quotex UID অন্য account-এর সাথে already linked/pending."
-                )
-
-                return
-
-            c.execute(
-                """
-                INSERT INTO uid_requests(
-                    user_id,
-                    uid,
-                    created_at
-                )
-                VALUES(?,?,?)
-                """,
-                (
-                    uid,
-                    uid_value,
-                    iso()
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            "✅ UID submitted for admin approval.",
-            user_keyboard(
-                is_admin(uid)
-            )
+        q(
+            "UPDATE users SET pending_uid=? WHERE user_id=?",
+            (value, uid)
         )
 
         send(
+            uid,
+            "✅ UID submitted.\n\n"
+            "Admin approval is required.",
+            main_keyboard(uid)
+        )
+
+        safe_send(
             ADMIN_ID,
-            "🆔 <b>New UID Request</b>\n\n"
-            f"👤 User: {uid}\n"
-            f"🆔 UID: {uid_value}\n\n"
-            "Go to Admin Panel → UID Requests."
+            f"🆔 <b>New UID Request</b>\n\n"
+            f"User: <code>{uid}</code>\n"
+            f"UID: <code>{escape(value)}</code>\n\n"
+            f"Use:\n"
+            f"APPROVEUID {uid}\n"
+            f"REJECTUID {uid}"
         )
 
+        STATE.pop(uid, None)
         return
 
-    # -----------------------------------------------------
-    # WITHDRAW
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # MONEY MANAGEMENT
+    # --------------------------------------------------------
 
-    if action == "withdraw":
+    if state.startswith("MM_"):
+
+        field = state[3:]
 
         try:
-
-            amount = cents(text)
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Valid USD amount দিন."
-            )
-
-            return
-
-        minimum = cents(
-            get_setting(
-                "withdraw_min"
-            )
-        )
-
-        user = get_user(uid)
-
-        if amount < minimum:
-
-            send(
-                uid,
-                f"❌ Minimum withdrawal "
-                f"is ${money(minimum)}."
-            )
-
-            return
-
-        if amount > user["balance_cents"]:
-
-            send(
-                uid,
-                "❌ Insufficient wallet balance."
-            )
-
-            return
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                UPDATE users
-                SET balance_cents=
-                    balance_cents-?
-                WHERE id=?
-                """,
-                (
-                    amount,
-                    uid
-                )
-            )
-
-            c.execute(
-                """
-                INSERT INTO withdrawals(
-                    user_id,
-                    amount_cents,
-                    created_at
-                )
-                VALUES(?,?,?)
-                """,
-                (
-                    uid,
-                    amount,
-                    iso()
-                )
-            )
-
-            c.execute(
-                """
-                INSERT INTO wallet_tx(
-                    user_id,
-                    amount_cents,
-                    kind,
-                    note,
-                    created_at
-                )
-                VALUES(?,?,?,?,?)
-                """,
-                (
-                    uid,
-                    -amount,
-                    "WITHDRAW_HOLD",
-                    "Withdrawal request",
-                    iso()
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            f"✅ Withdrawal request created.\n\n"
-            f"💵 Amount: ${money(amount)}",
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
-        send(
-            ADMIN_ID,
-            "💸 <b>New Withdrawal</b>\n\n"
-            f"👤 User: {uid}\n"
-            f"💵 Amount: ${money(amount)}\n\n"
-            "Go to Admin Panel → Withdraw Requests."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # FUTURE SIGNAL DATE
-    # -----------------------------------------------------
-
-    if action == "future_date":
-
-        if not re.match(
-            r"^\d{1,2}[-/]\d{1,2}[-/]\d{4}$",
-            text
-        ):
-
-            send(
-                uid,
-                "❌ Date format must be:\n"
-                "<b>DD-MM-YYYY</b>"
-            )
-
-            return
-
-        parts = re.split(
-            r"[-/]",
-            text
-        )
-
-        normalized_date = (
-            f"{int(parts[0]):02d}-"
-            f"{int(parts[1]):02d}-"
-            f"{int(parts[2]):04d}"
-        )
-
-        try:
-
-            datetime.strptime(
-                normalized_date,
-                "%d-%m-%Y"
-            )
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Invalid date."
-            )
-
-            return
-
-        STATE[uid] = {
-            "action": "future_audience",
-            "date": normalized_date
-        }
-
-        send(
-            uid,
-            "🎯 <b>Who should receive these signals?</b>",
-            make_keyboard(
-                [
-                    "🌐 ALL",
-                    "⭐ VIP",
-                    "🎯 SELECTED",
-                    "🔙 Back"
-                ],
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # FUTURE SIGNAL AUDIENCE
-    # -----------------------------------------------------
-
-    if action == "future_audience":
-
-        audience = {
-            "🌐 ALL": "ALL",
-            "⭐ VIP": "VIP",
-            "🎯 SELECTED": "SELECTED"
-        }.get(text)
-
-        if not audience:
-
-            send(
-                uid,
-                "Choose one of the buttons."
-            )
-
-            return
-
-        date_value = STATE[uid]["date"]
-
-        STATE[uid] = {
-            "action": "future_bulk",
-            "date": date_value,
-            "audience": audience
-        }
-
-        send(
-            uid,
-            "📋 <b>এখন সব Future Signal একসাথে paste করুন.</b>\n\n"
-            "Example:\n\n"
-            "<code>12:30 EURUSD UP 95</code>\n"
-            "<code>12:35 GBPUSD DOWN 97</code>\n"
-            "<code>12:40 USDJPY UP 96</code>\n\n"
-            "প্রতিটি signal নতুন line-এ থাকবে."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # FUTURE BULK
-    # -----------------------------------------------------
-
-    if action == "future_bulk":
-
-        default_date = STATE[uid]["date"]
-        audience = STATE[uid]["audience"]
-
-        rows = parse_signals(
-            text,
-            default_date
-        )
-
-        if not rows:
-
-            send(
-                uid,
-                "❌ কোনো valid signal পাওয়া যায়নি.\n\n"
-                "Correct example:\n"
-                "<code>12:30 EURUSD UP 95</code>\n"
-                "<code>12:35 GBPUSD DOWN 97</code>"
-            )
-
-            return
-
-        with DB_LOCK:
-
-            c = db()
-
-            for row in rows:
-
-                c.execute(
-                    """
-                    INSERT INTO signals(
-                        signal_date,
-                        signal_time,
-                        pair,
-                        direction,
-                        confidence,
-                        audience,
-                        created_at
-                    )
-                    VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (
-                        row[0],
-                        row[1],
-                        row[2],
-                        row[3],
-                        row[4],
-                        audience,
-                        iso()
-                    )
-                )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            f"✅ <b>{len(rows)} Future Signals added.</b>\n\n"
-            "📅 Date: "
-            f"{default_date}\n"
-            "🎯 Audience: "
-            f"{audience}\n\n"
-            "⏰ প্রতিটি signal তার নিজের Bangladesh time অনুযায়ী automatically send হবে.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # TEXT EDITOR
-    # -----------------------------------------------------
-
-    if action == "text_choose":
-
-        keys = STATE[uid].get(
-            "keys",
-            []
-        )
-
-        key = (
-            text[2:]
-            if text.startswith("📝 ")
-            else ""
-        )
-
-        if key not in keys:
-
-            send(
-                uid,
-                "Choose a text button."
-            )
-
-            return
-
-        STATE[uid] = {
-            "action": "edit_text",
-            "key": key
-        }
-
-        send(
-            uid,
-            f"📝 <b>Editing:</b> {key}\n\n"
-            "Current text:\n\n"
-            f"{get_setting(key)}\n\n"
-            "এখন নতুন text পাঠান."
-        )
-
-        return
-
-    if action == "edit_text":
-
-        key = STATE[uid]["key"]
-
-        set_setting(
-            key,
-            text
-        )
-
-        clear_state(uid)
-
-        send(
-            uid,
-            f"✅ <b>{key}</b> updated.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # NOTICE
-    # -----------------------------------------------------
-
-    if action == "notice":
-
-        set_setting(
-            "notice",
-            text
-        )
-
-        clear_state(uid)
-
-        send(
-            uid,
-            "✅ Notice updated.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # BROADCAST
-    # -----------------------------------------------------
-
-    if action == "broadcast":
-
-        STATE[uid] = {
-            "action": "broadcast_target",
-            "body": text
-        }
-
-        send(
-            uid,
-            "📢 Broadcast audience choose করুন:",
-            make_keyboard(
-                [
-                    "🌐 ALL",
-                    "⭐ VIP",
-                    "🔙 Back"
-                ],
-                2
-            )
-        )
-
-        return
-
-    if action == "broadcast_target":
-
-        body = STATE[uid].get(
-            "body",
-            ""
-        )
-
-        if text not in (
-            "🌐 ALL",
-            "⭐ VIP"
-        ):
-
-            send(
-                uid,
-                "Choose an audience button."
-            )
-
-            return
-
-        target_vip = (
-            text == "⭐ VIP"
-        )
-
-        with DB_LOCK:
-
-            c = db()
-
-            users = c.execute(
-                "SELECT * FROM users"
-            ).fetchall()
-
-            c.close()
-
-        count = 0
-
-        for user in users:
-
-            if (
-                target_vip
-                and not vip_active(user)
-            ):
-                continue
-
-            send(
-                user["id"],
-                body
-            )
-
-            count += 1
-
-        clear_state(uid)
-
-        send(
-            uid,
-            f"✅ Broadcast sent to "
-            f"<b>{count}</b> users.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # VIP
-    # -----------------------------------------------------
-
-    if action == "vip_user":
-
-        if not text.isdigit():
-
-            send(
-                uid,
-                "❌ Enter numeric Telegram ID."
-            )
-
-            return
-
-        target = int(text)
-
-        if not get_user(target):
-
-            send(
-                uid,
-                "❌ User not found."
-            )
-
-            return
-
-        STATE[uid] = {
-            "action": "vip_days",
-            "target": target
-        }
-
-        send(
-            uid,
-            "⭐ কত দিনের VIP দিতে চান?\n\n"
-            "Example: <b>20</b>"
-        )
-
-        return
-
-    if action == "vip_days":
-
-        try:
-
-            days = int(text)
-
-            if days < 1:
-                raise ValueError
-
-        except Exception:
-
-            send(
-                uid,
-                "❌ Enter whole days."
-            )
-
-            return
-
-        target = STATE[uid]["target"]
-
-        until = (
-            now() +
-            timedelta(days=days)
-        ).isoformat()
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                UPDATE users
-                SET vip_until=?
-                WHERE id=?
-                """,
-                (
-                    until,
-                    target
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            "✅ VIP updated.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        send(
-            target,
-            f"⭐ <b>VIP activated for {days} days.</b>",
-            user_keyboard(False)
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # UID DECISION
-    # -----------------------------------------------------
-
-    if action == "uid_decision":
-
-        req_id = STATE[uid]["req"]
-
-        approve = (
-            text == "✅ Approve UID"
-        )
-
-        with DB_LOCK:
-
-            c = db()
-
-            request = c.execute(
-                """
-                SELECT *
-                FROM uid_requests
-                WHERE id=?
-                """,
-                (req_id,)
-            ).fetchone()
-
-            if not request:
-
-                c.close()
-
-                clear_state(uid)
-
-                send(
-                    uid,
-                    "❌ Request not found."
-                )
-
-                return
-
-            target_uid = request["user_id"]
-
-            if approve:
-
-                duplicate = c.execute(
-                    """
-                    SELECT id
-                    FROM users
-                    WHERE uid=?
-                    AND id!=?
-                    """,
-                    (
-                        request["uid"],
-                        target_uid
-                    )
-                ).fetchone()
-
-                if duplicate:
-
-                    c.execute(
-                        """
-                        UPDATE uid_requests
-                        SET status='REJECTED'
-                        WHERE id=?
-                        """,
-                        (req_id,)
-                    )
-
-                    result = (
-                        "❌ UID duplicate; rejected."
-                    )
-
-                else:
-
-                    c.execute(
-                        """
-                        UPDATE uid_requests
-                        SET status='APPROVED'
-                        WHERE id=?
-                        """,
-                        (req_id,)
-                    )
-
-                    c.execute(
-                        """
-                        UPDATE users
-                        SET uid=?
-                        WHERE id=?
-                        """,
-                        (
-                            request["uid"],
-                            target_uid
-                        )
-                    )
-
-                    result = (
-                        "✅ UID approved."
-                    )
-
-            else:
-
-                c.execute(
-                    """
-                    UPDATE uid_requests
-                    SET status='REJECTED'
-                    WHERE id=?
-                    """,
-                    (req_id,)
-                )
-
-                result = (
-                    "❌ UID rejected."
-                )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            result,
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        send(
-            target_uid,
-            result,
-            user_keyboard(False)
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # WITHDRAW DECISION
-    # -----------------------------------------------------
-
-    if action == "withdraw_decision":
-
-        req_id = STATE[uid]["req"]
-
-        approve = (
-            text == "✅ Approve Withdraw"
-        )
-
-        with DB_LOCK:
-
-            c = db()
-
-            request = c.execute(
-                """
-                SELECT *
-                FROM withdrawals
-                WHERE id=?
-                """,
-                (req_id,)
-            ).fetchone()
-
-            if not request:
-
-                c.close()
-
-                clear_state(uid)
-
-                send(
-                    uid,
-                    "❌ Request not found."
-                )
-
-                return
-
-            target_uid = request["user_id"]
-
-            if approve:
-
-                c.execute(
-                    """
-                    UPDATE withdrawals
-                    SET status='APPROVED'
-                    WHERE id=?
-                    """,
-                    (req_id,)
-                )
-
-                result = (
-                    "✅ Withdrawal approved."
-                )
-
-            else:
-
-                c.execute(
-                    """
-                    UPDATE withdrawals
-                    SET status='REJECTED'
-                    WHERE id=?
-                    """,
-                    (req_id,)
-                )
-
-                c.execute(
-                    """
-                    UPDATE users
-                    SET balance_cents=
-                        balance_cents+?
-                    WHERE id=?
-                    """,
-                    (
-                        request["amount_cents"],
-                        target_uid
-                    )
-                )
-
-                c.execute(
-                    """
-                    INSERT INTO wallet_tx(
-                        user_id,
-                        amount_cents,
-                        kind,
-                        note,
-                        created_at
-                    )
-                    VALUES(?,?,?,?,?)
-                    """,
-                    (
-                        target_uid,
-                        request["amount_cents"],
-                        "WITHDRAW_REFUND",
-                        "Rejected withdrawal refund",
-                        iso()
-                    )
-                )
-
-                result = (
-                    "❌ Withdrawal rejected and refunded."
-                )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            result,
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        send(
-            target_uid,
-            result,
-            user_keyboard(False)
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # SUB ADMIN
-    # -----------------------------------------------------
-
-    if action == "subadmin_id":
-
-        if not text.isdigit():
-
-            send(
-                uid,
-                "❌ Enter Telegram numeric ID."
-            )
-
-            return
-
-        STATE[uid] = {
-            "action": "subadmin_perms",
-            "target": int(text)
-        }
-
-        send(
-            uid,
-            "👥 Permissions লিখুন.\n\n"
-            "Example:\n"
-            "<code>signals,users,money,broadcast,settings</code>\n\n"
-            "সব permission দিতে:\n"
-            "<code>ALL</code>"
-        )
-
-        return
-
-    if action == "subadmin_perms":
-
-        target = STATE[uid]["target"]
-
-        values = [
-            "signals",
-            "users",
-            "money",
-            "broadcast",
-            "settings"
-        ]
-
-        entered = (
-            text.lower()
-            .replace(" ", "")
-            .split(",")
-        )
-
-        all_permission = (
-            "all" in entered
-        )
-
-        flags = [
-            int(
-                all_permission
-                or x in entered
-            )
-            for x in values
-        ]
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                INSERT INTO admins(
-                    user_id,
-                    role,
-                    p_signals,
-                    p_users,
-                    p_money,
-                    p_broadcast,
-                    p_settings
-                )
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    p_signals=excluded.p_signals,
-                    p_users=excluded.p_users,
-                    p_money=excluded.p_money,
-                    p_broadcast=excluded.p_broadcast,
-                    p_settings=excluded.p_settings
-                """,
-                (
-                    target,
-                    "SUBADMIN",
-                    *flags
-                )
-            )
-
-            c.commit()
-            c.close()
-
-        clear_state(uid)
-
-        send(
-            uid,
-            "✅ Sub-admin saved.",
-            make_keyboard(
-                ADMIN_PANEL,
-                2
-            )
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # SETTINGS
-    # -----------------------------------------------------
-
-    if action == "set_free_limit":
-
-        try:
-
-            value = int(text)
+            value = float(message.text.strip())
 
             if value < 0:
                 raise ValueError
 
-            set_setting(
-                "free_limit",
-                value
-            )
-
-            clear_state(uid)
-
-            settings_menu(uid)
-
-        except Exception:
+        except:
 
             send(
                 uid,
-                "❌ Enter a whole number."
+                "❌ Enter a valid number.",
+                back_keyboard()
             )
+            return
+
+        ensure_mm(uid)
+
+        columns = {
+            "balance": "trading_balance",
+            "profit": "profit_target",
+            "loss": "loss_limit",
+            "base": "base_trade",
+            "m1": "m1_trade",
+            "max": "max_trades_day"
+        }
+
+        col = columns.get(field)
+
+        if not col:
+            return
+
+        q(
+            f"UPDATE mm SET {col}=? WHERE user_id=?",
+            (value, uid)
+        )
+
+        STATE.pop(uid, None)
+
+        send(
+            uid,
+            "✅ Money Management updated.\n\n" +
+            mm_status(uid),
+            main_keyboard(uid)
+        )
 
         return
 
-    if action == "set_withdraw_min":
+    # --------------------------------------------------------
+    # WITHDRAW USER
+    # --------------------------------------------------------
+
+    if state == "WITHDRAW":
 
         try:
-
-            cents(text)
-
-            set_setting(
-                "withdraw_min",
-                text
+            amount = float(
+                message.text.strip()
             )
+        except:
+            send(
+                uid,
+                "❌ Invalid amount.",
+                back_keyboard()
+            )
+            return
 
-            clear_state(uid)
+        minimum = float(
+            get_setting(
+                "min_withdraw",
+                "5"
+            )
+        )
 
-            settings_menu(uid)
+        u = user(uid)
 
-        except Exception:
+        if amount < minimum:
+            send(
+                uid,
+                f"❌ Minimum withdrawal is ${minimum:.2f}",
+                main_keyboard(uid)
+            )
+            STATE.pop(uid, None)
+            return
+
+        if amount > float(u["balance"]):
+            send(
+                uid,
+                "❌ Insufficient balance.",
+                main_keyboard(uid)
+            )
+            STATE.pop(uid, None)
+            return
+
+        # Reserve balance immediately
+        q(
+            "UPDATE users SET balance=balance-? WHERE user_id=?",
+            (amount, uid)
+        )
+
+        q("""
+        INSERT INTO withdrawals(
+            user_id,amount,status,created_at
+        )
+        VALUES(?,?,?,?)
+        """, (
+            uid,
+            amount,
+            "pending",
+            now_str()
+        ))
+
+        send(
+            uid,
+            f"✅ Withdrawal request submitted.\n\n"
+            f"Amount: <b>${amount:.2f}</b>\n"
+            f"Status: Pending",
+            main_keyboard(uid)
+        )
+
+        safe_send(
+            ADMIN_ID,
+            f"💸 <b>New Withdrawal</b>\n\n"
+            f"User: <code>{uid}</code>\n"
+            f"Amount: <b>${amount:.2f}</b>\n\n"
+            f"APPROVEWD ID\n"
+            f"REJECTWD ID"
+        )
+
+        STATE.pop(uid, None)
+        return
+
+    # --------------------------------------------------------
+    # IMPORT FUTURE SIGNALS
+    # --------------------------------------------------------
+
+    if state == "IMPORT_SIGNALS":
+
+        parsed = parse_signals(
+            message.text
+        )
+
+        if not parsed:
 
             send(
                 uid,
-                "❌ Enter valid amount."
+                "❌ No valid signal lines found.\n\n"
+                "Format:\n"
+                "13:04 - USD/BDT-OTC - UP",
+                back_keyboard()
             )
+            return
+
+        added = 0
+        duplicate = 0
+
+        for tm, pair, direction in parsed:
+
+            old = one("""
+            SELECT id FROM signals
+            WHERE signal_date=?
+              AND signal_time=?
+              AND pair=?
+              AND direction=?
+            """, (
+                today(),
+                tm,
+                pair,
+                direction
+            ))
+
+            if old:
+                duplicate += 1
+                continue
+
+            q("""
+            INSERT INTO signals(
+                signal_date,
+                signal_time,
+                pair,
+                direction,
+                confidence,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """, (
+                today(),
+                tm,
+                pair,
+                direction,
+                get_setting(
+                    "confidence_default",
+                    "95–99%"
+                ),
+                now_str()
+            ))
+
+            added += 1
+
+        STATE.pop(uid, None)
+
+        send(
+            uid,
+            f"✅ <b>Signal Import Complete</b>\n\n"
+            f"Added: <b>{added}</b>\n"
+            f"Duplicate: <b>{duplicate}</b>\n"
+            f"Date: <b>{today()}</b>\n\n"
+            f"Auto Send: "
+            f"<b>{'ON' if get_setting('auto_send','1')=='1' else 'OFF'}</b>",
+            future_admin_keyboard()
+        )
 
         return
 
-    if action == "set_ref_bonus":
+    # --------------------------------------------------------
+    # LIVE SIGNAL
+    # --------------------------------------------------------
 
-        try:
+    if state == "LIVE_SIGNAL":
 
-            cents(text)
+        parsed = parse_signals(
+            message.text
+        )
 
-            set_setting(
-                "ref_bonus",
-                text
-            )
-
-            clear_state(uid)
-
-            settings_menu(uid)
-
-        except Exception:
+        if not parsed:
 
             send(
                 uid,
-                "❌ Enter valid amount."
+                "❌ Invalid signal format.\n\n"
+                "Example:\n"
+                "13:59 - USD/BDT-OTC - DOWN",
+                back_keyboard()
             )
+            return
 
-        return
+        tm, pair, direction = parsed[0]
 
-    # -----------------------------------------------------
-    # LIVE MENU
-    # -----------------------------------------------------
-
-    if action == "live_pair":
-
-        STATE[uid]["pair"] = text.upper()
-
-        STATE[uid]["action"] = (
-            "live_menu"
-        )
-
-        send(
-            uid,
-            f"📌 Pair saved: "
-            f"<b>{text.upper()}</b>",
-            make_keyboard(
-                [
-                    "📌 Pair",
-                    "⏰ Time",
-                    "⬆️ UP",
-                    "⬇️ DOWN",
-                    "🎯 Confidence",
-                    "📤 Send Live Signal",
-                    "✏️ Send Live Text",
-                    "⛔ End Live Mode",
-                    "🏠 Main Menu"
-                ],
-                2
+        text = txt("live_template").format(
+            pair=escape(pair),
+            time=tm,
+            direction=direction,
+            confidence=get_setting(
+                "confidence_default",
+                "95–99%"
             )
         )
 
-        return
+        broadcast_live(text)
 
-    if action == "live_time":
-
-        STATE[uid]["time"] = text
-
-        STATE[uid]["action"] = (
-            "live_menu"
+        q("""
+        INSERT INTO live_history(
+            admin_id,pair,signal_time,direction,
+            message,created_at
         )
+        VALUES(?,?,?,?,?,?)
+        """, (
+            uid,
+            pair,
+            tm,
+            direction,
+            text,
+            now_str()
+        ))
+
+        LIVE["count"] += 1
+
+        STATE.pop(uid, None)
 
         send(
             uid,
-            f"⏰ Time saved: "
-            f"<b>{text}</b>",
-            make_keyboard(
-                [
-                    "📌 Pair",
-                    "⏰ Time",
-                    "⬆️ UP",
-                    "⬇️ DOWN",
-                    "🎯 Confidence",
-                    "📤 Send Live Signal",
-                    "✏️ Send Live Text",
-                    "⛔ End Live Mode",
-                    "🏠 Main Menu"
-                ],
-                2
+            "✅ Live signal sent.",
+            live_admin_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # LIVE TEXT
+    # --------------------------------------------------------
+
+    if state == "LIVE_TEXT":
+
+        broadcast_live(
+            message.text
+        )
+
+        q("""
+        INSERT INTO live_history(
+            admin_id,message,created_at
+        )
+        VALUES(?,?,?)
+        """, (
+            uid,
+            message.text,
+            now_str()
+        ))
+
+        LIVE["count"] += 1
+
+        STATE.pop(uid, None)
+
+        send(
+            uid,
+            "✅ Live text sent.",
+            live_admin_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ADMIN NOTICE
+    # --------------------------------------------------------
+
+    if state == "NOTICE_ADMIN":
+
+        set_setting(
+            "notice",
+            message.text
+        )
+
+        STATE.pop(uid, None)
+
+        send(
+            uid,
+            "✅ Notice updated.",
+            admin_keyboard(uid)
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ADMIN TEXT EDIT
+    # --------------------------------------------------------
+
+    if state == "TEXT_EDIT":
+
+        key = DATA.get(uid, {}).get(
+            "edit_key"
+        )
+
+        if key:
+
+            set_setting(
+                key,
+                message.text
             )
+
+        STATE.pop(uid, None)
+        DATA.pop(uid, None)
+
+        send(
+            uid,
+            "✅ Bot text updated and saved permanently.",
+            admin_keyboard(uid)
         )
 
         return
 
-    if action == "live_confidence":
+    # --------------------------------------------------------
+    # ADMIN SETTINGS
+    # --------------------------------------------------------
 
-        STATE[uid]["confidence"] = text
+    if state == "SETTINGS_ADMIN":
 
-        STATE[uid]["action"] = (
-            "live_menu"
+        parts = message.text.strip().split(
+            maxsplit=1
         )
 
-        send(
-            uid,
-            f"🎯 Confidence saved: "
-            f"<b>{text}%</b>",
-            make_keyboard(
-                [
-                    "📌 Pair",
-                    "⏰ Time",
-                    "⬆️ UP",
-                    "⬇️ DOWN",
-                    "🎯 Confidence",
-                    "📤 Send Live Signal",
-                    "✏️ Send Live Text",
-                    "⛔ End Live Mode",
-                    "🏠 Main Menu"
-                ],
-                2
+        if len(parts) != 2:
+
+            send(
+                uid,
+                "❌ Format: KEY VALUE",
+                back_keyboard()
             )
-        )
+            return
 
-        return
+        key = parts[0].upper()
+        value = parts[1]
 
-    if action == "live_text":
+        mapping = {
+            "FREE": "free_limit",
+            "MINWD": "min_withdraw",
+            "REF": "referral_bonus",
+            "AUTO": "auto_send",
+            "MINUTES": "auto_send_minutes",
+            "AUDIENCE": "future_audience",
+            "MAINTENANCE": "maintenance",
+            "VOTE_PUBLIC": "vote_public",
+            "HOLD": "withdraw_hold"
+        }
 
-        live_broadcast(
-            uid,
-            text
-        )
+        real_key = mapping.get(key)
 
-        STATE[uid]["action"] = (
-            "live_menu"
-        )
+        if not real_key:
 
-        send(
-            uid,
-            "✅ Live message sent."
-        )
-
-        return
-
-
-# =========================================================
-# MAIN TEXT ROUTER
-# =========================================================
-
-@bot.message_handler(
-    content_types=["text"]
-)
-def router(message):
-
-    ensure_user(message)
-
-    uid = message.from_user.id
-
-    text = (
-        message.text or ""
-    ).strip()
-
-    if text in (
-        "/start",
-        "/admin"
-    ):
-        return
-
-    # Maintenance
-    if (
-        get_setting("maintenance") == "1"
-        and not is_admin(uid)
-    ):
-
-        send(
-            uid,
-            get_setting("maintenance")
-        )
-
-        return
-
-    # State first.
-    state = STATE.get(
-        uid,
-        {}
-    )
-
-    action = state.get(
-        "action"
-    )
-
-    if action:
-
-        # Vote
-        if action == "vote":
-
-            save_vote(
-                message,
-                text
+            send(
+                uid,
+                "❌ Unknown setting.",
+                back_keyboard()
             )
+            return
+
+        if real_key == "future_audience":
+            value = value.upper()
+
+            if value not in [
+                "ALL",
+                "VIP",
+                "SELECTED"
+            ]:
+                send(
+                    uid,
+                    "Use ALL, VIP or SELECTED.",
+                    back_keyboard()
+                )
+                return
+
+        set_setting(
+            real_key,
+            value
+        )
+
+        STATE.pop(uid, None)
+
+        send(
+            uid,
+            "✅ Setting updated.",
+            admin_keyboard(uid)
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # VIP ADMIN
+    # --------------------------------------------------------
+
+    if state == "VIP_ADMIN":
+
+        p = message.text.strip().split()
+
+        if not p:
 
             return
 
-        # Result
-        if action == "result":
+        command = p[0].upper()
 
-            save_result(
-                message,
-                text
-            )
+        if command == "ADD" and len(p) >= 3:
 
-            return
+            try:
+                target = int(p[1])
+                days = int(p[2])
 
-        # Live menu buttons
-        if action == "live_menu":
-
-            if text == "📌 Pair":
-
-                STATE[uid]["action"] = (
-                    "live_pair"
-                )
-
-                send(
-                    uid,
-                    "📌 Pair লিখুন.\nExample: EURUSD"
-                )
-
-                return
-
-            if text == "⏰ Time":
-
-                STATE[uid]["action"] = (
-                    "live_time"
-                )
-
-                send(
-                    uid,
-                    "⏰ Time লিখুন.\nExample: 13:30"
-                )
-
-                return
-
-            if text in (
-                "⬆️ UP",
-                "⬇️ DOWN"
-            ):
-
-                STATE[uid]["direction"] = (
-                    "UP"
-                    if text == "⬆️ UP"
-                    else
-                    "DOWN"
-                )
-
-                send(
-                    uid,
-                    "✅ Direction saved."
-                )
-
-                return
-
-            if text == "🎯 Confidence":
-
-                STATE[uid]["action"] = (
-                    "live_confidence"
-                )
-
-                send(
-                    uid,
-                    "🎯 Confidence লিখুন.\nExample: 95"
-                )
-
-                return
-
-            if text == "✏️ Send Live Text":
-
-                STATE[uid]["action"] = (
-                    "live_text"
-                )
-
-                send(
-                    uid,
-                    "✏️ Live message পাঠান."
-                )
-
-                return
-
-            if text == "📤 Send Live Signal":
-
-                st = STATE[uid]
-
-                pair = st.get(
-                    "pair"
-                )
-
-                direction = st.get(
-                    "direction"
-                )
-
-                signal_time = st.get(
-                    "time",
-                    "NOW"
-                )
-
-                confidence = st.get(
-                    "confidence",
-                    ""
-                )
-
-                if not pair:
-
+                if not user(target):
                     send(
                         uid,
-                        "❌ আগে Pair দিন."
+                        "❌ User not found.",
+                        back_keyboard()
                     )
-
                     return
 
-                if not direction:
-
-                    send(
-                        uid,
-                        "❌ আগে UP অথবা DOWN select করুন."
-                    )
-
-                    return
-
-                arrow = (
-                    "🟢⬆️"
-                    if direction == "UP"
-                    else
-                    "🔴⬇️"
+                expiry = set_vip(
+                    target,
+                    days
                 )
 
-                live_message = (
-                    "⚡ <b>LIVE SIGNAL</b>\n\n"
-                    f"💱 <b>{pair}</b>\n"
-                    f"⏰ <b>{signal_time}</b>\n"
-                    f"{arrow} <b>{direction}</b>\n"
-                    f"🎯 Confidence: "
-                    f"<b>{confidence or '—'}%</b>"
-                )
-
-                live_broadcast(
-                    uid,
-                    live_message
+                send(
+                    target,
+                    f"💎 <b>VIP Activated</b>\n\n"
+                    f"Expires: <b>{expiry.strftime('%Y-%m-%d %H:%M')}</b>",
+                    main_keyboard(target)
                 )
 
                 send(
                     uid,
-                    "✅ Live Signal sent."
+                    "✅ VIP added.",
+                    admin_keyboard(uid)
                 )
 
-                return
+                STATE.pop(uid, None)
 
-            if text == "⛔ End Live Mode":
-
-                with DB_LOCK:
-
-                    c = db()
-
-                    c.execute(
-                        """
-                        UPDATE live_sessions
-                        SET
-                            status='ENDED',
-                            ended_at=?
-                        WHERE status='ACTIVE'
-                        """,
-                        (iso(),)
-                    )
-
-                    c.commit()
-                    c.close()
-
-                clear_state(uid)
+            except:
 
                 send(
                     uid,
-                    "⛔ Live Session ended.",
-                    make_keyboard(
-                        ADMIN_PANEL,
-                        2
-                    )
-                )
-
-                return
-
-        # Text editor
-        if action == "text_choose":
-
-            keys = state.get(
-                "keys",
-                []
-            )
-
-            key = (
-                text[2:]
-                if text.startswith("📝 ")
-                else ""
-            )
-
-            if key in keys:
-
-                STATE[uid] = {
-                    "action": "edit_text",
-                    "key": key
-                }
-
-                send(
-                    uid,
-                    f"📝 <b>Editing:</b> {key}\n\n"
-                    "Current text:\n\n"
-                    f"{get_setting(key)}\n\n"
-                    "নতুন text পাঠান."
+                    "❌ Example: ADD 123456789 30",
+                    back_keyboard()
                 )
 
             return
 
-        # Everything else
-        handle_state(
-            message,
-            action,
-            text
-        )
+        if command == "REMOVE" and len(p) >= 2:
 
-        return
+            try:
+                target = int(p[1])
 
-    # -----------------------------------------------------
-    # NAVIGATION
-    # -----------------------------------------------------
+                remove_vip(target)
 
-    if text == "🏠 Main Menu":
+                send(
+                    target,
+                    "ℹ️ Your VIP status has been removed.",
+                    main_keyboard(target)
+                )
 
-        main_menu(uid)
+                send(
+                    uid,
+                    "✅ VIP removed.",
+                    admin_keyboard(uid)
+                )
 
-        return
+                STATE.pop(uid, None)
 
-    if text == "🔙 Back":
+            except:
+                send(
+                    uid,
+                    "❌ Invalid user ID.",
+                    back_keyboard()
+                )
 
-        main_menu(uid)
-
-        return
-
-    # -----------------------------------------------------
-    # USER MENU
-    # -----------------------------------------------------
-
-    if text == "📡 Future Signals":
-
-        future_menu(message)
-
-        return
-
-    if text == "📅 Today's Signals":
-
-        todays_signals(uid)
-
-        return
-
-    if text == "⚡ Live Signals":
-
-        live_menu_user(message)
-
-        return
-
-    if text == "💰 Money Management":
-
-        money_management_menu(message)
-
-        return
-
-    if text in MM_MENU:
-
-        mm_action(
-            message,
-            text
-        )
-
-        return
-
-    if text == "💼 Wallet":
-
-        wallet_menu(message)
-
-        return
-
-    if text == "💸 Withdraw":
-
-        withdraw_menu(message)
-
-        return
-
-    if text == "💵 Withdraw Amount":
-
-        require_input(
-            uid,
-            "withdraw"
-        )
+            return
 
         send(
             uid,
-            "💵 কত USD withdraw করতে চান?\n\n"
-            "Example: <b>10</b>"
+            "❌ Use:\nADD USER_ID DAYS\nor\nREMOVE USER_ID",
+            back_keyboard()
         )
 
         return
 
-    if text == "👤 VIP / UID":
+    # --------------------------------------------------------
+    # BROADCAST
+    # --------------------------------------------------------
 
-        vip_menu(message)
+    if state == "BROADCAST":
 
-        return
-
-    if text in VIP_MENU:
-
-        vip_action(
-            message,
-            text
+        parts = message.text.split(
+            maxsplit=1
         )
 
-        return
+        if len(parts) < 2:
 
-    if text == "👥 Referral":
-
-        referral_menu(message)
-
-        return
-
-    if text == "📊 Dashboard":
-
-        send(
-            uid,
-            dashboard(uid),
-            user_keyboard(
-                is_admin(uid)
+            send(
+                uid,
+                "Use:\nALL message\nVIP message\nSELECTED message",
+                back_keyboard()
             )
-        )
+            return
 
-        return
+        target = parts[0].upper()
+        body = parts[1]
 
-    if text == "🗳 Vote Signal":
+        if target == "ALL":
 
-        vote_menu(message)
-
-        return
-
-    if text == "📈 Signal Result":
-
-        result_menu(message)
-
-        return
-
-    if text == "📜 Signal History":
-
-        history_menu(message)
-
-        return
-
-    if text == "📖 Trading Rules":
-
-        send(
-            uid,
-            get_setting(
-                "trading_rules"
-            ),
-            user_keyboard(
-                is_admin(uid)
-            )
-        )
-
-        return
-
-    if text == "🔔 Notifications":
-
-        notification_menu(message)
-
-        return
-
-    if text == "🔔 ON":
-
-        set_notification(
-            message,
-            text
-        )
-
-        return
-
-    if text == "🔕 OFF":
-
-        set_notification(
-            message,
-            text
-        )
-
-        return
-
-    if text == "🔔 Live ON":
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                UPDATE users
-                SET live_notify=1
-                WHERE id=?
-                """,
-                (uid,)
+            users = q(
+                "SELECT user_id FROM users",
+                fetch=True
             )
 
-            c.commit()
-            c.close()
+        elif target == "VIP":
 
-        live_menu_user(message)
-
-        return
-
-    if text == "🔕 Live OFF":
-
-        with DB_LOCK:
-
-            c = db()
-
-            c.execute(
-                """
-                UPDATE users
-                SET live_notify=0
-                WHERE id=?
-                """,
-                (uid,)
+            users = q(
+                "SELECT user_id FROM users WHERE is_vip=1",
+                fetch=True
             )
 
-            c.commit()
-            c.close()
+        elif target == "SELECTED":
 
-        live_menu_user(message)
-
-        return
-
-    if text == "❓ Help":
-
-        send(
-            uid,
-            get_setting(
-                "help"
-            ),
-            user_keyboard(
-                is_admin(uid)
+            ids = get_setting(
+                "selected_users",
+                ""
             )
-        )
 
-        return
+            users = []
 
-    # -----------------------------------------------------
-    # ADMIN
-    # -----------------------------------------------------
+            for x in ids.split(","):
 
-    if (
-        is_admin(uid)
-        and text == "🛠 Admin Panel"
-    ):
-
-        admin_panel(uid)
-
-        return
-
-    if (
-        is_admin(uid)
-        and text in ADMIN_PANEL
-    ):
-
-        if text == "🔙 Back":
-
-            main_menu(uid)
-
-        elif text == "🏠 Main Menu":
-
-            main_menu(uid)
+                try:
+                    r = one(
+                        "SELECT user_id FROM users WHERE user_id=?",
+                        (int(x),)
+                    )
+                    if r:
+                        users.append(r)
+                except:
+                    pass
 
         else:
 
-            admin_action(
-                message,
-                text
+            send(
+                uid,
+                "❌ Target must be ALL, VIP or SELECTED.",
+                back_keyboard()
             )
+            return
+
+        count = 0
+
+        for u in users:
+
+            if safe_send(
+                u["user_id"],
+                body
+            ):
+                count += 1
+
+        send(
+            uid,
+            f"✅ Broadcast sent to {count} users.",
+            admin_keyboard(uid)
+        )
+
+        STATE.pop(uid, None)
 
         return
 
-    # Admin submenu buttons
-    if is_admin(uid):
+    # --------------------------------------------------------
+    # WITHDRAW ADMIN
+    # --------------------------------------------------------
 
-        admin_submenus = [
-            "➕ Add/Renew VIP",
-            "📋 VIP List",
-            "🔢 Free Limit",
-            "💸 Withdraw ON/OFF",
-            "💵 Minimum Withdraw",
-            "👥 Referral Bonus"
-        ]
+    if state == "WITHDRAW_ADMIN":
 
-        if text in admin_submenus:
+        p = message.text.strip().split()
 
-            admin_action(
-                message,
-                text
+        if len(p) != 2:
+
+            send(
+                uid,
+                "Use APPROVE ID or REJECT ID",
+                back_keyboard()
             )
+            return
+
+        action = p[0].upper()
+
+        try:
+            wid = int(p[1])
+        except:
+            send(
+                uid,
+                "❌ Invalid withdrawal ID.",
+                back_keyboard()
+            )
+            return
+
+        w = one(
+            "SELECT * FROM withdrawals WHERE id=?",
+            (wid,)
+        )
+
+        if not w or w["status"] != "pending":
+
+            send(
+                uid,
+                "❌ Withdrawal not found/pending.",
+                admin_keyboard(uid)
+            )
+            return
+
+        if action == "APPROVE":
+
+            q("""
+            UPDATE withdrawals
+            SET status='approved',
+                processed_at=?
+            WHERE id=?
+            """, (
+                now_str(),
+                wid
+            ))
+
+            safe_send(
+                w["user_id"],
+                f"✅ Withdrawal approved.\n\n"
+                f"Amount: ${w['amount']:.2f}"
+            )
+
+            send(
+                uid,
+                "✅ Withdrawal approved.",
+                admin_keyboard(uid)
+            )
+
+        elif action == "REJECT":
+
+            q("""
+            UPDATE withdrawals
+            SET status='rejected',
+                processed_at=?
+            WHERE id=?
+            """, (
+                now_str(),
+                wid
+            ))
+
+            # Refund
+            add_balance(
+                w["user_id"],
+                float(w["amount"]),
+                "WITHDRAW_REFUND",
+                f"Rejected withdrawal #{wid}"
+            )
+
+            safe_send(
+                w["user_id"],
+                f"❌ Withdrawal rejected.\n\n"
+                f"Amount ${w['amount']:.2f} "
+                f"has been returned to your wallet."
+            )
+
+            send(
+                uid,
+                "✅ Withdrawal rejected and refunded.",
+                admin_keyboard(uid)
+            )
+
+        else:
+
+            send(
+                uid,
+                "Use APPROVE ID or REJECT ID.",
+                back_keyboard()
+            )
+            return
+
+        STATE.pop(uid, None)
+        return
+
+    # --------------------------------------------------------
+    # SUB ADMIN
+    # --------------------------------------------------------
+
+    if state == "SUBADMIN":
+
+        p = message.text.strip().split(
+            maxsplit=2
+        )
+
+        if not p:
+            return
+
+        command = p[0].upper()
+
+        if command == "ADDADMIN" and len(p) >= 3:
+
+            try:
+                target = int(p[1])
+                permissions = p[2]
+
+                q("""
+                INSERT INTO admins(
+                    user_id,role,permissions
+                )
+                VALUES(?,?,?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET permissions=excluded.permissions
+                """, (
+                    target,
+                    "sub_admin",
+                    permissions
+                ))
+
+                send(
+                    uid,
+                    "✅ Sub-admin added/updated.",
+                    admin_keyboard(uid)
+                )
+
+                STATE.pop(uid, None)
+
+            except:
+                send(
+                    uid,
+                    "❌ Invalid format.",
+                    back_keyboard()
+                )
 
             return
 
-    # -----------------------------------------------------
-    # FALLBACK
-    # -----------------------------------------------------
+        if command == "DELADMIN" and len(p) >= 2:
+
+            try:
+                target = int(p[1])
+
+                if target == ADMIN_ID:
+
+                    send(
+                        uid,
+                        "❌ Owner cannot be removed.",
+                        back_keyboard()
+                    )
+                    return
+
+                q(
+                    "DELETE FROM admins WHERE user_id=?",
+                    (target,)
+                )
+
+                send(
+                    uid,
+                    "✅ Admin removed.",
+                    admin_keyboard(uid)
+                )
+
+                STATE.pop(uid, None)
+
+            except:
+                pass
+
+            return
+
+        send(
+            uid,
+            "❌ Use:\n"
+            "ADDADMIN ID signals,vip,withdraw,live\n"
+            "DELADMIN ID",
+            back_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # TARGETS
+    # --------------------------------------------------------
+
+    if state == "TARGETS":
+
+        p = message.text.strip().split(
+            maxsplit=2
+        )
+
+        if not p:
+            return
+
+        command = p[0].upper()
+
+        if command == "ADD" and len(p) >= 2:
+
+            try:
+                chat_id = int(p[1])
+                title = p[2] if len(p) >= 3 else ""
+
+                q("""
+                INSERT OR REPLACE INTO notification_targets(
+                    chat_id,title,chat_type,enabled,created_at
+                )
+                VALUES(?,?,?,?,?)
+                """, (
+                    chat_id,
+                    title,
+                    "unknown",
+                    1,
+                    now_str()
+                ))
+
+                send(
+                    uid,
+                    "✅ Notification target added.",
+                    admin_keyboard(uid)
+                )
+
+                STATE.pop(uid, None)
+
+            except:
+                send(
+                    uid,
+                    "❌ Invalid chat ID.",
+                    back_keyboard()
+                )
+
+            return
+
+        if command == "DEL" and len(p) >= 2:
+
+            try:
+                chat_id = int(p[1])
+
+                q(
+                    "DELETE FROM notification_targets WHERE chat_id=?",
+                    (chat_id,)
+                )
+
+                send(
+                    uid,
+                    "✅ Notification target removed.",
+                    admin_keyboard(uid)
+                )
+
+                STATE.pop(uid, None)
+
+            except:
+                pass
+
+            return
+
+        send(
+            uid,
+            "Use ADD CHAT_ID NAME\nor DEL CHAT_ID",
+            back_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # UNKNOWN STATE
+    # --------------------------------------------------------
+
+    STATE.pop(uid, None)
 
     send(
         uid,
-        get_setting("invalid"),
-        user_keyboard(
-            is_admin(uid)
-        )
+        txt("invalid"),
+        main_keyboard(uid)
     )
 
 
-# =========================================================
-# START BOT
-# =========================================================
+# ============================================================
+# ERROR SAFE POLLING
+# ============================================================
 
-init_db()
+def run_bot():
+
+    while True:
+
+        try:
+
+            logging.info(
+                "Bot polling started..."
+            )
+
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=30,
+                long_polling_timeout=30
+            )
+
+        except Exception as e:
+
+            logging.exception(
+                "Polling crashed: %s",
+                e
+            )
+
+            time.sleep(5)
 
 
-def main():
+# ============================================================
+# START
+# ============================================================
 
+if __name__ == "__main__":
+
+    init_db()
+
+    os.makedirs(
+        BACKUP_DIR,
+        exist_ok=True
+    )
+
+    # Scheduler thread
     threading.Thread(
         target=scheduler,
         daemon=True
     ).start()
 
-    print(
-        "SM QUATEX SURE SHORT BOT STARTED"
+    logging.info(
+        "SM QUATEX SURE SHORT started"
     )
 
-    bot.infinity_polling(
-        skip_pending=True,
-        timeout=30,
-        long_polling_timeout=30
-    )
-
-
-if __name__ == "__main__":
-
-    main()
+    run_bot()
