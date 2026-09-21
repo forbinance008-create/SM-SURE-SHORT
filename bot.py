@@ -319,19 +319,41 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS live_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 session_id INTEGER NOT NULL,
-
                 pair TEXT NOT NULL,
                 signal_time TEXT NOT NULL,
                 direction TEXT NOT NULL,
-
                 confidence TEXT NOT NULL DEFAULT '95–99%',
-
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, action TEXT NOT NULL,
+                target_type TEXT, target_id TEXT, details TEXT, created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS referral_flags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, flag TEXT NOT NULL,
+                details TEXT, created_at TEXT NOT NULL
+            );
+
             """)
+
+            for migration in (
+                "ALTER TABLE notify_targets ADD COLUMN target_type TEXT NOT NULL DEFAULT 'GROUP'",
+                "ALTER TABLE notify_targets ADD COLUMN audience TEXT NOT NULL DEFAULT 'ALL'",
+                "ALTER TABLE notify_targets ADD COLUMN selected_users TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE withdrawals ADD COLUMN reviewed_by INTEGER",
+                "ALTER TABLE withdrawals ADD COLUMN risk_status TEXT NOT NULL DEFAULT 'NORMAL'",
+                "ALTER TABLE withdrawals ADD COLUMN risk_note TEXT NOT NULL DEFAULT ''",
+            ):
+                try: conn.execute(migration)
+                except sqlite3.OperationalError: pass
+
+            try:
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_uid_normalized_unique ON uid_submissions(lower(trim(quotex_uid)))")
+            except sqlite3.IntegrityError:
+                pass
 
 
             defaults = {
@@ -489,6 +511,71 @@ def cycle_key(date_value=None):
 def money(cents):
 
     return f"${cents / 100:.2f}"
+
+
+# ============================================================
+# SECURITY / AUDIT HELPERS
+# ============================================================
+
+def audit_admin(admin_id, action, target_type="", target_id="", details=""):
+    try:
+        with DB_LOCK:
+            conn=db()
+            try:
+                conn.execute("INSERT INTO admin_audit(admin_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",(int(admin_id),action,target_type,str(target_id),details,utc_iso(now_utc())))
+                conn.commit()
+            finally: conn.close()
+    except Exception: logger.exception("audit failed")
+
+
+def referral_security_report(user_id):
+    flags=[]; referred=[]; total_bonus=0
+    with DB_LOCK:
+        conn=db()
+        try:
+            user=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if not user: return {"total":0,"valid":0,"suspicious":0,"bonus":0,"flags":[],"referred":[]}
+            rows=conn.execute("""SELECT u.user_id,u.username,u.first_name,u.created_at,u.blocked,u.status,r.bonus_cents,r.created_at AS referral_at
+                FROM users u LEFT JOIN referrals r ON r.referred_id=u.user_id AND r.referrer_id=? WHERE u.referred_by=? ORDER BY u.created_at ASC""",(user_id,user_id)).fetchall()
+            for r in rows:
+                total_bonus += int(r["bonus_cents"] or 0); referred.append(dict(r))
+                if r["blocked"]: flags.append(f"Blocked referred account: {r['user_id']}")
+                if r["bonus_cents"] is None: flags.append(f"Referral bonus not recorded: {r['user_id']}")
+            if user["referred_by"]==user_id: flags.append("Self-referral record exists")
+            recent=conn.execute("SELECT COUNT(*) n FROM referrals WHERE referrer_id=? AND created_at>=?",(user_id,utc_iso(now_utc()-timedelta(hours=24)))).fetchone()["n"]
+            if recent>=5: flags.append(f"High referral volume in last 24h: {recent}")
+            valid=sum(1 for r in referred if r["bonus_cents"] is not None and not r["blocked"])
+            return {"total":len(referred),"valid":valid,"suspicious":len(flags),"bonus":total_bonus,"flags":flags,"referred":referred}
+        finally: conn.close()
+
+
+def withdrawal_risk(withdrawal):
+    report=referral_security_report(withdrawal["user_id"]); flags=list(report["flags"])
+    with DB_LOCK:
+        conn=db()
+        try: recent=conn.execute("SELECT COUNT(*) n FROM wallet_tx WHERE user_id=? AND kind='REFERRAL' AND created_at>=?",(withdrawal["user_id"],utc_iso(now_utc()-timedelta(hours=24)))).fetchone()["n"]
+        finally: conn.close()
+    if recent>=3: flags.append(f"{recent} referral bonuses in last 24h")
+    return ("REVIEW" if flags else "NORMAL", "; ".join(flags) if flags else "No observable referral anomaly found.", report)
+
+
+def save_withdrawal_risk(withdrawal_id,status,note):
+    with DB_LOCK:
+        conn=db()
+        try: conn.execute("UPDATE withdrawals SET risk_status=?,risk_note=? WHERE id=?",(status,note,withdrawal_id)); conn.commit()
+        finally: conn.close()
+
+
+def notify_audience(target_row,user_id):
+    audience=(target_row["audience"] or "ALL").upper() if "audience" in target_row.keys() else "ALL"
+    if audience=="ALL": return True
+    u=get_user(user_id)
+    if not u: return False
+    if audience=="VIP": return u["status"]=="VIP"
+    if audience=="SELECTED":
+        ids=[x.strip() for x in (target_row["selected_users"] or "").split(",") if x.strip()] if "selected_users" in target_row.keys() else []
+        return str(user_id) in ids
+    return True
 
 
 # ============================================================
@@ -837,6 +924,11 @@ def admin_keyboard():
         [
             "📢 Broadcast",
             "👥 Users"
+        ],
+
+        [
+            "👥 Referral History",
+            "🛡️ Security Logs"
         ],
 
         [
@@ -1835,7 +1927,7 @@ def auto_signal_loop():
 
                                 targets = conn.execute(
                                     """
-                                    SELECT chat_id
+                                    SELECT *
                                     FROM notify_targets
                                     WHERE enabled=1
                                     """
@@ -1849,7 +1941,8 @@ def auto_signal_loop():
                         for target in targets:
 
                             try:
-
+                                if get_setting("target_notify", "ON") != "ON":
+                                    continue
                                 bot.send_message(
                                     target["chat_id"],
                                     target_message
@@ -3491,99 +3584,18 @@ def admin_live_session(message):
 # ============================================================
 
 def admin_pending_uid(message):
-
-    if not can(
-        message.from_user.id,
-        "vip"
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Access denied.",
-            reply_markup=admin_keyboard()
-        )
-
-        return
-
-
+    if not can(message.from_user.id,"vip"):
+        bot.send_message(message.chat.id,"⛔ Access denied.",reply_markup=admin_keyboard()); return
     with DB_LOCK:
-
-        conn = db()
-
-        try:
-
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM uid_submissions
-
-                WHERE status='PENDING'
-
-                ORDER BY id ASC
-
-                LIMIT 20
-                """
-            ).fetchall()
-
-        finally:
-
-            conn.close()
-
-
+        conn=db()
+        try: rows=conn.execute("SELECT * FROM uid_submissions WHERE status='PENDING' ORDER BY id ASC LIMIT 20").fetchall()
+        finally: conn.close()
     if not rows:
-
-        text = "📭 কোনো pending UID নেই."
-
-    else:
-
-        lines = [
-            "🆔 <b>PENDING UID</b>\n"
-        ]
-
-
-        for row in rows:
-
-            lines.append(
-
-                f"#{row['id']} | "
-                f"User: <code>{row['user_id']}</code> | "
-                f"UID: <code>"
-                f"{escape(row['quotex_uid'])}"
-                f"</code>"
-
-            )
-
-
-        text = "\n".join(
-            lines
-        )
-
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "uid_review"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        text
-        +
-        "\n\nApprove:\n"
-        "<code>approve ID</code>\n\n"
-        "Reject:\n"
-        "<code>reject ID</code>",
-
-        reply_markup=admin_keyboard()
-    )
-
-
-# ============================================================
-# ADMIN: VIP
-# ============================================================
+        clear_state(message.from_user.id); bot.send_message(message.chat.id,"📭 কোনো pending UID নেই.",reply_markup=admin_keyboard()); return
+    buttons=[[f"🆔 #{r['id']} • {r['user_id']}"] for r in rows]
+    buttons.append(["🔙 Back","🏠 Main Menu"])
+    STATES[message.from_user.id]={"action":"uid_select"}
+    bot.send_message(message.chat.id,"🆔 <b>PENDING UID</b>\n\nএকটি UID নির্বাচন করুন:",reply_markup=make_keyboard(buttons))
 
 def admin_vip(message):
 
@@ -3632,104 +3644,18 @@ def admin_vip(message):
 # ============================================================
 
 def admin_withdrawals(message):
-
-    if not can(
-        message.from_user.id,
-        "withdraw"
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Access denied.",
-            reply_markup=admin_keyboard()
-        )
-
-        return
-
-
+    if not can(message.from_user.id,"withdraw"):
+        bot.send_message(message.chat.id,"⛔ Access denied.",reply_markup=admin_keyboard()); return
     with DB_LOCK:
-
-        conn = db()
-
-        try:
-
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM withdrawals
-
-                WHERE status='PENDING'
-
-                ORDER BY id ASC
-
-                LIMIT 20
-                """
-            ).fetchall()
-
-        finally:
-
-            conn.close()
-
-
-    if rows:
-
-        lines = [
-            "💸 <b>PENDING WITHDRAWALS</b>\n"
-        ]
-
-
-        for row in rows:
-
-            lines.append(
-
-                f"#{row['id']} | "
-                f"User: <code>{row['user_id']}</code> | "
-                f"Amount: "
-                f"<b>${row['amount_cents']/100:.2f}</b>\n"
-                f"Method: {escape(row['method'])}\n"
-                f"Account: <code>"
-                f"{escape(row['account'])}"
-                f"</code>\n"
-
-            )
-
-
-        text = "\n".join(
-            lines
-        )
-
-    else:
-
-        text = (
-            "💸 <b>PENDING WITHDRAWALS</b>\n\n"
-            "None."
-        )
-
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "withdraw_review"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        text
-        +
-        "\n\n"
-        "Approve: <code>approve ID</code>\n"
-        "Reject: <code>reject ID</code>",
-
-        reply_markup=admin_keyboard()
-    )
-
-
-# ============================================================
-# ADMIN: WALLET
-# ============================================================
+        conn=db()
+        try: rows=conn.execute("SELECT * FROM withdrawals WHERE status='PENDING' ORDER BY id ASC LIMIT 20").fetchall()
+        finally: conn.close()
+    if not rows:
+        clear_state(message.from_user.id); bot.send_message(message.chat.id,"💸 <b>PENDING WITHDRAWALS</b>\n\nNone.",reply_markup=admin_keyboard()); return
+    buttons=[[f"💸 #{r['id']} • ${r['amount_cents']/100:.2f} • {r['user_id']}"] for r in rows]
+    buttons.append(["🔙 Back","🏠 Main Menu"])
+    STATES[message.from_user.id]={"action":"withdraw_select"}
+    bot.send_message(message.chat.id,"💸 <b>PENDING WITHDRAWALS</b>\n\nএকটি withdrawal নির্বাচন করুন:",reply_markup=make_keyboard(buttons))
 
 def admin_wallet_adjust(message):
 
@@ -3844,98 +3770,16 @@ def admin_users(message):
 # ============================================================
 
 def admin_subadmins(message):
-
-    if not is_master(
-        message.from_user.id
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Master Admin only.",
-            reply_markup=admin_keyboard()
-        )
-
-        return
-
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "subadmin"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "🛡️ <b>SUB-ADMIN</b>\n\n"
-
-        "Add:\n"
-        "<code>"
-        "add USER_ID signals,vip,withdraw,results,users,settings,broadcast"
-        "</code>\n\n"
-
-        "Remove:\n"
-        "<code>"
-        "remove USER_ID"
-        "</code>",
-
-        reply_markup=back_keyboard()
-    )
-
-
-# ============================================================
-# ADMIN: NOTIFICATION TARGETS
-# ============================================================
+    if not is_master(message.from_user.id):
+        bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard()); return
+    STATES[message.from_user.id]={"action":"subadmin_menu"}
+    bot.send_message(message.chat.id,"🛡️ <b>SUB-ADMIN MANAGEMENT</b>",reply_markup=make_keyboard([["➕ Add Sub Admin","📋 Sub-admin List"],["🗑 Remove Sub Admin"],["🔙 Back","🏠 Main Menu"]]))
 
 def admin_notify_targets(message):
-
-    if not is_master(
-        message.from_user.id
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Master Admin only.",
-            reply_markup=admin_keyboard()
-        )
-
-        return
-
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "notify_target"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "🎯 <b>NOTIFICATION TARGET</b>\n\n"
-
-        "Add group/channel chat ID:\n"
-        "<code>-1001234567890</code>\n\n"
-
-        "Remove:\n"
-        "<code>remove -1001234567890</code>\n\n"
-
-        "Test:\n"
-        "<code>test -1001234567890</code>\n\n"
-
-        "Bot-কে group/channel-এ add করে "
-        "message send করার permission দিতে হবে.",
-
-        reply_markup=back_keyboard()
-    )
-
-
-# ============================================================
-# ADMIN: ANALYTICS
-# ============================================================
+    if not is_master(message.from_user.id):
+        bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard()); return
+    STATES[message.from_user.id]={"action":"notify_menu"}
+    bot.send_message(message.chat.id,"🎯 <b>NOTIFICATION TARGETS</b>\n\nTarget যোগ/ম্যানেজ করতে নিচের button ব্যবহার করুন।",reply_markup=make_keyboard([["➕ Add Target","📋 Target List"],["🧪 Test Target","🗑 Remove Target"],["🔔 Auto Notification ON/OFF"],["🔙 Back","🏠 Main Menu"]]))
 
 def admin_analytics(message):
 
@@ -4058,46 +3902,10 @@ def admin_settings(message):
 # ============================================================
 
 def admin_text_editor(message):
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "text_editor"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "📝 <b>BOT TEXT EDITOR</b>\n\n"
-
-        "Format:\n"
-        "<code>key=value</code>\n\n"
-
-        "Available keys:\n"
-        "<code>"
-        "welcome\n"
-        "trading_rules\n"
-        "notice\n"
-        "confidence\n"
-        "referral_bonus\n"
-        "min_withdraw\n"
-        "free_limit"
-        "</code>\n\n"
-
-        "Example:\n"
-        "<code>"
-        "welcome=🎉 Welcome to SM QUATEX SURE SHORT"
-        "</code>",
-
-        reply_markup=back_keyboard()
-    )
-
-
-# ============================================================
-# ADMIN ROUTER
-# ============================================================
+    if not is_master(message.from_user.id):
+        bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard()); return
+    STATES[message.from_user.id]={"action":"text_menu"}
+    bot.send_message(message.chat.id,"📝 <b>BOT TEXT EDITOR</b>\n\nCategory নির্বাচন করুন:",reply_markup=make_keyboard([["👋 Welcome","📊 Future Signal"],["⚡ Live Signal","💰 Money Management"],["⭐ VIP","🆔 UID"],["💵 Wallet","💸 Withdraw"],["👥 Referral","🔔 Notification"],["📜 Trading Rules","📢 Broadcast"],["✅ WIN","❌ LOSS"],["⏭️ SKIP","⚠️ Error Messages"],["🔔 Reminders","✨ Feature Text"],["🔙 Back","🏠 Main Menu"]]))
 
 def handle_admin_button(message):
 
@@ -4216,6 +4024,12 @@ def handle_admin_button(message):
             message
         )
 
+
+    if text == "👥 Referral History":
+        return admin_referral_history(message)
+
+    if text == "🛡️ Security Logs":
+        return admin_security_logs(message)
 
     if text == "📊 Analytics":
 
@@ -4677,28 +4491,28 @@ def handle_state(message):
 
                     duplicate = conn.execute(
                         """
-                        SELECT 1
+                        SELECT user_id,status
                         FROM uid_submissions
-
-                        WHERE
-                            quotex_uid=?
-                            AND status IN(
-                                'PENDING',
-                                'APPROVED'
-                            )
+                        WHERE lower(trim(quotex_uid))=lower(trim(?))
+                          AND status IN('PENDING','APPROVED')
+                        LIMIT 1
                         """,
-                        (
-                            quotex_uid,
-                        )
+                        (quotex_uid,)
                     ).fetchone()
 
-
-                    if duplicate:
-
+                    if duplicate and duplicate["user_id"] != user_id:
                         raise ValueError(
-                            "এই Quotex UID already used."
+                            f"এই Quotex UID অন্য Telegram account-এ already linked/pending: {duplicate['user_id']}"
                         )
 
+                    existing_user_uid = conn.execute(
+                        """SELECT quotex_uid,status FROM uid_submissions
+                           WHERE user_id=? AND status IN('PENDING','APPROVED')
+                           ORDER BY id DESC LIMIT 1""",
+                        (user_id,)
+                    ).fetchone()
+                    if existing_user_uid:
+                        raise ValueError("আপনার UID already pending/approved. নতুন UID submit করা যাবে না.")
 
                     pending = conn.execute(
                         """
@@ -6156,9 +5970,8 @@ def handle_state(message):
 
                     targets = conn.execute(
                         """
-                        SELECT chat_id
+                        SELECT *
                         FROM notify_targets
-
                         WHERE enabled=1
                         """
                     ).fetchall()
@@ -6185,7 +5998,8 @@ def handle_state(message):
             for target in targets:
 
                 try:
-
+                    if get_setting("target_notify", "ON") != "ON":
+                        continue
                     bot.send_message(
                         target["chat_id"],
                         live_message
@@ -6206,1139 +6020,111 @@ def handle_state(message):
 
 
         # ====================================================
-        # MM
+        # BUTTON-BASED ADMIN FLOWS
         # ====================================================
+        if action == "uid_select":
+            m = re.match(r"🆔 #(\d+)", text)
+            if not m:
+                raise ValueError("একটি Pending UID button নির্বাচন করুন.")
+            sid = int(m.group(1))
+            with DB_LOCK:
+                conn = db()
+                try:
+                    row = conn.execute("SELECT * FROM uid_submissions WHERE id=? AND status='PENDING'", (sid,)).fetchone()
+                finally:
+                    conn.close()
+            if not row:
+                raise ValueError("Pending UID পাওয়া যায়নি.")
+            STATES[user_id] = {"action":"uid_review_buttons", "submission_id":sid}
+            bot.send_message(message.chat.id,
+                f"🆔 <b>UID REVIEW</b>\n\nID: <code>{sid}</code>\nUser: <code>{row['user_id']}</code>\nUID: <code>{escape(row['quotex_uid'])}</code>",
+                reply_markup=make_keyboard([["✅ Approve UID","❌ Reject UID"],["🔙 Back","🏠 Main Menu"]]))
+            return True
 
-        if action == "mm":
-
-            key = state["key"]
-
-            value = text.replace(
-                "$",
-                ""
-            ).strip()
-
-
-            if key == "max_trades":
-
-                int(value)
-
+        if action == "uid_review_buttons":
+            sid = state["submission_id"]
+            if text not in ("✅ Approve UID", "❌ Reject UID"):
+                raise ValueError("Approve/Reject button ব্যবহার করুন.")
+            with DB_LOCK:
+                conn = db()
+                try:
+                    row = conn.execute("SELECT * FROM uid_submissions WHERE id=? AND status='PENDING'", (sid,)).fetchone()
+                finally:
+                    conn.close()
+            if not row:
+                raise ValueError("UID already reviewed.")
+            if text == "✅ Approve UID":
+                with DB_LOCK:
+                    conn = db()
+                    try:
+                        conflict = conn.execute(
+                            "SELECT id,user_id FROM uid_submissions WHERE lower(trim(quotex_uid))=lower(trim(?)) AND id<>? AND status IN ('PENDING','APPROVED')",
+                            (row["quotex_uid"], sid)).fetchone()
+                        if conflict:
+                            raise ValueError(f"এই Quotex UID অন্য Telegram account-এ already linked: {conflict['user_id']}")
+                        vip_until = (now_bd() + timedelta(days=30)).isoformat()
+                        conn.execute("UPDATE uid_submissions SET status='APPROVED',reviewed_at=? WHERE id=?", (utc_iso(now_utc()), sid))
+                        conn.execute("UPDATE users SET status='VIP',vip_until=? WHERE user_id=?", (vip_until, row["user_id"]))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                audit_admin(user_id, "APPROVE_UID", "UID", sid, f"UID {row['quotex_uid']} -> TG {row['user_id']}")
+                try:
+                    bot.send_message(row["user_id"], "⭐ আপনার VIP approved হয়েছে.", reply_markup=main_keyboard(row["user_id"]))
+                except Exception:
+                    pass
             else:
-
-                float(value)
-
-
-            mm_set(
-                user_id,
-                key,
-                value
-            )
-
-
-            clear_state(
-                user_id
-            )
-
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Money Management value saved.",
-                reply_markup=mm_keyboard()
-            )
-
+                with DB_LOCK:
+                    conn = db()
+                    try:
+                        conn.execute("UPDATE uid_submissions SET status='REJECTED',reviewed_at=? WHERE id=?", (utc_iso(now_utc()), sid))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                audit_admin(user_id, "REJECT_UID", "UID", sid, f"UID {row['quotex_uid']} rejected")
+                try:
+                    bot.send_message(row["user_id"], "❌ আপনার UID rejected হয়েছে.", reply_markup=main_keyboard(row["user_id"]))
+                except Exception:
+                    pass
+            clear_state(user_id)
+            bot.send_message(message.chat.id, "✅ UID review complete.", reply_markup=admin_keyboard())
             return True
 
-
-        # ====================================================
-        # WITHDRAW
-        # ====================================================
-
-        if action == "withdraw":
-
-            stage = state.get(
-                "stage",
-                "amount"
-            )
-
-
-            # ----------------------------
-            # Amount
-            # ----------------------------
-
-            if stage == "amount":
-
-                amount_cents = int(
-                    round(
-                        float(
-                            text.replace(
-                                "$",
-                                ""
-                            )
-                        )
-                        * 100
-                    )
-                )
-
-
-                minimum = int(
-                    round(
-                        float(
-                            get_setting(
-                                "min_withdraw",
-                                "5.00"
-                            )
-                        )
-                        * 100
-                    )
-                )
-
-
-                current_user = get_user(
-                    user_id
-                )
-
-
-                if get_setting(
-                    "withdrawals",
-                    "ON"
-                ) != "ON":
-
-                    raise ValueError(
-                        "Withdrawals বর্তমানে OFF."
-                    )
-
-
-                if amount_cents < minimum:
-
-                    raise ValueError(
-                        "Minimum withdrawal: "
-                        f"${minimum/100:.2f}"
-                    )
-
-
-                if (
-                    amount_cents
-                    >
-                    current_user["wallet_cents"]
-                ):
-
-                    raise ValueError(
-                        "Wallet balance যথেষ্ট নয়."
-                    )
-
-
-                STATES[user_id] = {
-
-                    "action": "withdraw",
-
-                    "stage": "method",
-
-                    "amount": amount_cents
-
-                }
-
-
-                bot.send_message(
-                    message.chat.id,
-                    "💸 Method পাঠান.\n"
-                    "Example: bKash / Nagad / Bank",
-                    reply_markup=back_keyboard()
-                )
-
-                return True
-
-
-            # ----------------------------
-            # Method
-            # ----------------------------
-
-            if stage == "method":
-
-                STATES[user_id].update({
-
-                    "stage": "account",
-
-                    "method": text
-
-                })
-
-
-                bot.send_message(
-                    message.chat.id,
-                    "Account/Number পাঠান.",
-                    reply_markup=back_keyboard()
-                )
-
-                return True
-
-
-            # ----------------------------
-            # Account
-            # ----------------------------
-
-            amount_cents = state[
-                "amount"
+        if action == "withdraw_select":
+            m = re.match(r"💸 #(\d+)", text)
+            if not m:
+                raise ValueError("একটি withdrawal button নির্বাচন করুন.")
+            wid = int(m.group(1))
+            with DB_LOCK:
+                conn = db()
+                try:
+                    w = conn.execute("SELECT * FROM withdrawals WHERE id=? AND status='PENDING'", (wid,)).fetchone()
+                finally:
+                    conn.close()
+            if not w:
+                raise ValueError("Pending withdrawal পাওয়া যায়নি.")
+            risk, note, report = withdrawal_risk(w)
+            save_withdrawal_risk(wid, risk, note)
+            lines = [
+                f"💸 <b>WITHDRAWAL #{wid}</b>",
+                f"User: <code>{w['user_id']}</code>",
+                f"Amount: <b>{money(w['amount_cents'])}</b>",
+                f"Method: {escape(w['method'])}",
+                f"Account: <code>{escape(w['account'])}</code>",
+                f"\n👥 Referrals: {report['total']} | Valid: {report['valid']}",
+                f"Referral earnings: {money(report['bonus'])}"
             ]
-
-            method = state[
-                "method"
-            ]
-
-            account = text
-
-
-            with DB_LOCK:
-
-                conn = db()
-
-                try:
-
-                    current = conn.execute(
-                        """
-                        SELECT wallet_cents
-                        FROM users
-                        WHERE user_id=?
-                        """,
-                        (
-                            user_id,
-                        )
-                    ).fetchone()
-
-
-                    if (
-                        not current
-                        or
-                        current["wallet_cents"]
-                        <
-                        amount_cents
-                    ):
-
-                        raise ValueError(
-                            "Wallet balance যথেষ্ট নয়."
-                        )
-
-
-                    conn.execute(
-                        """
-                        UPDATE users
-
-                        SET
-                            wallet_cents=
-                                wallet_cents-?
-
-                        WHERE
-                            user_id=?
-                            AND wallet_cents>=?
-                        """,
-                        (
-                            amount_cents,
-                            user_id,
-                            amount_cents
-                        )
-                    )
-
-
-                    conn.execute(
-                        """
-                        INSERT INTO withdrawals(
-                            user_id,
-                            amount_cents,
-                            method,
-                            account,
-                            created_at
-                        )
-                        VALUES(?,?,?,?,?)
-                        """,
-                        (
-                            user_id,
-                            amount_cents,
-                            method,
-                            account,
-                            utc_iso(now_utc())
-                        )
-                    )
-
-
-                    conn.execute(
-                        """
-                        INSERT INTO wallet_tx(
-                            user_id,
-                            amount_cents,
-                            kind,
-                            note,
-                            created_at
-                        )
-                        VALUES(?,?,?,?,?)
-                        """,
-                        (
-                            user_id,
-                            -amount_cents,
-                            "WITHDRAW_HOLD",
-                            "Withdrawal request",
-                            utc_iso(now_utc())
-                        )
-                    )
-
-
-                    conn.commit()
-
-                finally:
-
-                    conn.close()
-
-
-            clear_state(
-                user_id
-            )
-
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Withdrawal request submitted.",
-                reply_markup=main_keyboard(
-                    user_id
-                )
-            )
-
-
-            try:
-
-                bot.send_message(
-
-                    ADMIN_ID,
-
-                    "💸 <b>WITHDRAWAL PENDING</b>\n\n"
-
-                    f"User: "
-                    f"<code>{user_id}</code>\n"
-
-                    f"Amount: "
-                    f"<b>${amount_cents/100:.2f}</b>\n"
-
-                    f"Method: "
-                    f"{escape(method)}\n"
-
-                    f"Account: "
-                    f"<code>{escape(account)}</code>"
-
-                )
-
-            except Exception:
-
-                pass
-
-
+            if report["referred"]:
+                lines.append("\n📋 <b>Referred users:</b>")
+                lines += [f"• {r['user_id']} @{escape(r['username'] or 'none')} | {r['referral_at'] or 'bonus pending'}" for r in report["referred"][:20]]
+            lines.append("\n⚠️ <b>Review status:</b> " + risk)
+            if note:
+                lines.append(escape(note))
+            STATES[user_id] = {"action":"withdraw_review_buttons", "withdrawal_id":wid}
+            bot.send_message(message.chat.id, "\n".join(lines), reply_markup=make_keyboard([
+                ["🔍 Referral Details", "📜 User History"],
+                ["✅ Approve Withdrawal", "❌ Reject Withdrawal"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ]))
             return True
 
-
-        # ====================================================
-        # WITHDRAW REVIEW
-        # ====================================================
-
-        if action == "withdraw_review":
-
-            parts = text.lower().split()
-
-
-            if (
-                len(parts) != 2
-                or
-                parts[0]
-                not in (
-                    "approve",
-                    "reject"
-                )
-            ):
-
-                raise ValueError(
-                    "approve ID অথবা reject ID"
-                )
-
-
-            withdrawal_id = int(
-                parts[1]
-            )
-
-
-            with DB_LOCK:
-
-                conn = db()
-
-                try:
-
-                    withdrawal = conn.execute(
-                        """
-                        SELECT *
-                        FROM withdrawals
-
-                        WHERE
-                            id=?
-                            AND status='PENDING'
-                        """,
-                        (
-                            withdrawal_id,
-                        )
-                    ).fetchone()
-
-                finally:
-
-                    conn.close()
-
-
-            if not withdrawal:
-
-                raise ValueError(
-                    "Withdrawal পাওয়া যায়নি."
-                )
-
-
-            if parts[0] == "approve":
-
-                new_status = "APPROVED"
-
-
-            else:
-
-                new_status = "REJECTED"
-
-
-            with DB_LOCK:
-
-                conn = db()
-
-                try:
-
-                    conn.execute(
-                        """
-                        UPDATE withdrawals
-
-                        SET
-                            status=?,
-                            reviewed_at=?
-
-                        WHERE id=?
-                        """,
-                        (
-                            new_status,
-                            utc_iso(now_utc()),
-                            withdrawal_id
-                        )
-                    )
-
-
-                    if new_status == "REJECTED":
-
-                        conn.execute(
-                            """
-                            UPDATE users
-
-                            SET
-                                wallet_cents=
-                                    wallet_cents+?
-
-                            WHERE user_id=?
-                            """,
-                            (
-                                withdrawal["amount_cents"],
-                                withdrawal["user_id"]
-                            )
-                        )
-
-
-                        conn.execute(
-                            """
-                            INSERT INTO wallet_tx(
-                                user_id,
-                                amount_cents,
-                                kind,
-                                note,
-                                created_at
-                            )
-                            VALUES(?,?,?,?,?)
-                            """,
-                            (
-                                withdrawal["user_id"],
-                                withdrawal["amount_cents"],
-                                "WITHDRAW_REFUND",
-                                "Rejected withdrawal",
-                                utc_iso(now_utc())
-                            )
-                        )
-
-
-                    conn.commit()
-
-                finally:
-
-                    conn.close()
-
-
-            clear_state(
-                user_id
-            )
-
-
-            bot.send_message(
-                message.chat.id,
-                "✅ Withdrawal review complete.",
-                reply_markup=admin_keyboard()
-            )
-
-
-            try:
-
-                bot.send_message(
-                    withdrawal["user_id"],
-
-                    "💸 Withdrawal update:\n\n"
-                    f"Amount: "
-                    f"${withdrawal['amount_cents']/100:.2f}\n"
-                    f"Status: "
-                    f"<b>{new_status}</b>",
-
-                    reply_markup=main_keyboard(
-                        withdrawal["user_id"]
-                    )
-                )
-
-            except Exception:
-
-                pass
-
-
-            return True
-
-
-        # ====================================================
-        # FREE LIMIT
-        # ====================================================
-
-        if action == "set_free_limit":
-
-            value = int(
-                text
-            )
-
-
-            if value < 0:
-
-                raise ValueError(
-                    "Limit negative হতে পারে না."
-                )
-
-
-            set_setting(
-                "free_limit",
-                value
-            )
-
-
-            clear_state(
-                user_id
-            )
-
-
-            bot.send_message(
-                message.chat.id,
-                f"🎟️ Free limit updated: "
-                f"<b>{value}</b>",
-                reply_markup=admin_keyboard()
-            )
-
-            return True
-
-
-        # ====================================================
-        # MIN WITHDRAW
-        # ====================================================
-
-        if action == "set_min_withdraw":
-
-            value = float(
-                text.replace(
-                    "$",
-                    ""
-                )
-            )
-
-
-            if value < 0:
-
-                raise ValueError(
-                    "Minimum negative হতে পারে না."
-                )
-
-
-            set_setting(
-                "min_withdraw",
-                f"{value:.2f}"
-            )
-
-
-            clear_state(
-                user_id
-            )
-
-
-            bot.send_message(
-                message.chat.id,
-                f"💵 Minimum withdrawal: "
-                f"<b>${value:.2f}</b>",
-                reply_markup=admin_keyboard()
-            )
-
-            return True
-
-
-        raise ValueError(
-            "এই operation-এর input বুঝতে পারিনি."
-        )
-
-
-    except Exception as exc:
-
-        bot.send_message(
-
-            message.chat.id,
-
-            f"❌ <b>Error</b>\n\n"
-            f"{escape(str(exc))}\n\n"
-            "আবার চেষ্টা করুন অথবা /cancel দিন.",
-
-            reply_markup=back_keyboard()
-        )
-
-
-    return True
-
-
-# ============================================================
-# MAIN MESSAGE ROUTER
-# ============================================================
-
-@bot.message_handler(
-    content_types=["text"]
-)
-def message_router(message):
-
-    user_id = message.from_user.id
-
-    text = (
-        message.text or ""
-    ).strip()
-
-
-    # Always register user.
-    register_user(
-        message.from_user
-    )
-
-
-    # Active state gets priority.
-    if user_id in STATES:
-
-        handle_state(
-            message
-        )
-
-        return
-
-
-    # Navigation.
-    if text == "🏠 Main Menu":
-
-        send_main_menu(
-            message.chat.id,
-            user_id,
-            "🏠 <b>Main Menu</b>"
-        )
-
-        return
-
-
-    if text == "🔙 Back":
-
-        send_main_menu(
-            message.chat.id,
-            user_id,
-            "🔙 Back to Main Menu"
-        )
-
-        return
-
-
-    # Maintenance.
-    if maintenance_blocked(
-        user_id
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "🛠️ Bot maintenance mode-এ আছে.",
-            reply_markup=main_keyboard(
-                user_id
-            )
-        )
-
-        return
-
-
-    # ========================================================
-    # USER MENU
-    # ========================================================
-
-    if text == "📊 Future Signals":
-
-        future_signal_menu(
-            message
-        )
-
-        return
-
-
-    if text == "⚡ Live Signals":
-
-        live_signal_menu(
-            message
-        )
-
-        return
-
-
-    if text == "🗳️ Vote":
-
-        vote_menu(
-            message
-        )
-
-        return
-
-
-    if text == "📈 Signal Result":
-
-        result_menu(
-            message
-        )
-
-        return
-
-
-    if text == "👤 My Status":
-
-        status_menu(
-            message
-        )
-
-        return
-
-
-    if text == "🆔 Submit Quotex UID":
-
-        start_uid_submission(
-            message
-        )
-
-        return
-
-
-    if text == "💰 Money Management":
-
-        mm_menu(
-            message
-        )
-
-        return
-
-
-    if text == "💵 Wallet":
-
-        wallet_menu(
-            message
-        )
-
-        return
-
-
-    if text == "💸 Request Withdraw":
-
-        STATES[user_id] = {
-            "action": "withdraw",
-            "stage": "amount"
-        }
-
-
-        bot.send_message(
-
-            message.chat.id,
-
-            "💸 Withdrawal amount USD পাঠান.\n\n"
-
-            f"Minimum: "
-            f"${get_setting('min_withdraw','5.00')}",
-
-            reply_markup=back_keyboard()
-        )
-
-        return
-
-
-    if text == "👥 Referral Link":
-
-        referral_menu(
-            message
-        )
-
-        return
-
-
-    if text == "📜 Signal History":
-
-        signal_history(
-            message
-        )
-
-        return
-
-
-    if text == "📖 VIP Rules":
-
-        vip_rules(
-            message
-        )
-
-        return
-
-
-    if text == "📜 Trading Contract":
-
-        trading_contract(
-            message
-        )
-
-        return
-
-
-    if text == "🔔 Notifications":
-
-        notification_menu(
-            message
-        )
-
-        return
-
-
-    if text == "🔔 Toggle Notifications":
-
-        toggle_notifications(
-            message
-        )
-
-        return
-
-
-    if text == "❓ Help / FAQ":
-
-        help_menu(
-            message
-        )
-
-        return
-
-
-    # ========================================================
-    # MONEY MANAGEMENT BUTTONS
-    # ========================================================
-
-    mm_buttons = {
-
-        "💵 Set Balance":
-            "balance",
-
-        "🎯 Set Profit Target":
-            "profit_target",
-
-        "🛑 Set Loss Limit":
-            "loss_limit",
-
-        "💲 Set Base Trade":
-            "base_trade",
-
-        "1️⃣ Set M1 Trade":
-            "m1_trade",
-
-        "🔢 Max Trades/Day":
-            "max_trades"
-
-    }
-
-
-    if text in mm_buttons:
-
-        STATES[user_id] = {
-
-            "action": "mm",
-
-            "key":
-                mm_buttons[text]
-
-        }
-
-
-        bot.send_message(
-
-            message.chat.id,
-
-            f"Enter "
-            f"<b>"
-            f"{mm_buttons[text].replace('_',' ').title()}"
-            f"</b>:",
-
-            reply_markup=back_keyboard()
-        )
-
-        return
-
-
-    if text == "📊 MM Status":
-
-        mm_menu(
-            message
-        )
-
-        return
-
-
-    if text == "🛑 Stop MM Today":
-
-        mm_set(
-            user_id,
-            "stop_mm",
-            "ON"
-        )
-
-
-        bot.send_message(
-            message.chat.id,
-            "🛑 Money Management আজকের জন্য stopped.",
-            reply_markup=mm_keyboard()
-        )
-
-        return
-
-
-    # ========================================================
-    # ADMIN
-    # ========================================================
-
-    if text == "👑 Admin Control":
-
-        admin_panel(
-            message
-        )
-
-        return
-
-
-    if (
-        is_master(user_id)
-        or
-        get_permissions(user_id)
-    ):
-
-        handle_admin_button(
-            message
-        )
-
-        return
-
-
-    # ========================================================
-    # UNKNOWN
-    # ========================================================
-
-    bot.send_message(
-
-        message.chat.id,
-
-        "❌ এই option বুঝতে পারিনি.\n"
-        "নিচের menu থেকে option নির্বাচন করুন.",
-
-        reply_markup=main_keyboard(
-            user_id
-        )
-    )
-
-
-# ============================================================
-# DATABASE BACKUP
-# ============================================================
-
-def backup_database():
-
-    try:
-
-        if not os.path.exists(
-            DB_FILE
-        ):
-
-            return
-
-
-        filename = (
-            "bot_database_"
-            +
-            now_bd().strftime(
-                "%Y%m%d_%H%M%S"
-            )
-            +
-            ".db"
-        )
-
-
-        backup_path = os.path.join(
-            BACKUP_DIR,
-            filename
-        )
-
-
-        source = sqlite3.connect(
-            DB_FILE
-        )
-
-        destination = sqlite3.connect(
-            backup_path
-        )
-
-
-        try:
-
-            source.backup(
-                destination
-            )
-
-        finally:
-
-            destination.close()
-            source.close()
-
-
-        files = sorted(
-
-            [
-                os.path.join(
-                    BACKUP_DIR,
-                    filename
-                )
-
-                for filename
-                in os.listdir(
-                    BACKUP_DIR
-                )
-
-                if filename.endswith(".db")
-            ],
-
-            key=os.path.getmtime,
-
-            reverse=True
-
-        )
-
-
-        # Keep newest 7 backups.
-        for old_file in files[7:]:
-
-            try:
-
-                os.remove(
-                    old_file
-                )
-
-            except Exception:
-
-                pass
-
-
-        logger.info(
-            "Database backup created."
-        )
-
-
-    except Exception:
-
-        logger.exception(
-            "Backup failed."
-        )
-
-
-def backup_loop():
-
-    while True:
-
-        time.sleep(
-            6 * 60 * 60
-        )
-
-        backup_database()
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def main():
-
-    init_db()
-
-    backup_database()
-
-
-    threading.Thread(
-        target=auto_signal_loop,
-        daemon=True
-    ).start()
-
-
-    threading.Thread(
-        target=backup_loop,
-        daemon=True
-    ).start()
-
-
-    logger.info(
-        "SM QUATEX SURE SHORT started."
-    )
-
-
-    while True:
-
-        try:
-
-            bot.infinity_polling(
-
-                skip_pending=True,
-
-                timeout=30,
-
-                long_polling_timeout=30
-
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Polling crashed."
-            )
-
-            time.sleep(
-                5
-            )
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
