@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import sqlite3
@@ -803,7 +804,7 @@ def back_keyboard():
     ])
 
 
-def admin_keyboard():
+def legacy_admin_keyboard():
 
     return make_keyboard([
 
@@ -2013,72 +2014,44 @@ def send_main_menu(
     commands=["start"]
 )
 def start_command(message):
+    """Reliable /start entry point, including Telegram referral deep-links."""
+    user_id = message.from_user.id
+    referred_by = None
 
     try:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) == 2 and parts[1].startswith("ref_"):
+            raw_ref = parts[1][4:].strip()
+            if raw_ref.isdigit():
+                candidate = int(raw_ref)
+                if candidate != user_id:
+                    referred_by = candidate
 
-        referred_by = None
+        # Registration must never prevent the welcome message from being sent.
+        try:
+            register_user(message.from_user, referred_by)
+            reset_cycle_if_needed(user_id)
+        except Exception:
+            logger.exception("/start registration failed for user %s", user_id)
 
-        parts = (
-            message.text or ""
-        ).split(
-            maxsplit=1
-        )
-
-
-        if (
-            len(parts) == 2
-            and
-            parts[1].startswith("ref_")
-        ):
-
-            try:
-
-                referred_by = int(
-                    parts[1][4:]
-                )
-
-            except ValueError:
-
-                referred_by = None
-
-
-        register_user(
-            message.from_user,
-            referred_by
-        )
-
-        reset_cycle_if_needed(
-            message.from_user.id
-        )
-
-
-        welcome = get_setting(
-            "welcome",
-            "🎉 Welcome!"
-        )
-
+        welcome = get_setting("welcome", "🎉 Welcome!")
+        if not welcome:
+            welcome = "🎉 Welcome!"
 
         bot.send_message(
             message.chat.id,
             welcome,
-            reply_markup=main_keyboard(
-                message.from_user.id
-            )
+            reply_markup=main_keyboard(user_id)
         )
-
-
     except Exception:
-
-        logger.exception(
-            "Start error"
-        )
-
-
-        bot.send_message(
-            message.chat.id,
-            "❌ /start process করা যায়নি। "
-            "আবার /start দিন।"
-        )
+        logger.exception("/start send failed for user %s", user_id)
+        try:
+            bot.send_message(
+                message.chat.id,
+                "❌ /start process করা যায়নি। আবার /start দিন।"
+            )
+        except Exception:
+            logger.exception("Could not send /start error to user %s", user_id)
 
 
 # ============================================================
@@ -2493,7 +2466,7 @@ def wallet_menu(message):
 # REFERRAL
 # ============================================================
 
-def referral_menu(message):
+def legacy_referral_menu(message):
 
     user_id = message.from_user.id
 
@@ -3858,7 +3831,7 @@ def admin_users(message):
 # ADMIN: SUB ADMINS
 # ============================================================
 
-def admin_subadmins(message):
+def legacy_admin_subadmins(message):
 
     if not is_master(
         message.from_user.id
@@ -3904,7 +3877,7 @@ def admin_subadmins(message):
 # ADMIN: NOTIFICATION TARGETS
 # ============================================================
 
-def admin_notify_targets(message):
+def legacy_admin_notify_targets(message):
 
     if not is_master(
         message.from_user.id
@@ -4069,10 +4042,87 @@ def admin_settings(message):
 
 
 # ============================================================
+# ADMIN: USER-FRIENDLY SETTINGS CENTER
+# ============================================================
+
+def admin_settings_center_keyboard():
+    return make_keyboard([
+        ["🛠️ Maintenance ON/OFF", "⚡ Live ON/OFF"],
+        ["📤 Auto Send ON/OFF", "🔔 Auto Notification ON/OFF"],
+        ["💸 Withdraw ON/OFF", "⏳ Set Withdraw Hold"],
+        ["🎟️ Set Free Limit", "💵 Set Min Withdraw"],
+        ["👥 Set Referral Bonus", "🎯 Set Confidence"],
+        ["📜 Edit Trading Contract", "📝 Bot Text Editor"],
+        ["💾 Create DB Backup", "📊 Settings Summary"],
+        ["🔙 Back", "🏠 Main Menu"],
+    ])
+
+
+def admin_settings_center(message):
+    """Button-driven settings hub for the master admin/sub-admins."""
+    uid = message.from_user.id
+    if not can(uid, "settings"):
+        return bot.send_message(
+            message.chat.id,
+            "⛔ এই Settings section-এর permission আপনার নেই.",
+            reply_markup=admin_keyboard()
+        )
+
+    maintenance = get_setting("maintenance", "OFF")
+    live_mode = get_setting("live_mode", "ON")
+    auto_send = get_setting("auto_send", "ON")
+    withdrawals = get_setting("withdrawals", "ON")
+    auto_notification = get_setting("auto_notification", "ON")
+    free_limit = get_setting("free_limit", "4")
+    min_withdraw = get_setting("min_withdraw", "5.00")
+    hold_hours = get_setting("withdraw_hold_hours", "0")
+    referral_bonus = get_setting("referral_bonus", "1.00")
+    confidence = get_setting("confidence", "95-99%")
+
+    text = (
+        "⚙️ <b>ADMIN SETTINGS CENTER</b>\n\n"
+        f"🛠 Maintenance: <b>{escape(maintenance)}</b>\n"
+        f"⚡ Live Mode: <b>{escape(live_mode)}</b>\n"
+        f"📤 Auto Send: <b>{escape(auto_send)}</b>\n"
+        f"💸 Withdrawals: <b>{escape(withdrawals)}</b>\n"
+        f"🔔 Auto Notification: <b>{escape(auto_notification)}</b>\n"
+        f"🎟 Free Limit / 2 days: <b>{escape(free_limit)}</b>\n"
+        f"💵 Minimum Withdraw: <b>${escape(min_withdraw)}</b>\n"
+        f"⏳ Withdraw Hold: <b>{escape(hold_hours)}h</b>\n"
+        f"👥 Base Referral Bonus: <b>${escape(referral_bonus)}</b>\n"
+        f"🎯 Signal Confidence Text: <b>{escape(confidence)}</b>\n\n"
+        "নিচের button থেকে সরাসরি পরিবর্তন করুন।"
+    )
+
+    return bot.send_message(message.chat.id, text, reply_markup=admin_settings_center_keyboard())
+
+
+def admin_settings_summary(message):
+    uid = message.from_user.id
+    if not can(uid, "settings"):
+        return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
+    values = [
+        ("Maintenance", "maintenance", "OFF"),
+        ("Live Mode", "live_mode", "ON"),
+        ("Auto Send", "auto_send", "ON"),
+        ("Auto Notification", "auto_notification", "ON"),
+        ("Withdrawals", "withdrawals", "ON"),
+        ("Free Limit", "free_limit", "4"),
+        ("Minimum Withdraw", "min_withdraw", "5.00"),
+        ("Withdraw Hold Hours", "withdraw_hold_hours", "0"),
+        ("Referral Bonus", "referral_bonus", "1.00"),
+        ("Confidence", "confidence", "95-99%"),
+    ]
+    lines = ["📊 <b>SETTINGS SUMMARY</b>"]
+    for label, key, default in values:
+        lines.append(f"• {label}: <b>{escape(get_setting(key, default))}</b>")
+    return bot.send_message(message.chat.id, "\n".join(lines), reply_markup=make_keyboard([["⚙️ Settings"], ["🔙 Back", "🏠 Main Menu"]]))
+
+# ============================================================
 # ADMIN: TEXT EDITOR
 # ============================================================
 
-def admin_text_editor(message):
+def legacy_admin_text_editor(message):
 
     STATES[
         message.from_user.id
@@ -4114,7 +4164,7 @@ def admin_text_editor(message):
 # ADMIN ROUTER
 # ============================================================
 
-def handle_admin_button(message):
+def legacy_handle_admin_button(message):
 
     text = message.text
     user_id = message.from_user.id
@@ -4410,7 +4460,7 @@ def handle_admin_button(message):
 # STATE HANDLER
 # ============================================================
 
-def handle_state(message):
+def legacy_handle_state(message):
 
     user_id = message.from_user.id
 
@@ -7183,10 +7233,10 @@ def message_router(message):
 # per-signal inline WIN/LOSE/SKIP buttons, UID protection, button-based admin
 # tools, and persistent migrations.
 
-LEGACY_HANDLE_STATE = handle_state
-LEGACY_ADMIN_KEYBOARD = admin_keyboard
-LEGACY_HANDLE_ADMIN_BUTTON = handle_admin_button
-LEGACY_REFERRAL_MENU = referral_menu
+LEGACY_HANDLE_STATE = legacy_handle_state
+LEGACY_ADMIN_KEYBOARD = legacy_admin_keyboard
+LEGACY_HANDLE_ADMIN_BUTTON = legacy_handle_admin_button
+LEGACY_REFERRAL_MENU = legacy_referral_menu
 
 REFERRAL_LEVEL_DEFAULTS = [
     (0, 100, 1.00),
@@ -7604,10 +7654,22 @@ def handle_admin_button(message):
         "➕ Add Future Signals":"signals","📋 Future Signal List":"signals","✏️ Edit Signal":"signals","🗑️ Delete Signal":"signals","🧹 Clear Future Signals":"signals","📤 Auto Send ON/OFF":"signals","🎯 Signal Audience":"signals",
         "⚡ Live Session":"live","🆔 Pending UID":"uid","⭐ Manage VIP":"vip","💸 Withdrawals":"withdraw","📊 Withdrawal Reports":"withdraw","👥 Referral History":"analytics","💳 Wallet Adjust":"wallet","📢 Broadcast":"broadcast","👥 Users":"users","📊 Analytics":"analytics","📈 Result Stats":"analytics","🎯 Notify Targets":"notifications","⚙️ Settings":"settings","📝 Bot Text Editor":"text","🎟️ Set Free Limit":"settings","💵 Set Min Withdraw":"settings","💸 Withdraw ON/OFF":"settings","🛠️ Maintenance ON/OFF":"settings","⚡ Live ON/OFF":"settings","🔔 Auto Notification ON/OFF":"notifications"
     }
-    if text in permission_map and not can(uid, permission_map[text]):
-        return bot.send_message(message.chat.id,"⛔ You do not have permission for this section.",reply_markup=admin_keyboard())
+    if text in permission_map:
+        required = permission_map[text]
+        allowed = can(uid, required)
+        # Settings permission intentionally includes the operational toggles
+        # shown inside the Settings Center, so sub-admins do not get confusing
+        # "access denied" messages after entering Settings.
+        if not allowed and required in ("signals", "notifications", "live"):
+            allowed = can(uid, "settings")
+        if not allowed:
+            return bot.send_message(message.chat.id,"⛔ You do not have permission for this section.",reply_markup=admin_keyboard())
     if text=="📈 Result Stats":
         return admin_result_stats(message)
+    if text=="⚙️ Settings":
+        return admin_settings_center(message)
+    if text=="📊 Settings Summary":
+        return admin_settings_summary(message)
     if text=="📊 Withdrawal Reports": return admin_withdrawal_report(message)
     if text=="👥 Referral History": return admin_referral_history(message)
     if text=="➕ Add Sub Admin":
@@ -7644,6 +7706,40 @@ def handle_admin_button(message):
     if text=="🔔 Auto Notification ON/OFF":
         if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
         old=get_setting("auto_notification","ON"); new="OFF" if old=="ON" else "ON"; set_setting("auto_notification",new); return bot.send_message(message.chat.id,f"🔔 Auto Notification: <b>{new}</b>",reply_markup=admin_keyboard())
+    if text == "⏳ Set Withdraw Hold":
+        if not can(uid, "settings"):
+            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
+        STATES[uid] = {"action": "settings_set_hold"}
+        return bot.send_message(message.chat.id, "⏳ Withdrawal hold কত ঘণ্টা হবে?\n0 = no hold\nExample: 24", reply_markup=back_keyboard())
+
+    if text == "👥 Set Referral Bonus":
+        if not can(uid, "settings"):
+            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
+        STATES[uid] = {"action": "settings_set_ref_bonus"}
+        return bot.send_message(message.chat.id, "👥 Base referral bonus USD লিখুন.\nExample: 1.00", reply_markup=back_keyboard())
+
+    if text == "🎯 Set Confidence":
+        if not can(uid, "settings"):
+            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
+        STATES[uid] = {"action": "settings_set_confidence"}
+        return bot.send_message(message.chat.id, "🎯 Signal confidence text লিখুন.\nExample: 95–99%", reply_markup=back_keyboard())
+
+    if text == "📜 Edit Trading Contract":
+        if not can(uid, "settings"):
+            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
+        STATES[uid] = {"action": "settings_edit_contract"}
+        return bot.send_message(message.chat.id, "📜 নতুন Trading Contract text লিখুন:", reply_markup=back_keyboard())
+
+    if text == "💾 Create DB Backup":
+        if not is_master(uid):
+            return bot.send_message(message.chat.id, "⛔ Master Admin only.", reply_markup=admin_keyboard())
+        try:
+            backup_database()
+            return bot.send_message(message.chat.id, "✅ Database backup created successfully.", reply_markup=admin_settings_center_keyboard())
+        except Exception as exc:
+            logger.exception("Manual backup failed")
+            return bot.send_message(message.chat.id, "❌ Backup failed: " + escape(str(exc)), reply_markup=admin_settings_center_keyboard())
+
     # Preserve all legacy admin buttons and handlers.
     return LEGACY_HANDLE_ADMIN_BUTTON(message)
 
@@ -7820,12 +7916,22 @@ def handle_state(message):
                     r=conn.execute("SELECT * FROM withdrawals WHERE id=? AND status='PENDING'",(wid,)).fetchone()
                     if not r: raise ValueError("Withdrawal already processed.")
                     if text=="✅ Approve Withdrawal":
-                        if r["hold_until"]:
+                        hold_until = r["hold_until"]
+                        if hold_until:
                             try:
-                                if datetime.fromisoformat(r["hold_until"]).astimezone(UTC)>now_utc(): raise ValueError("Withdrawal hold এখনও শেষ হয়নি.")
-                            except ValueError as e:
-                                if "hold" in str(e): raise
-                        conn.execute("UPDATE withdrawals SET status='APPROVED',reviewed_at=?,reviewed_by=? WHERE id=? AND status='PENDING'",(utc_iso(now_utc()),uid,wid))
+                                hold_dt = datetime.fromisoformat(hold_until)
+                                if hold_dt.tzinfo is None:
+                                    hold_dt = hold_dt.replace(tzinfo=UTC)
+                                if hold_dt.astimezone(UTC) > now_utc():
+                                    raise ValueError("Withdrawal hold এখনও শেষ হয়নি.")
+                            except ValueError:
+                                # Includes both an active hold and malformed stored data.
+                                raise
+                            except Exception as exc:
+                                raise ValueError("Withdrawal hold data invalid; manual review required.") from exc
+                        updated = conn.execute("UPDATE withdrawals SET status='APPROVED',reviewed_at=?,reviewed_by=? WHERE id=? AND status='PENDING'",(utc_iso(now_utc()),uid,wid))
+                        if updated.rowcount != 1:
+                            raise ValueError("Withdrawal already processed.")
                         note="Withdrawal approved"
                     else:
                         conn.execute("UPDATE withdrawals SET status='REJECTED',reviewed_at=?,reviewed_by=?,review_note=? WHERE id=? AND status='PENDING'",(utc_iso(now_utc()),uid,"Rejected by admin",wid))
@@ -7866,6 +7972,35 @@ def handle_state(message):
                 finally: conn.close()
             admin_audit(uid,"RESULT_REVEAL",sid,result or "HIDDEN")
             clear_state(uid); bot.send_message(message.chat.id,"✅ Result setting updated.",reply_markup=admin_keyboard()); return True
+        if action == "settings_set_hold":
+            if not text.isdigit() or int(text) < 0 or int(text) > 720:
+                raise ValueError("0 থেকে 720 ঘণ্টার মধ্যে দিন.")
+            set_setting("withdraw_hold_hours", str(int(text)))
+            clear_state(uid)
+            bot.send_message(message.chat.id, "✅ Withdrawal hold updated.", reply_markup=admin_settings_center(message))
+            return True
+        if action == "settings_set_ref_bonus":
+            value = float(text.replace("$", "").strip())
+            if value < 0 or value > 1000:
+                raise ValueError("Referral bonus 0–1000 USD-এর মধ্যে দিন.")
+            set_setting("referral_bonus", f"{value:.2f}")
+            clear_state(uid)
+            bot.send_message(message.chat.id, "✅ Referral bonus updated.", reply_markup=admin_settings_center(message))
+            return True
+        if action == "settings_set_confidence":
+            if len(text) < 1 or len(text) > 100:
+                raise ValueError("Confidence text 1–100 characters দিন.")
+            set_setting("confidence", text)
+            clear_state(uid)
+            bot.send_message(message.chat.id, "✅ Confidence text updated.", reply_markup=admin_settings_center(message))
+            return True
+        if action == "settings_edit_contract":
+            if len(text) < 1 or len(text) > 4000:
+                raise ValueError("Trading Contract 1–4000 characters দিন.")
+            set_setting("trading_rules", text)
+            clear_state(uid)
+            bot.send_message(message.chat.id, "✅ Trading Contract updated.", reply_markup=admin_settings_center(message))
+            return True
         # New withdrawal entry starts at method selection. Legacy amount-first state is intercepted below.
         if action=="withdraw":
             raise ValueError("Use the withdrawal buttons.")
@@ -8154,14 +8289,25 @@ def main():
 
         try:
 
+            # A stale webhook or skipped pending update can make /start appear dead
+            # immediately after deployment. Clear webhook state and process queued updates.
+            try:
+                bot.remove_webhook()
+            except Exception:
+                logger.exception("Webhook cleanup failed")
+
+            try:
+                me = bot.get_me()
+                logger.info("Telegram bot connected as @%s (%s)", getattr(me, "username", "unknown"), getattr(me, "id", "?"))
+            except Exception:
+                logger.exception("Telegram authentication check failed")
+                time.sleep(5)
+                continue
+
             bot.infinity_polling(
-
-                skip_pending=True,
-
+                skip_pending=False,
                 timeout=30,
-
                 long_polling_timeout=30
-
             )
 
         except Exception:
@@ -8182,4 +8328,3 @@ def main():
 if __name__ == "__main__":
 
     main()
-
