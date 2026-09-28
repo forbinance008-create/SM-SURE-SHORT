@@ -804,7 +804,7 @@ def back_keyboard():
     ])
 
 
-def legacy_admin_keyboard():
+def admin_keyboard():
 
     return make_keyboard([
 
@@ -2466,7 +2466,7 @@ def wallet_menu(message):
 # REFERRAL
 # ============================================================
 
-def legacy_referral_menu(message):
+def referral_menu(message):
 
     user_id = message.from_user.id
 
@@ -3479,94 +3479,36 @@ def admin_live_session(message):
 # ============================================================
 
 def admin_pending_uid(message):
-
-    if not can(
-        message.from_user.id,
-        "vip"
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Access denied.",
-            reply_markup=admin_keyboard()
-        )
-
+    uid = message.from_user.id
+    if not can(uid, "vip"):
+        bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
         return
 
-
     with DB_LOCK:
-
         conn = db()
-
         try:
-
             rows = conn.execute(
-                """
-                SELECT *
-                FROM uid_submissions
-
-                WHERE status='PENDING'
-
-                ORDER BY id ASC
-
-                LIMIT 20
-                """
+                "SELECT * FROM uid_submissions WHERE status='PENDING' ORDER BY id ASC LIMIT 20"
             ).fetchall()
-
         finally:
-
             conn.close()
 
-
     if not rows:
+        bot.send_message(message.chat.id, "📭 কোনো pending UID নেই.", reply_markup=admin_keyboard())
+        return
 
-        text = "📭 কোনো pending UID নেই."
-
-    else:
-
-        lines = [
-            "🆔 <b>PENDING UID</b>\n"
-        ]
-
-
-        for row in rows:
-
-            lines.append(
-
-                f"#{row['id']} | "
-                f"User: <code>{row['user_id']}</code> | "
-                f"UID: <code>"
-                f"{escape(row['quotex_uid'])}"
-                f"</code>"
-
-            )
-
-
-        text = "\n".join(
-            lines
+    bot.send_message(message.chat.id, "🆔 <b>PENDING UID</b>", reply_markup=admin_keyboard())
+    for row in rows:
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton("✅ Approve", callback_data=f"uidapprove:{row['id']}"),
+            types.InlineKeyboardButton("❌ Reject", callback_data=f"uidreject:{row['id']}")
         )
-
-
-    STATES[
-        message.from_user.id
-    ] = {
-        "action": "uid_review"
-    }
-
-
-    bot.send_message(
-
-        message.chat.id,
-
-        text
-        +
-        "\n\nApprove:\n"
-        "<code>approve ID</code>\n\n"
-        "Reject:\n"
-        "<code>reject ID</code>",
-
-        reply_markup=admin_keyboard()
-    )
+        bot.send_message(
+            message.chat.id,
+            f"#{row['id']}\n👤 User: <code>{row['user_id']}</code>\n🆔 UID: <code>{escape(row['quotex_uid'])}</code>\n📅 {escape(row['created_at'])}",
+            reply_markup=kb
+        )
 
 
 # ============================================================
@@ -3831,7 +3773,7 @@ def admin_users(message):
 # ADMIN: SUB ADMINS
 # ============================================================
 
-def legacy_admin_subadmins(message):
+def admin_subadmins(message):
 
     if not is_master(
         message.from_user.id
@@ -3877,7 +3819,7 @@ def legacy_admin_subadmins(message):
 # ADMIN: NOTIFICATION TARGETS
 # ============================================================
 
-def legacy_admin_notify_targets(message):
+def admin_notify_targets(message):
 
     if not is_master(
         message.from_user.id
@@ -4042,87 +3984,10 @@ def admin_settings(message):
 
 
 # ============================================================
-# ADMIN: USER-FRIENDLY SETTINGS CENTER
-# ============================================================
-
-def admin_settings_center_keyboard():
-    return make_keyboard([
-        ["🛠️ Maintenance ON/OFF", "⚡ Live ON/OFF"],
-        ["📤 Auto Send ON/OFF", "🔔 Auto Notification ON/OFF"],
-        ["💸 Withdraw ON/OFF", "⏳ Set Withdraw Hold"],
-        ["🎟️ Set Free Limit", "💵 Set Min Withdraw"],
-        ["👥 Set Referral Bonus", "🎯 Set Confidence"],
-        ["📜 Edit Trading Contract", "📝 Bot Text Editor"],
-        ["💾 Create DB Backup", "📊 Settings Summary"],
-        ["🔙 Back", "🏠 Main Menu"],
-    ])
-
-
-def admin_settings_center(message):
-    """Button-driven settings hub for the master admin/sub-admins."""
-    uid = message.from_user.id
-    if not can(uid, "settings"):
-        return bot.send_message(
-            message.chat.id,
-            "⛔ এই Settings section-এর permission আপনার নেই.",
-            reply_markup=admin_keyboard()
-        )
-
-    maintenance = get_setting("maintenance", "OFF")
-    live_mode = get_setting("live_mode", "ON")
-    auto_send = get_setting("auto_send", "ON")
-    withdrawals = get_setting("withdrawals", "ON")
-    auto_notification = get_setting("auto_notification", "ON")
-    free_limit = get_setting("free_limit", "4")
-    min_withdraw = get_setting("min_withdraw", "5.00")
-    hold_hours = get_setting("withdraw_hold_hours", "0")
-    referral_bonus = get_setting("referral_bonus", "1.00")
-    confidence = get_setting("confidence", "95-99%")
-
-    text = (
-        "⚙️ <b>ADMIN SETTINGS CENTER</b>\n\n"
-        f"🛠 Maintenance: <b>{escape(maintenance)}</b>\n"
-        f"⚡ Live Mode: <b>{escape(live_mode)}</b>\n"
-        f"📤 Auto Send: <b>{escape(auto_send)}</b>\n"
-        f"💸 Withdrawals: <b>{escape(withdrawals)}</b>\n"
-        f"🔔 Auto Notification: <b>{escape(auto_notification)}</b>\n"
-        f"🎟 Free Limit / 2 days: <b>{escape(free_limit)}</b>\n"
-        f"💵 Minimum Withdraw: <b>${escape(min_withdraw)}</b>\n"
-        f"⏳ Withdraw Hold: <b>{escape(hold_hours)}h</b>\n"
-        f"👥 Base Referral Bonus: <b>${escape(referral_bonus)}</b>\n"
-        f"🎯 Signal Confidence Text: <b>{escape(confidence)}</b>\n\n"
-        "নিচের button থেকে সরাসরি পরিবর্তন করুন।"
-    )
-
-    return bot.send_message(message.chat.id, text, reply_markup=admin_settings_center_keyboard())
-
-
-def admin_settings_summary(message):
-    uid = message.from_user.id
-    if not can(uid, "settings"):
-        return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
-    values = [
-        ("Maintenance", "maintenance", "OFF"),
-        ("Live Mode", "live_mode", "ON"),
-        ("Auto Send", "auto_send", "ON"),
-        ("Auto Notification", "auto_notification", "ON"),
-        ("Withdrawals", "withdrawals", "ON"),
-        ("Free Limit", "free_limit", "4"),
-        ("Minimum Withdraw", "min_withdraw", "5.00"),
-        ("Withdraw Hold Hours", "withdraw_hold_hours", "0"),
-        ("Referral Bonus", "referral_bonus", "1.00"),
-        ("Confidence", "confidence", "95-99%"),
-    ]
-    lines = ["📊 <b>SETTINGS SUMMARY</b>"]
-    for label, key, default in values:
-        lines.append(f"• {label}: <b>{escape(get_setting(key, default))}</b>")
-    return bot.send_message(message.chat.id, "\n".join(lines), reply_markup=make_keyboard([["⚙️ Settings"], ["🔙 Back", "🏠 Main Menu"]]))
-
-# ============================================================
 # ADMIN: TEXT EDITOR
 # ============================================================
 
-def legacy_admin_text_editor(message):
+def admin_text_editor(message):
 
     STATES[
         message.from_user.id
@@ -4164,7 +4029,7 @@ def legacy_admin_text_editor(message):
 # ADMIN ROUTER
 # ============================================================
 
-def legacy_handle_admin_button(message):
+def handle_admin_button(message):
 
     text = message.text
     user_id = message.from_user.id
@@ -4460,7 +4325,7 @@ def legacy_handle_admin_button(message):
 # STATE HANDLER
 # ============================================================
 
-def legacy_handle_state(message):
+def handle_state(message):
 
     user_id = message.from_user.id
 
@@ -4487,21 +4352,31 @@ def legacy_handle_state(message):
     # UNIVERSAL BACK
     # --------------------------------------------------------
 
-    if text in (
-        "🔙 Back",
-        "🏠 Main Menu"
-    ):
+    if text in ("🔙 Back", "🏠 Main Menu"):
+        if text == "🏠 Main Menu":
+            clear_state(user_id)
+            send_main_menu(message.chat.id, user_id, "🏠 <b>Main Menu</b>")
+            return True
 
-        clear_state(
-            user_id
-        )
-
-        send_main_menu(
-            message.chat.id,
-            user_id,
-            "🏠 <b>Main Menu</b>"
-        )
-
+        # Back = previous menu. Admin workflows return to Admin Control;
+        # normal user workflows return to the main menu.
+        admin_actions = {
+            "add_future", "edit_signal", "delete_signal", "clear_signals",
+            "auto_send", "audience", "live_session", "uid_review", "vip_manage",
+            "withdraw_review", "wallet_adjust", "broadcast", "user_list",
+            "subadmin_add_id", "subadmin_remove", "notify_type", "notify_id",
+            "notify_audience", "notify_save", "settings", "set_free_limit",
+            "set_min_withdraw", "text_category", "text_edit", "text_preview",
+            "set_referral_bonus", "set_referral_min_signals", "set_referral_hold_hours",
+            "set_withdraw_hold_hours", "set_vip_days", "set_confidence",
+            "set_auto_notification", "set_live_mode", "set_maintenance",
+            "set_result_reveal"
+        }
+        clear_state(user_id)
+        if action in admin_actions and (is_master(user_id) or get_permissions(user_id)):
+            bot.send_message(message.chat.id, "🔙 <b>Admin Control</b>", reply_markup=admin_keyboard())
+        else:
+            send_main_menu(message.chat.id, user_id, "🔙 <b>Main Menu</b>")
         return True
 
 
@@ -7233,10 +7108,10 @@ def message_router(message):
 # per-signal inline WIN/LOSE/SKIP buttons, UID protection, button-based admin
 # tools, and persistent migrations.
 
-LEGACY_HANDLE_STATE = legacy_handle_state
-LEGACY_ADMIN_KEYBOARD = legacy_admin_keyboard
-LEGACY_HANDLE_ADMIN_BUTTON = legacy_handle_admin_button
-LEGACY_REFERRAL_MENU = legacy_referral_menu
+LEGACY_HANDLE_STATE = handle_state
+LEGACY_ADMIN_KEYBOARD = admin_keyboard
+LEGACY_HANDLE_ADMIN_BUTTON = handle_admin_button
+LEGACY_REFERRAL_MENU = referral_menu
 
 REFERRAL_LEVEL_DEFAULTS = [
     (0, 100, 1.00),
@@ -7654,22 +7529,10 @@ def handle_admin_button(message):
         "➕ Add Future Signals":"signals","📋 Future Signal List":"signals","✏️ Edit Signal":"signals","🗑️ Delete Signal":"signals","🧹 Clear Future Signals":"signals","📤 Auto Send ON/OFF":"signals","🎯 Signal Audience":"signals",
         "⚡ Live Session":"live","🆔 Pending UID":"uid","⭐ Manage VIP":"vip","💸 Withdrawals":"withdraw","📊 Withdrawal Reports":"withdraw","👥 Referral History":"analytics","💳 Wallet Adjust":"wallet","📢 Broadcast":"broadcast","👥 Users":"users","📊 Analytics":"analytics","📈 Result Stats":"analytics","🎯 Notify Targets":"notifications","⚙️ Settings":"settings","📝 Bot Text Editor":"text","🎟️ Set Free Limit":"settings","💵 Set Min Withdraw":"settings","💸 Withdraw ON/OFF":"settings","🛠️ Maintenance ON/OFF":"settings","⚡ Live ON/OFF":"settings","🔔 Auto Notification ON/OFF":"notifications"
     }
-    if text in permission_map:
-        required = permission_map[text]
-        allowed = can(uid, required)
-        # Settings permission intentionally includes the operational toggles
-        # shown inside the Settings Center, so sub-admins do not get confusing
-        # "access denied" messages after entering Settings.
-        if not allowed and required in ("signals", "notifications", "live"):
-            allowed = can(uid, "settings")
-        if not allowed:
-            return bot.send_message(message.chat.id,"⛔ You do not have permission for this section.",reply_markup=admin_keyboard())
+    if text in permission_map and not can(uid, permission_map[text]):
+        return bot.send_message(message.chat.id,"⛔ You do not have permission for this section.",reply_markup=admin_keyboard())
     if text=="📈 Result Stats":
         return admin_result_stats(message)
-    if text=="⚙️ Settings":
-        return admin_settings_center(message)
-    if text=="📊 Settings Summary":
-        return admin_settings_summary(message)
     if text=="📊 Withdrawal Reports": return admin_withdrawal_report(message)
     if text=="👥 Referral History": return admin_referral_history(message)
     if text=="➕ Add Sub Admin":
@@ -7706,40 +7569,6 @@ def handle_admin_button(message):
     if text=="🔔 Auto Notification ON/OFF":
         if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
         old=get_setting("auto_notification","ON"); new="OFF" if old=="ON" else "ON"; set_setting("auto_notification",new); return bot.send_message(message.chat.id,f"🔔 Auto Notification: <b>{new}</b>",reply_markup=admin_keyboard())
-    if text == "⏳ Set Withdraw Hold":
-        if not can(uid, "settings"):
-            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
-        STATES[uid] = {"action": "settings_set_hold"}
-        return bot.send_message(message.chat.id, "⏳ Withdrawal hold কত ঘণ্টা হবে?\n0 = no hold\nExample: 24", reply_markup=back_keyboard())
-
-    if text == "👥 Set Referral Bonus":
-        if not can(uid, "settings"):
-            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
-        STATES[uid] = {"action": "settings_set_ref_bonus"}
-        return bot.send_message(message.chat.id, "👥 Base referral bonus USD লিখুন.\nExample: 1.00", reply_markup=back_keyboard())
-
-    if text == "🎯 Set Confidence":
-        if not can(uid, "settings"):
-            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
-        STATES[uid] = {"action": "settings_set_confidence"}
-        return bot.send_message(message.chat.id, "🎯 Signal confidence text লিখুন.\nExample: 95–99%", reply_markup=back_keyboard())
-
-    if text == "📜 Edit Trading Contract":
-        if not can(uid, "settings"):
-            return bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_keyboard())
-        STATES[uid] = {"action": "settings_edit_contract"}
-        return bot.send_message(message.chat.id, "📜 নতুন Trading Contract text লিখুন:", reply_markup=back_keyboard())
-
-    if text == "💾 Create DB Backup":
-        if not is_master(uid):
-            return bot.send_message(message.chat.id, "⛔ Master Admin only.", reply_markup=admin_keyboard())
-        try:
-            backup_database()
-            return bot.send_message(message.chat.id, "✅ Database backup created successfully.", reply_markup=admin_settings_center_keyboard())
-        except Exception as exc:
-            logger.exception("Manual backup failed")
-            return bot.send_message(message.chat.id, "❌ Backup failed: " + escape(str(exc)), reply_markup=admin_settings_center_keyboard())
-
     # Preserve all legacy admin buttons and handlers.
     return LEGACY_HANDLE_ADMIN_BUTTON(message)
 
@@ -7972,41 +7801,130 @@ def handle_state(message):
                 finally: conn.close()
             admin_audit(uid,"RESULT_REVEAL",sid,result or "HIDDEN")
             clear_state(uid); bot.send_message(message.chat.id,"✅ Result setting updated.",reply_markup=admin_keyboard()); return True
-        if action == "settings_set_hold":
-            if not text.isdigit() or int(text) < 0 or int(text) > 720:
-                raise ValueError("0 থেকে 720 ঘণ্টার মধ্যে দিন.")
-            set_setting("withdraw_hold_hours", str(int(text)))
-            clear_state(uid)
-            bot.send_message(message.chat.id, "✅ Withdrawal hold updated.", reply_markup=admin_settings_center(message))
-            return True
-        if action == "settings_set_ref_bonus":
-            value = float(text.replace("$", "").strip())
-            if value < 0 or value > 1000:
-                raise ValueError("Referral bonus 0–1000 USD-এর মধ্যে দিন.")
-            set_setting("referral_bonus", f"{value:.2f}")
-            clear_state(uid)
-            bot.send_message(message.chat.id, "✅ Referral bonus updated.", reply_markup=admin_settings_center(message))
-            return True
-        if action == "settings_set_confidence":
-            if len(text) < 1 or len(text) > 100:
-                raise ValueError("Confidence text 1–100 characters দিন.")
-            set_setting("confidence", text)
-            clear_state(uid)
-            bot.send_message(message.chat.id, "✅ Confidence text updated.", reply_markup=admin_settings_center(message))
-            return True
-        if action == "settings_edit_contract":
-            if len(text) < 1 or len(text) > 4000:
-                raise ValueError("Trading Contract 1–4000 characters দিন.")
-            set_setting("trading_rules", text)
-            clear_state(uid)
-            bot.send_message(message.chat.id, "✅ Trading Contract updated.", reply_markup=admin_settings_center(message))
-            return True
         # New withdrawal entry starts at method selection. Legacy amount-first state is intercepted below.
         if action=="withdraw":
             raise ValueError("Use the withdrawal buttons.")
         return LEGACY_HANDLE_STATE(message)
     except Exception as exc:
         bot.send_message(message.chat.id,"❌ <b>Error</b>\n\n"+escape(str(exc)),reply_markup=back_keyboard()); return True
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("uidapprove:"))
+def uid_approve_callback(call):
+    admin_id = call.from_user.id
+    if not can(admin_id, "vip"):
+        bot.answer_callback_query(call.id, "Access denied.", show_alert=True)
+        return
+    try:
+        sid = int(call.data.split(":", 1)[1])
+        with DB_LOCK:
+            conn = db()
+            try:
+                row = conn.execute("SELECT * FROM uid_submissions WHERE id=? AND status='PENDING'", (sid,)).fetchone()
+            finally:
+                conn.close()
+        if not row:
+            bot.answer_callback_query(call.id, "Pending UID পাওয়া যায়নি.", show_alert=True)
+            return
+        kb = types.InlineKeyboardMarkup()
+        kb.row(types.InlineKeyboardButton("7 Days", callback_data=f"uidduration:{sid}:7"), types.InlineKeyboardButton("15 Days", callback_data=f"uidduration:{sid}:15"))
+        kb.row(types.InlineKeyboardButton("30 Days", callback_data=f"uidduration:{sid}:30"), types.InlineKeyboardButton("60 Days", callback_data=f"uidduration:{sid}:60"))
+        kb.row(types.InlineKeyboardButton("90 Days", callback_data=f"uidduration:{sid}:90"), types.InlineKeyboardButton("♾️ Unlimited", callback_data=f"uidduration:{sid}:0"))
+        kb.row(types.InlineKeyboardButton("🔙 Cancel", callback_data=f"uidcancel:{sid}"))
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, f"⭐ <b>VIP Duration নির্বাচন করুন</b>\n\nUser: <code>{row['user_id']}</code>\nUID: <code>{escape(row['quotex_uid'])}</code>", reply_markup=kb)
+    except Exception as exc:
+        bot.answer_callback_query(call.id, f"Error: {exc}", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("uidduration:"))
+def uid_duration_callback(call):
+    admin_id = call.from_user.id
+    if not can(admin_id, "vip"):
+        bot.answer_callback_query(call.id, "Access denied.", show_alert=True)
+        return
+    try:
+        _, sid_s, days_s = call.data.split(":", 2)
+        sid, days = int(sid_s), int(days_s)
+        with DB_LOCK:
+            conn = db()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM uid_submissions WHERE id=? AND status='PENDING'", (sid,)).fetchone()
+                if not row:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Pending UID পাওয়া যায়নি.", show_alert=True)
+                    return
+                # One Quotex UID can belong to only one Telegram account.
+                other = conn.execute("SELECT user_id FROM uid_submissions WHERE quotex_uid=? AND status='APPROVED' AND user_id<>? LIMIT 1", (row['quotex_uid'], row['user_id'])).fetchone()
+                if other:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "এই UID অন্য account-এ already approved.", show_alert=True)
+                    return
+                vip_until = None if days == 0 else (now_bd() + timedelta(days=days)).isoformat()
+                conn.execute("UPDATE uid_submissions SET status='APPROVED', reviewed_at=? WHERE id=? AND status='PENDING'", (utc_iso(now_utc()), sid))
+                conn.execute("UPDATE users SET status='VIP', vip_until=? WHERE user_id=?", (vip_until, row['user_id']))
+                conn.commit()
+            finally:
+                conn.close()
+        bot.answer_callback_query(call.id, "VIP approved.")
+        try:
+            label = "Unlimited" if days == 0 else f"{days} days"
+            bot.send_message(row['user_id'], f"⭐ <b>VIP Approved</b>\n\nVIP Duration: <b>{label}</b>\nUID: <code>{escape(row['quotex_uid'])}</code>", reply_markup=main_keyboard(row['user_id']))
+        except Exception:
+            pass
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+    except Exception as exc:
+        bot.answer_callback_query(call.id, f"Error: {exc}", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("uidreject:"))
+def uid_reject_callback(call):
+    admin_id = call.from_user.id
+    if not can(admin_id, "vip"):
+        bot.answer_callback_query(call.id, "Access denied.", show_alert=True)
+        return
+    try:
+        sid = int(call.data.split(":", 1)[1])
+        with DB_LOCK:
+            conn = db()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM uid_submissions WHERE id=? AND status='PENDING'", (sid,)).fetchone()
+                if not row:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Pending UID পাওয়া যায়নি.", show_alert=True)
+                    return
+                conn.execute("UPDATE uid_submissions SET status='REJECTED', reviewed_at=? WHERE id=? AND status='PENDING'", (utc_iso(now_utc()), sid))
+                conn.commit()
+            finally:
+                conn.close()
+        bot.answer_callback_query(call.id, "UID rejected.")
+        try:
+            bot.send_message(row['user_id'], "❌ আপনার Quotex UID rejected হয়েছে.", reply_markup=main_keyboard(row['user_id']))
+        except Exception:
+            pass
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+    except Exception as exc:
+        bot.answer_callback_query(call.id, f"Error: {exc}", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("uidcancel:"))
+def uid_cancel_callback(call):
+    if not can(call.from_user.id, "vip"):
+        bot.answer_callback_query(call.id, "Access denied.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "Cancelled")
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
 
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("sigres:"))
