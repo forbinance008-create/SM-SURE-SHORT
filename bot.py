@@ -4334,7 +4334,7 @@ def handle_admin_button(message):
 # STATE HANDLER
 # ============================================================
 
-def handle_state(message):
+def LEGACY_HANDLE_STATE(message):
 
     user_id = message.from_user.id
 
@@ -7153,7 +7153,6 @@ def message_router(message):
 # per-signal inline WIN/LOSE/SKIP buttons, UID protection, button-based admin
 # tools, and persistent migrations.
 
-LEGACY_HANDLE_STATE = handle_state
 LEGACY_ADMIN_KEYBOARD = admin_keyboard
 LEGACY_HANDLE_ADMIN_BUTTON = handle_admin_button
 LEGACY_REFERRAL_MENU = referral_menu
@@ -9548,14 +9547,35 @@ def _reject_referral(rid,reason,admin_id,reason_type="custom"):
 
 
 # Extend handle_state with custom referral reason by wrapping the final handler.
-_PREV_HANDLE_STATE=__clean_handle_state_v4
 def __clean_handle_state_v4(message):
-    uid=message.from_user.id; st=STATES.get(uid)
-    if st and st.get("action")=="ref_custom_reason":
+    uid = message.from_user.id
+    st = STATES.get(uid)
+    if st and st.get("action") == "ref_custom_reason":
         try:
-            _reject_referral(int(st["referral_id"]),message.text or "Custom reason",uid,"custom"); clear_state(uid); bot.send_message(message.chat.id,"❌ Referral rejected.",reply_markup=admin_keyboard()); return True
-        except Exception as exc: bot.send_message(message.chat.id,"❌ "+escape(str(exc))); return True
-    return _PREV_HANDLE_STATE(message)
+            _reject_referral(int(st["referral_id"]), message.text or "Custom reason", uid, "custom")
+            clear_state(uid)
+            bot.send_message(message.chat.id, "❌ Referral rejected.", reply_markup=admin_keyboard())
+            return True
+        except Exception as exc:
+            logger.exception("Referral custom reason failed")
+            clear_state(uid)
+            bot.send_message(message.chat.id, "❌ " + escape(str(exc)), reply_markup=admin_keyboard())
+            return True
+    return __clean_handle_state_v3(message)
+
+
+def handle_state(message):
+    """Single public state dispatcher."""
+    try:
+        return __clean_handle_state_v4(message)
+    except Exception:
+        logger.exception("State handler crashed; clearing user state")
+        try:
+            clear_state(message.from_user.id)
+            bot.send_message(message.chat.id, "❌ Request process করা যায়নি. আবার চেষ্টা করুন.", reply_markup=main_keyboard(message.from_user.id))
+        except Exception:
+            pass
+        return True
 
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("mmres:"))
@@ -9704,24 +9724,12 @@ def __clean_main_v2():
 
 
 
+
 # ============================================================
-# CLEAN REBUILD — SINGLE PUBLIC BINDINGS
+# FINAL RUNTIME BINDINGS
 # ============================================================
-# Duplicate definitions above are kept as uniquely named compatibility internals.
-# The names below are the only public implementations used at runtime.
-normalize_uid = __clean_normalize_uid_v2
-admin_keyboard = __clean_admin_keyboard_v3
-handle_admin_button = __clean_handle_admin_button_v3
-handle_state = __clean_handle_state_v5
-safe_startup_migration = __clean_safe_startup_migration_v2
-admin_audit = __clean_admin_audit_v2
-start_uid_submission = __clean_start_uid_submission_v2
-handle_candle_photo = __clean_handle_candle_photo_v2
-analyze_candle_state = __clean_analyze_candle_state_v2
-candle_ai_prompt = __clean_candle_ai_prompt_v2
-release_referral_bonuses = __clean_release_referral_bonuses_v2
-secure_process_referral_bonus = __clean_secure_process_referral_bonus_v2
-result_buttons = __clean_result_buttons_v2
+format_signal = patched_format_signal_final
+deliver_signal = patched_deliver_signal_final
 main = __clean_main_v2
 
 # ============================================================
