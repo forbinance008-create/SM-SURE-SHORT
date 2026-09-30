@@ -7352,7 +7352,7 @@ def secure_process_referral_bonus(user_id):
     release_referral_bonuses()
 
 
-def referral_menu(message):
+def __clean_referral_menu_v2(message):
     uid=message.from_user.id
     u=get_user(uid)
     with DB_LOCK:
@@ -7525,19 +7525,19 @@ def admin_referral_history(message):
     bot.send_message(message.chat.id,"\n".join(lines),reply_markup=make_keyboard([["📊 Withdrawal Reports"],["🔙 Back","🏠 Main Menu"]]))
 
 
-def admin_subadmins(message):
+def __clean_admin_subadmins_v2(message):
     uid=message.from_user.id
     if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
     bot.send_message(message.chat.id,"🛡️ <b>SUB-ADMIN MANAGEMENT</b>",reply_markup=make_keyboard([["➕ Add Sub Admin","📋 Sub Admin List"],["🗑️ Remove Sub Admin"],["🔙 Back","🏠 Main Menu"]]))
 
 
-def admin_notify_targets(message):
+def __clean_admin_notify_targets_v2(message):
     uid=message.from_user.id
     if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
     bot.send_message(message.chat.id,"🎯 <b>NOTIFICATION TARGETS</b>",reply_markup=make_keyboard([["➕ Add Target","📋 Target List"],["🗑️ Remove Target","🧪 Test Target"],["🔔 Auto Notification ON/OFF"],["🔙 Back","🏠 Main Menu"]]))
 
 
-def admin_text_editor(message):
+def __clean_admin_text_editor_v2(message):
     uid=message.from_user.id
     if not can(uid,"settings"): return bot.send_message(message.chat.id,"⛔ Access denied.",reply_markup=admin_keyboard())
     cats=[("👋 Welcome","welcome"),("📊 Future Signal","future_signal_text"),("⚡ Live Signal","live_signal_text"),("💰 Money Management","mm_text"),("⭐ VIP","vip_text"),("🆔 UID","uid_text"),("💵 Wallet","wallet_text"),("💸 Withdraw","withdraw_text"),("👥 Referral","referral_text"),("📣 Notification","notification_text"),("📜 Trading Contract","trading_rules"),("📢 Broadcast","broadcast_text"),("✅ WIN","win_text"),("❌ LOSS","loss_text"),("⏭️ SKIP","skip_text"),("🛠️ Errors","error_text"),("🔔 Reminders","reminder_text"),("✨ Feature Text","feature_text")]
@@ -7547,7 +7547,7 @@ def admin_text_editor(message):
     bot.send_message(message.chat.id,"📝 <b>BOT TEXT EDITOR</b>\nChoose a section:",reply_markup=make_keyboard(rows+[["🔙 Back","🏠 Main Menu"]]))
 
 
-def admin_keyboard():
+def __clean_admin_keyboard_v2():
     # Keep legacy controls reachable while exposing the new admin tools.
     return make_keyboard([
         ["➕ Add Future Signals", "📋 Future Signal List"],
@@ -7569,7 +7569,7 @@ def admin_keyboard():
     ])
 
 
-def handle_admin_button(message):
+def __clean_handle_admin_button_v2(message):
     text=message.text; uid=message.from_user.id
     permission_map={
         "➕ Add Future Signals":"signals","📋 Future Signal List":"signals","✏️ Edit Signal":"signals","🗑️ Delete Signal":"signals","🧹 Clear Future Signals":"signals","📤 Auto Send ON/OFF":"signals","🎯 Signal Audience":"signals",
@@ -7637,7 +7637,7 @@ def _subadmin_permission_keyboard(selected):
     return make_keyboard(rows)
 
 
-def handle_state(message):
+def __clean_handle_state_v2(message):
     uid=message.from_user.id; text=(message.text or "").strip(); st=STATES.get(uid)
     if not st: return LEGACY_HANDLE_STATE(message)
     if text in ("🔙 Back","🏠 Main Menu","❌ Cancel"):
@@ -8626,7 +8626,7 @@ def main():
 
 # normalize_uid is intentionally defined here before runtime use by every
 # handler; Python resolves the function when the handler executes.
-def normalize_uid(value):
+def __clean_normalize_uid_v2(value):
     return re.sub(r"\D", "", str(value or "")).strip()
 
 
@@ -8797,7 +8797,7 @@ def final_migration():
             conn.close()
 
 
-def safe_startup_migration():
+def __clean_safe_startup_migration_v2():
     """Run original migrations plus additive migration without killing polling."""
     try:
         init_db()
@@ -8819,7 +8819,7 @@ def safe_startup_migration():
     return True
 
 
-def admin_audit(admin_id, action, target_id="", note=""):
+def __clean_admin_audit_v2(admin_id, action, target_id="", note=""):
     try:
         with DB_LOCK:
             conn=db()
@@ -8978,7 +8978,7 @@ def vip_duration_keyboard(prefix="vipdur"):
     return kb
 
 
-def start_uid_submission(message):
+def __clean_start_uid_submission_v2(message):
     uid=message.from_user.id
     u=get_user(uid)
     if u and u["status"]=="VIP":
@@ -9042,7 +9042,7 @@ def _qualify_referral_after_vip(user_id, admin_id):
     except Exception: pass
 
 
-def release_referral_bonuses():
+def __clean_release_referral_bonuses_v2():
     """Release only QUALIFIED referrals; never pay at signal view time."""
     with DB_LOCK:
         conn=db()
@@ -9058,7 +9058,7 @@ def release_referral_bonuses():
         finally: conn.close()
 
 
-def secure_process_referral_bonus(user_id):
+def __clean_secure_process_referral_bonus_v2(user_id):
     # Compatibility shim: qualification is admin/VIP based, not signal-view based.
     return
 
@@ -9094,7 +9094,7 @@ def mm_status_text(user_id):
     return (f"💰 <b>MONEY MANAGEMENT</b>\n\n🔘 Status: <b>{enabled}</b>\n💵 Balance: <b>{money(u['mm_balance_cents'])}</b>\n🎯 Win Target: <b>{money(target)}</b>\n🛑 Loss Limit: <b>{money(loss)}</b>\n\n📊 Today Net: <b>{money(pnl)}</b>\n🔢 Trades: <b>{u['mm_trade_count']}</b>\n🎯 Target: <b>{money(target)}</b>\n🛑 Loss Limit: <b>{money(loss)}</b>\n\n➡️ Next: <b>{mode}</b>\n💵 Trade: <b>{money(amount)}</b>")
 
 
-def mm_menu(message):
+def __clean_mm_menu_v2(message):
     uid=message.from_user.id
     bot.send_message(message.chat.id,mm_status_text(uid),reply_markup=make_keyboard([["⚙️ Setup MM","🔘 MM ON/OFF"],["📊 MM Status","💵 Change Base"],["💲 Change M1","📈 Change Payout"],["🛑 Stop MM Today"],["🔙 Back","🏠 Main Menu"]]))
 
@@ -9127,7 +9127,7 @@ def _mm_trade_result(user_id, signal_id, result, mode=None):
         finally: conn.close()
 
 
-def result_buttons(signal_id,user_id):
+def __clean_result_buttons_v2(signal_id,user_id):
     with DB_LOCK:
         conn=db()
         try: row=conn.execute("SELECT result FROM signal_user_results WHERE signal_id=? AND user_id=?",(signal_id,user_id)).fetchone()
@@ -9145,7 +9145,7 @@ def result_buttons(signal_id,user_id):
     return kb
 
 
-def handle_candle_photo(message):
+def __clean_handle_candle_photo_v2(message):
     uid=message.from_user.id
     st=STATES.get(uid)
     if not st or st.get("action")!="candle_upload": return False
@@ -9167,11 +9167,11 @@ def handle_candle_photo(message):
     return True
 
 
-def candle_ai_prompt():
+def __clean_candle_ai_prompt_v2():
     return """You are analyzing a Quotex-style trading chart screenshot. Analyze ONLY visible evidence. Never invent indicators, prices, candles, volume, RSI, MACD, Fibonacci, Bollinger Bands, news, or time. If evidence is missing, say not visible. Check: (1) at least 20 visible candles, (2) timeframe if visible, (3) trend over ~20 candles, (4) momentum over last 5, (5) last 3 candle pattern, (6) support/resistance, (7) volume/RSI/MACD/Fibonacci/Bollinger only if visible, (8) confirmation using at least 2 independent visible signals. If fewer than 20 candles, blurry, cropped/unclear, text-only, or conflicting, output WAIT. Confidence must be evidence-based; never claim certainty. Output Bengali + English mix with: Chart Analysis, Trend, Candle Pattern, Support/Resistance, Momentum, Volatility, Signal UP/DOWN/WAIT, Confidence band, Next Candle Time if visible/inferable from visible clock/timeframe, Signal Time + Direction, Risk note. Strong UP requires multiple visible confirmations such as trend/support/bullish pattern. Strong DOWN requires multiple visible confirmations such as trend/resistance/bearish pattern. RSI/MACD/news may be used only when actually visible. Prediction is not a guarantee."""
 
 
-def analyze_candle_state(message):
+def __clean_analyze_candle_state_v2(message):
     uid=message.from_user.id; st=STATES.get(uid)
     if not st or st.get("action")!="candle_upload": return False
     text=(message.text or "").strip()
@@ -9234,11 +9234,11 @@ def admin_category_keyboard():
     return make_keyboard([["📊 Signals","👥 Users"],["⭐ VIP","💰 Money"],["🎁 Referral","⚙️ Settings"],["📈 Analytics","📝 Content"],["🔙 Back","🏠 Main Menu"]])
 
 
-def admin_keyboard():
+def __clean_admin_keyboard_v3():
     return admin_category_keyboard()
 
 
-def handle_admin_button(message):
+def __clean_handle_admin_button_v3(message):
     text=(message.text or "").strip(); uid=message.from_user.id
     if text=="📊 Signals": return bot.send_message(message.chat.id,"📊 <b>SIGNALS</b>",reply_markup=make_keyboard([["➕ Add Future Signals","📋 Future Signal List"],["✏️ Edit Signal","🗑️ Delete Signal"],["🧹 Clear Future Signals","📤 Auto Send ON/OFF"],["🎯 Signal Audience","⚡ Live Session"],["🔙 Back","🏠 Main Menu"]]))
     if text=="👥 Users": return bot.send_message(message.chat.id,"👥 <b>USERS</b>",reply_markup=make_keyboard([["🔍 Search User","👥 All Users"],["🚫 Blocked Users","⚠️ Warning List"],["📩 Message User","📢 Broadcast"],["🔙 Back","🏠 Main Menu"]]))
@@ -9371,7 +9371,7 @@ def _ai_usage_stats(message):
 # ------------------------- State override ---------------------
 _LEGACY_FINAL_STATE = LEGACY_HANDLE_STATE
 
-def handle_state(message):
+def __clean_handle_state_v3(message):
     uid=message.from_user.id; text=(message.text or "").strip(); st=STATES.get(uid)
     if st: _state_set(uid,st); st=STATES.get(uid)
     if text in ("🔙 Back","🏠 Main Menu","❌ Cancel") and st and st.get("action") not in ("withdraw_admin_action",):
@@ -9548,8 +9548,8 @@ def _reject_referral(rid,reason,admin_id,reason_type="custom"):
 
 
 # Extend handle_state with custom referral reason by wrapping the final handler.
-_PREV_HANDLE_STATE=handle_state
-def handle_state(message):
+_PREV_HANDLE_STATE=__clean_handle_state_v4
+def __clean_handle_state_v4(message):
     uid=message.from_user.id; st=STATES.get(uid)
     if st and st.get("action")=="ref_custom_reason":
         try:
@@ -9665,7 +9665,7 @@ def patched_deliver_signal_final(user_id, signal_id, source="manual"):
 deliver_signal=patched_deliver_signal_final
 
 
-def vote_menu(message):
+def __clean_vote_menu_v2(message):
     uid=message.from_user.id; signal=next_signal_for_user(uid)
     if not signal: return bot.send_message(message.chat.id,"📭 কোনো signal vote করার জন্য নেই।",reply_markup=main_keyboard(uid))
     with DB_LOCK:
@@ -9679,7 +9679,7 @@ def vote_menu(message):
     bot.send_message(message.chat.id,patched_format_signal_final(signal)+mm+"\n\n🗳️ Vote নির্বাচন করুন:",reply_markup=make_keyboard([["🟢 UP / BUY","🔴 DOWN / SELL"],["⏭️ SKIP"],["🔙 Back","🏠 Main Menu"]]))
 
 
-def main():
+def __clean_main_v2():
     if not safe_startup_migration(): logger.error("DB startup had errors; polling will still retry")
     try: backup_database()
     except Exception: logger.exception("Initial backup failed")
@@ -9702,6 +9702,27 @@ def main():
             logger.exception("Polling crashed; reconnecting")
             time.sleep(5)
 
+
+
+# ============================================================
+# CLEAN REBUILD — SINGLE PUBLIC BINDINGS
+# ============================================================
+# Duplicate definitions above are kept as uniquely named compatibility internals.
+# The names below are the only public implementations used at runtime.
+normalize_uid = __clean_normalize_uid_v2
+admin_keyboard = __clean_admin_keyboard_v3
+handle_admin_button = __clean_handle_admin_button_v3
+handle_state = __clean_handle_state_v5
+safe_startup_migration = __clean_safe_startup_migration_v2
+admin_audit = __clean_admin_audit_v2
+start_uid_submission = __clean_start_uid_submission_v2
+handle_candle_photo = __clean_handle_candle_photo_v2
+analyze_candle_state = __clean_analyze_candle_state_v2
+candle_ai_prompt = __clean_candle_ai_prompt_v2
+release_referral_bonuses = __clean_release_referral_bonuses_v2
+secure_process_referral_bonus = __clean_secure_process_referral_bonus_v2
+result_buttons = __clean_result_buttons_v2
+main = __clean_main_v2
 
 # ============================================================
 # RUN
