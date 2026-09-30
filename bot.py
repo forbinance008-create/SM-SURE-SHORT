@@ -7069,6 +7069,39 @@ def message_router(message):
 
 
     # ========================================================
+    # FINAL MM / AI BUTTONS
+    # ========================================================
+
+    if text == "⚙️ Setup MM":
+        _state_set(user_id, {"action":"mm_setup"})
+        bot.send_message(message.chat.id, "💵 Starting Balance কত? Example: 50", reply_markup=back_keyboard())
+        return
+    if text == "🔘 MM ON/OFF":
+        with DB_LOCK:
+            conn=db()
+            try:
+                u=conn.execute("SELECT mm_enabled FROM users WHERE user_id=?",(user_id,)).fetchone()
+                new=0 if u and int(u["mm_enabled"] or 0) else 1
+                conn.execute("UPDATE users SET mm_enabled=? WHERE user_id=?",(new,user_id)); conn.commit()
+            finally: conn.close()
+        bot.send_message(message.chat.id, f"💰 MM: <b>{'ON' if new else 'OFF'}</b>", reply_markup=mm_keyboard())
+        return
+    if text == "💵 Change Base":
+        _state_set(user_id,{"action":"mm_set_base"}); bot.send_message(message.chat.id,"New Base amount দিন. Minimum $1",reply_markup=back_keyboard()); return
+    if text == "💲 Change M1":
+        _state_set(user_id,{"action":"mm_set_m1"}); bot.send_message(message.chat.id,"New M1 amount দিন.",reply_markup=back_keyboard()); return
+    if text == "📈 Change Payout":
+        _state_set(user_id,{"action":"mm_set_payout"}); bot.send_message(message.chat.id,"Payout percent দিন. Example: 85",reply_markup=back_keyboard()); return
+    if text == "🛑 Stop MM Today":
+        with DB_LOCK:
+            conn=db()
+            try: conn.execute("UPDATE users SET mm_stop=1 WHERE user_id=?",(user_id,)); conn.commit()
+            finally: conn.close()
+        bot.send_message(message.chat.id,"🛑 MM আজকের জন্য stopped.",reply_markup=mm_keyboard()); return
+    if text == "🤖 AI Candle Analysis":
+        return start_candle_analysis(message)
+
+    # ========================================================
     # ADMIN
     # ========================================================
 
@@ -8583,6 +8616,1091 @@ def main():
             time.sleep(
                 5
             )
+
+
+
+# ============================================================
+# SM QUATEX SURE SHORT — FINAL UPDATE EXTENSION
+# Additive/backward-compatible hardening and feature layer.
+# ============================================================
+
+# normalize_uid is intentionally defined here before runtime use by every
+# handler; Python resolves the function when the handler executes.
+def normalize_uid(value):
+    return re.sub(r"\D", "", str(value or "")).strip()
+
+
+def _safe_add_column(conn, table, column, definition):
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def final_migration():
+    """Idempotent additive migration. Never drops old columns/data."""
+    with DB_LOCK:
+        conn = db()
+        try:
+            user_cols = {
+                "vip_reminder_7d_sent": "INTEGER NOT NULL DEFAULT 0",
+                "vip_reminder_3d_sent": "INTEGER NOT NULL DEFAULT 0",
+                "vip_started_at": "TEXT",
+                "warning_count": "INTEGER NOT NULL DEFAULT 0",
+                "warning_reason": "TEXT",
+                "uid_confirmed": "INTEGER NOT NULL DEFAULT 0",
+                "uid_confirm_at": "TEXT",
+                "mm_balance_cents": "INTEGER NOT NULL DEFAULT 0",
+                "mm_target_cents": "INTEGER NOT NULL DEFAULT 0",
+                "mm_loss_limit_cents": "INTEGER NOT NULL DEFAULT 0",
+                "mm_base_cents": "INTEGER NOT NULL DEFAULT 100",
+                "mm_m1_cents": "INTEGER NOT NULL DEFAULT 200",
+                "mm_payout_percent": "REAL NOT NULL DEFAULT 85.0",
+                "mm_current_mode": "TEXT NOT NULL DEFAULT 'BASE'",
+                "mm_daily_win_cents": "INTEGER NOT NULL DEFAULT 0",
+                "mm_daily_loss_cents": "INTEGER NOT NULL DEFAULT 0",
+                "mm_trade_count": "INTEGER NOT NULL DEFAULT 0",
+                "mm_stop": "INTEGER NOT NULL DEFAULT 0",
+                "mm_date": "TEXT",
+                "mm_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "mm_last_signal_id": "INTEGER",
+                "ai_usage_count": "INTEGER NOT NULL DEFAULT 0",
+                "ai_usage_date": "TEXT",
+                "ai_limit_vip": "INTEGER NOT NULL DEFAULT 50",
+                "ai_limit_nonvip": "INTEGER NOT NULL DEFAULT 3",
+            }
+            for c, d in user_cols.items():
+                _safe_add_column(conn, "users", c, d)
+
+            referral_cols = {
+                "status": "TEXT NOT NULL DEFAULT 'PENDING'",
+                "quotex_uid": "TEXT",
+                "deposit_amount_cents": "INTEGER NOT NULL DEFAULT 0",
+                "warning_count": "INTEGER NOT NULL DEFAULT 0",
+                "risk_flag": "INTEGER NOT NULL DEFAULT 0",
+                "risk_note": "TEXT",
+                "reviewed_by": "INTEGER",
+                "reviewed_at": "TEXT",
+                "qualified_at": "TEXT",
+                "paid_at": "TEXT",
+                "reject_reason": "TEXT",
+                "reject_reason_type": "TEXT",
+                "rejected_by": "INTEGER",
+                "rejected_at": "TEXT",
+            }
+            for c, d in referral_cols.items():
+                _safe_add_column(conn, "referrals", c, d)
+
+            for table, cols in {
+                "uid_submissions": {"confirm_at": "TEXT", "deposit_attested": "INTEGER NOT NULL DEFAULT 0"},
+                "withdrawals": {"reviewed_by": "INTEGER", "hold_until": "TEXT", "review_note": "TEXT"},
+                "notify_targets": {"target_type": "TEXT NOT NULL DEFAULT 'GROUP'", "audience": "TEXT NOT NULL DEFAULT 'ALL'", "selected_users": "TEXT NOT NULL DEFAULT ''"},
+            }.items():
+                for c, d in cols.items():
+                    _safe_add_column(conn, table, c, d)
+
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS referral_warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referral_id INTEGER,
+                user_id INTEGER NOT NULL,
+                warning_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS uid_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                quotex_uid TEXT NOT NULL,
+                event TEXT NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS vip_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                days INTEGER,
+                old_until TEXT,
+                new_until TEXT,
+                admin_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS vip_reminders_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(user_id, kind)
+            );
+            CREATE TABLE IF NOT EXISTS admin_actions_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_id TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mm_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                signal_id INTEGER,
+                trade_mode TEXT NOT NULL DEFAULT 'BASE',
+                result TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                pnl_cents INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_usage_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                image_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                result_summary TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS referral_levels (
+                min_refs INTEGER PRIMARY KEY,
+                bonus_cents INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_users_name ON users(first_name);
+            CREATE INDEX IF NOT EXISTS idx_referrals_status ON referrals(status);
+            CREATE INDEX IF NOT EXISTS idx_uid_tracking_uid ON uid_tracking(quotex_uid);
+            """)
+
+            levels = [(1,100),(5,125),(10,150),(20,200),(30,250)]
+            for n, cents in levels:
+                conn.execute("INSERT OR IGNORE INTO referral_levels(min_refs,bonus_cents) VALUES(?,?)", (n,cents))
+
+            defaults = {
+                "free_cycle_days":"2", "withdraw_hold_minutes":"0",
+                "referral_qualification":"UID + $15 deposit attestation + admin review",
+                "candle_ai_enabled":"OFF", "candle_ai_max_images":"3",
+                "candle_ai_vip_limit":"50", "candle_ai_nonvip_limit":"3",
+                "candle_ai_confidence_min":"70", "candle_ai_model":"gemini-2.5-flash",
+                "mm_payout_percent":"85", "mm_min_base":"1.00",
+                "vip_reminder_days":"7,3", "result_reveal":"OFF",
+            }
+            for k,v in defaults.items():
+                conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def safe_startup_migration():
+    """Run original migrations plus additive migration without killing polling."""
+    try:
+        init_db()
+    except Exception:
+        logger.exception("Initial DB init failed")
+        return False
+    try:
+        migrate_final_schema()
+    except Exception:
+        logger.exception("Legacy schema migration failed; continuing with safe migration")
+    try:
+        ensure_signal_user_results()
+    except Exception:
+        logger.exception("Signal-user result migration failed")
+    try:
+        final_migration()
+    except Exception:
+        logger.exception("Final additive migration failed")
+    return True
+
+
+def admin_audit(admin_id, action, target_id="", note=""):
+    try:
+        with DB_LOCK:
+            conn=db()
+            try:
+                conn.execute("INSERT INTO admin_actions_log(admin_id,action,target_id,note,created_at) VALUES(?,?,?,?,?)",(admin_id,str(action),str(target_id),str(note),utc_iso(now_utc())))
+                conn.commit()
+            finally: conn.close()
+    except Exception:
+        logger.exception("Admin audit failed")
+
+
+def _daily_reset_key():
+    now = now_bd()
+    # Daily MM/AI reset is 06:00 Bangladesh time.
+    return (now.date() if now.hour >= 6 else (now.date()-timedelta(days=1))).isoformat()
+
+
+def reset_user_daily_state(user_id):
+    day=_daily_reset_key()
+    with DB_LOCK:
+        conn=db()
+        try:
+            u=conn.execute("SELECT ai_usage_date,mm_date FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if not u: return
+            if u["ai_usage_date"] != day:
+                conn.execute("UPDATE users SET ai_usage_count=0,ai_usage_date=? WHERE user_id=?",(day,user_id))
+            if u["mm_date"] != day:
+                conn.execute("UPDATE users SET mm_daily_win_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0,mm_current_mode='BASE',mm_date=? WHERE user_id=?",(day,user_id))
+            conn.commit()
+        finally: conn.close()
+
+
+def vip_is_active(user):
+    if not user: return False
+    if user["status"] != "VIP": return False
+    until=user["vip_until"]
+    if not until: return True
+    try: return datetime.fromisoformat(until).astimezone(BD_TZ) > now_bd()
+    except Exception: return False
+
+
+def vip_expiry_loop():
+    while True:
+        try:
+            with DB_LOCK:
+                conn=db()
+                try:
+                    rows=conn.execute("SELECT * FROM users WHERE status='VIP' AND vip_until IS NOT NULL").fetchall()
+                finally: conn.close()
+            now=now_bd()
+            for u in rows:
+                try: exp=datetime.fromisoformat(u["vip_until"]).astimezone(BD_TZ)
+                except Exception: continue
+                if exp <= now:
+                    with DB_LOCK:
+                        conn=db()
+                        try:
+                            conn.execute("UPDATE users SET status='FREE',vip_until=NULL,vip_reminder_7d_sent=0,vip_reminder_3d_sent=0 WHERE user_id=?",(u["user_id"],))
+                            conn.execute("INSERT INTO vip_history(user_id,action,old_until,admin_id,created_at) VALUES(?,?,?,?,?)",(u["user_id"],"EXPIRED",u["vip_until"],ADMIN_ID,utc_iso(now_utc())))
+                            conn.commit()
+                        finally: conn.close()
+                    try: bot.send_message(u["user_id"],"⏰ <b>VIP Expired</b>\nআপনার account এখন FREE status-এ ফিরে গেছে.",reply_markup=main_keyboard(u["user_id"]))
+                    except Exception: pass
+                    continue
+                days=(exp-now).total_seconds()/86400
+                if days <= 3 and not int(u["vip_reminder_3d_sent"] or 0):
+                    _send_vip_reminder(u,"3d",exp)
+                elif days <= 7 and not int(u["vip_reminder_7d_sent"] or 0):
+                    _send_vip_reminder(u,"7d",exp)
+        except Exception:
+            logger.exception("VIP expiry loop error")
+        time.sleep(300)
+
+
+def _send_vip_reminder(user,kind,exp):
+    text=f"⏰ <b>VIP Reminder</b>\n\n⭐ Your VIP expires: <b>{exp.strftime('%d %b %Y %I:%M %p')}</b>\n📅 Reminder: {kind.replace('d',' days')}"
+    try: bot.send_message(user["user_id"],text,reply_markup=main_keyboard(user["user_id"]))
+    except Exception: pass
+    with DB_LOCK:
+        conn=db()
+        try:
+            conn.execute("INSERT OR IGNORE INTO vip_reminders_log(user_id,kind,sent_at) VALUES(?,?,?)",(user["user_id"],kind,utc_iso(now_utc())))
+            conn.execute("UPDATE users SET vip_reminder_7d_sent=CASE WHEN ?='7d' THEN 1 ELSE vip_reminder_7d_sent END,vip_reminder_3d_sent=CASE WHEN ?='3d' THEN 1 ELSE vip_reminder_3d_sent END WHERE user_id=?",(kind,kind,user["user_id"]))
+            conn.commit()
+        finally: conn.close()
+
+
+def mm_daily_reset_loop():
+    while True:
+        try:
+            day=_daily_reset_key()
+            with DB_LOCK:
+                conn=db()
+                try:
+                    conn.execute("UPDATE users SET mm_daily_win_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0,mm_current_mode='BASE',mm_date=? WHERE mm_enabled=1 AND (mm_date IS NULL OR mm_date<>?)",(day,day))
+                    conn.commit()
+                finally: conn.close()
+        except Exception: logger.exception("MM daily reset error")
+        time.sleep(60)
+
+
+def ai_limit_reset_loop():
+    while True:
+        try:
+            day=_daily_reset_key()
+            with DB_LOCK:
+                conn=db()
+                try:
+                    conn.execute("UPDATE users SET ai_usage_count=0,ai_usage_date=? WHERE ai_usage_date IS NULL OR ai_usage_date<>?",(day,day))
+                    conn.commit()
+                finally: conn.close()
+        except Exception: logger.exception("AI limit reset error")
+        time.sleep(60)
+
+
+def cleanup_states_loop():
+    while True:
+        try:
+            cutoff=time.time()-3600
+            for uid,st in list(STATES.items()):
+                if st.get("updated_ts",0) < cutoff:
+                    STATES.pop(uid,None)
+        except Exception: logger.exception("STATE cleanup error")
+        time.sleep(300)
+
+
+def _state_set(uid, data):
+    data=dict(data); data["updated_ts"]=time.time(); STATES[uid]=data
+
+
+def warn_user(user_id, reason, admin_id=None, referral_id=None, warning_type="MANUAL"):
+    admin_id=admin_id or ADMIN_ID
+    with DB_LOCK:
+        conn=db()
+        try:
+            conn.execute("INSERT INTO referral_warnings(referral_id,user_id,warning_type,reason,created_by,created_at) VALUES(?,?,?,?,?,?)",(referral_id,user_id,warning_type,reason,admin_id,utc_iso(now_utc())))
+            conn.execute("UPDATE users SET warning_count=warning_count+1,warning_reason=? WHERE user_id=?",(reason,user_id))
+            row=conn.execute("SELECT warning_count,referred_by FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if row and int(row["warning_count"] or 0)>=3:
+                conn.execute("UPDATE users SET blocked=1,status='BLOCKED' WHERE user_id=?",(user_id,))
+            conn.commit()
+        finally: conn.close()
+    admin_audit(admin_id,"WARNING",user_id,reason)
+    try:
+        count=get_user(user_id)["warning_count"]
+        bot.send_message(user_id,f"⚠️ <b>Warning</b>\n\n{escape(reason)}\n\n⚠️ Warning count: <b>{count}/3</b>" + ("\n🚫 3 warnings reached — account blocked." if count>=3 else ""),reply_markup=main_keyboard(user_id))
+    except Exception: pass
+    return count
+
+
+def vip_duration_keyboard(prefix="vipdur"):
+    kb=types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("7 Days",callback_data=f"{prefix}:7"),types.InlineKeyboardButton("15 Days",callback_data=f"{prefix}:15"))
+    kb.row(types.InlineKeyboardButton("30 Days",callback_data=f"{prefix}:30"),types.InlineKeyboardButton("60 Days",callback_data=f"{prefix}:60"))
+    kb.row(types.InlineKeyboardButton("90 Days",callback_data=f"{prefix}:90"),types.InlineKeyboardButton("♾️ Unlimited",callback_data=f"{prefix}:0"))
+    return kb
+
+
+def start_uid_submission(message):
+    uid=message.from_user.id
+    u=get_user(uid)
+    if u and u["status"]=="VIP":
+        return bot.send_message(message.chat.id,"⭐ আপনি already VIP.",reply_markup=main_keyboard(uid))
+    with DB_LOCK:
+        conn=db()
+        try: pending=conn.execute("SELECT 1 FROM uid_submissions WHERE user_id=? AND status='PENDING'",(uid,)).fetchone()
+        finally: conn.close()
+    if pending: return bot.send_message(message.chat.id,"⏳ আপনার UID already pending আছে.",reply_markup=main_keyboard(uid))
+    _state_set(uid,{"action":"uid_confirm"})
+    bot.send_message(message.chat.id,
+        "🆔 <b>Quotex UID Verification</b>\n\n"
+        "UID submit করার আগে confirmation প্রয়োজন:\n\n"
+        "☐ আমি Quotex referral link দিয়ে account করেছি\n"
+        "☐ আমি $15+ deposit করেছি\n\n"
+        "⚠️ Screenshot লাগবে না। Admin review করবে.",
+        reply_markup=make_keyboard([["✅ সব ঠিক আছে","❌ Cancel"],["🔗 Register on Quotex"],["🔙 Back","🏠 Main Menu"]]))
+
+
+def _submit_uid_after_confirm(message):
+    uid=message.from_user.id
+    _state_set(uid,{"action":"uid"})
+    bot.send_message(message.chat.id,"🆔 <b>Quotex UID</b>\n\n6–15 digit UID পাঠান.",reply_markup=back_keyboard())
+
+
+def _record_uid_confirmation(uid):
+    with DB_LOCK:
+        conn=db()
+        try:
+            conn.execute("UPDATE users SET uid_confirmed=1,uid_confirm_at=? WHERE user_id=?",(utc_iso(now_utc()),uid))
+            conn.commit()
+        finally: conn.close()
+
+
+def _create_referral_for_user(user_id, quotex_uid):
+    with DB_LOCK:
+        conn=db()
+        try:
+            u=conn.execute("SELECT referred_by FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if not u or not u["referred_by"]: return None
+            existing=conn.execute("SELECT id FROM referrals WHERE referred_id=?",(user_id,)).fetchone()
+            if existing: return existing["id"]
+            bonus=100
+            r=conn.execute("INSERT INTO referrals(referrer_id,referred_id,bonus_cents,status,quotex_uid,deposit_amount_cents,created_at) VALUES(?,?,?,?,?,?,?)",(u["referred_by"],user_id,bonus,"PENDING",quotex_uid,1500,utc_iso(now_utc())))
+            rid=r.lastrowid
+            conn.execute("INSERT INTO uid_tracking(user_id,quotex_uid,event,note,created_at) VALUES(?,?,?,?,?)",(user_id,quotex_uid,"SUBMITTED","Referral UID; $15 deposit attested",utc_iso(now_utc())))
+            conn.commit(); return rid
+        finally: conn.close()
+
+
+def _qualify_referral_after_vip(user_id, admin_id):
+    with DB_LOCK:
+        conn=db()
+        try:
+            r=conn.execute("SELECT * FROM referrals WHERE referred_id=? AND status='PENDING'",(user_id,)).fetchone()
+            if not r: return
+            conn.execute("UPDATE referrals SET status='QUALIFIED',qualified_at=?,reviewed_by=?,reviewed_at=? WHERE id=?",(utc_iso(now_utc()),admin_id,utc_iso(now_utc()),r["id"]))
+            conn.commit()
+        finally: conn.close()
+    try: bot.send_message(r["referrer_id"],f"✅ <b>Referral Qualified</b>\nUser: <code>{user_id}</code>\n💰 Bonus: {money(r['bonus_cents'])}\nStatus: QUALIFIED")
+    except Exception: pass
+
+
+def release_referral_bonuses():
+    """Release only QUALIFIED referrals; never pay at signal view time."""
+    with DB_LOCK:
+        conn=db()
+        try:
+            rows=conn.execute("SELECT * FROM referrals WHERE status='QUALIFIED'").fetchall()
+            for r in rows:
+                already=conn.execute("SELECT 1 FROM wallet_tx WHERE user_id=? AND kind='REFERRAL_BONUS' AND note LIKE ? LIMIT 1",(r["referrer_id"],f"Referral #{r['id']}%" )).fetchone()
+                if already: continue
+                conn.execute("UPDATE users SET wallet_cents=wallet_cents+?,refs_count=refs_count+1 WHERE user_id=?",(r["bonus_cents"],r["referrer_id"]))
+                conn.execute("INSERT INTO wallet_tx(user_id,amount_cents,kind,note,created_at) VALUES(?,?,?,?,?)",(r["referrer_id"],r["bonus_cents"],"REFERRAL_BONUS",f"Referral #{r['id']} approved",utc_iso(now_utc())))
+                conn.execute("UPDATE referrals SET status='PAID',paid_at=? WHERE id=?",(utc_iso(now_utc()),r["id"]))
+            conn.commit()
+        finally: conn.close()
+
+
+def secure_process_referral_bonus(user_id):
+    # Compatibility shim: qualification is admin/VIP based, not signal-view based.
+    return
+
+
+def mm_calculate(balance_cents,target_cents,loss_cents,payout_percent=85.0):
+    payout=max(1.0,float(payout_percent))/100.0
+    base=max(100, int(round(target_cents/6.5/payout)))
+    base_profit=int(round(base*payout))
+    m1=max(base, int(round((base+base_profit)/payout)))
+    return base,m1
+
+
+def mm_configure(user_id,balance,target,loss,payout=85.0):
+    balance=max(0,int(round(float(balance)*100))); target=max(0,int(round(float(target)*100))); loss=max(0,int(round(float(loss)*100)))
+    base,m1=mm_calculate(balance,target,loss,payout)
+    with DB_LOCK:
+        conn=db()
+        try:
+            conn.execute("UPDATE users SET mm_balance_cents=?,mm_target_cents=?,mm_loss_limit_cents=?,mm_base_cents=?,mm_m1_cents=?,mm_payout_percent=?,mm_current_mode='BASE',mm_daily_win_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0,mm_enabled=1,mm_date=? WHERE user_id=?",(balance,target,loss,base,m1,payout,_daily_reset_key(),user_id))
+            conn.commit()
+        finally: conn.close()
+    return base,m1
+
+
+def mm_status_text(user_id):
+    reset_user_daily_state(user_id); u=get_user(user_id)
+    if not u: return "MM unavailable."
+    enabled="ON" if int(u["mm_enabled"] or 0) else "OFF"
+    mode=u["mm_current_mode"] or "BASE"
+    amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100)
+    pnl=int(u["mm_daily_win_cents"] or 0)-int(u["mm_daily_loss_cents"] or 0)
+    target=int(u["mm_target_cents"] or 0); loss=int(u["mm_loss_limit_cents"] or 0)
+    return (f"💰 <b>MONEY MANAGEMENT</b>\n\n🔘 Status: <b>{enabled}</b>\n💵 Balance: <b>{money(u['mm_balance_cents'])}</b>\n🎯 Win Target: <b>{money(target)}</b>\n🛑 Loss Limit: <b>{money(loss)}</b>\n\n📊 Today Net: <b>{money(pnl)}</b>\n🔢 Trades: <b>{u['mm_trade_count']}</b>\n🎯 Target: <b>{money(target)}</b>\n🛑 Loss Limit: <b>{money(loss)}</b>\n\n➡️ Next: <b>{mode}</b>\n💵 Trade: <b>{money(amount)}</b>")
+
+
+def mm_menu(message):
+    uid=message.from_user.id
+    bot.send_message(message.chat.id,mm_status_text(uid),reply_markup=make_keyboard([["⚙️ Setup MM","🔘 MM ON/OFF"],["📊 MM Status","💵 Change Base"],["💲 Change M1","📈 Change Payout"],["🛑 Stop MM Today"],["🔙 Back","🏠 Main Menu"]]))
+
+
+def _mm_trade_result(user_id, signal_id, result, mode=None):
+    reset_user_daily_state(user_id)
+    with DB_LOCK:
+        conn=db()
+        try:
+            u=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if not u or not int(u["mm_enabled"] or 0) or int(u["mm_stop"] or 0): return
+            mode=mode or (u["mm_current_mode"] or "BASE")
+            amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100)
+            payout=max(0,float(u["mm_payout_percent"] or 85)/100)
+            pnl=int(round(amount*payout)) if result in ("WIN","M1 WIN") else (-amount if result in ("LOSS","M1 LOSS") else 0)
+            conn.execute("INSERT INTO mm_trades(user_id,signal_id,trade_mode,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?,?)",(user_id,signal_id,mode,result,amount,pnl,utc_iso(now_utc())))
+            if pnl>=0: conn.execute("UPDATE users SET mm_daily_win_cents=mm_daily_win_cents+? WHERE user_id=?",(pnl,user_id))
+            else: conn.execute("UPDATE users SET mm_daily_loss_cents=mm_daily_loss_cents+? WHERE user_id=?",(-pnl,user_id))
+            conn.execute("UPDATE users SET mm_trade_count=mm_trade_count+1 WHERE user_id=?",(user_id,))
+            u=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if int(u["mm_loss_limit_cents"] or 0)>0 and int(u["mm_daily_loss_cents"] or 0)>=int(u["mm_loss_limit_cents"]):
+                conn.execute("UPDATE users SET mm_stop=1 WHERE user_id=?",(user_id,))
+            elif int(u["mm_target_cents"] or 0)>0 and int(u["mm_daily_win_cents"] or 0)>=int(u["mm_target_cents"]):
+                conn.execute("UPDATE users SET mm_stop=1 WHERE user_id=?",(user_id,))
+            else:
+                # Base loss => M1. Base win => Base. M1 win/loss => Base.
+                next_mode="M1" if (mode=="BASE" and result=="LOSS") else "BASE"
+                conn.execute("UPDATE users SET mm_current_mode=? WHERE user_id=?",(next_mode,user_id))
+            conn.commit()
+        finally: conn.close()
+
+
+def result_buttons(signal_id,user_id):
+    with DB_LOCK:
+        conn=db()
+        try: row=conn.execute("SELECT result FROM signal_user_results WHERE signal_id=? AND user_id=?",(signal_id,user_id)).fetchone()
+        finally: conn.close()
+    if row: return None
+    reset_user_daily_state(user_id); u=get_user(user_id)
+    mode=(u["mm_current_mode"] or "BASE") if u and int(u["mm_enabled"] or 0) and not int(u["mm_stop"] or 0) else "BASE"
+    amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100) if u else 100
+    kb=types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(f"💰 {mode} {money(amount)}",callback_data=f"mmnoop:{signal_id}"))
+    if mode=="M1":
+        kb.row(types.InlineKeyboardButton("✅ M1 WIN",callback_data=f"mmres:{signal_id}:M1:WIN"),types.InlineKeyboardButton("❌ M1 LOSS",callback_data=f"mmres:{signal_id}:M1:LOSS"),types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"mmres:{signal_id}:M1:SKIP"))
+    else:
+        kb.row(types.InlineKeyboardButton("✅ WIN",callback_data=f"mmres:{signal_id}:BASE:WIN"),types.InlineKeyboardButton("❌ LOSS",callback_data=f"mmres:{signal_id}:BASE:LOSS"),types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"mmres:{signal_id}:BASE:SKIP"))
+    return kb
+
+
+def handle_candle_photo(message):
+    uid=message.from_user.id
+    st=STATES.get(uid)
+    if not st or st.get("action")!="candle_upload": return False
+    u=get_user(uid); reset_user_daily_state(uid); u=get_user(uid)
+    if not candle_ai_enabled() and not is_master(uid):
+        clear_state(uid); bot.send_message(message.chat.id,"🤖 AI Candle Analysis বর্তমানে OFF.",reply_markup=main_keyboard(uid)); return True
+    vip=vip_is_active(u)
+    limit=int(u["ai_limit_vip"] if vip else u["ai_limit_nonvip"]) if u else 3
+    limit=max(1,limit)
+    if int(u["ai_usage_count"] or 0)>=limit and not is_master(uid):
+        bot.send_message(message.chat.id,f"⛔ আজকের AI limit শেষ।\n{'⭐ VIP' if vip else '👤 FREE'} limit: <b>{limit}/day</b>",reply_markup=main_keyboard(uid)); return True
+    max_images=candle_ai_max_images(); images=st.setdefault("images",[])
+    if len(images)>=max_images:
+        bot.send_message(message.chat.id,f"⚠️ Maximum {max_images} screenshots reached. এখন 🔍 Analyze Candles চাপুন.",reply_markup=make_keyboard([["🔍 Analyze Candles","🗑️ Clear Candles"],["🔙 Back","🏠 Main Menu"]])); return True
+    try:
+        photo=message.photo[-1]; images.append(photo.file_id); _state_set(uid,st)
+        bot.send_message(message.chat.id,f"✅ Screenshot {len(images)}/{max_images} added.",reply_markup=make_keyboard([["🔍 Analyze Candles","🗑️ Clear Candles"],["🔙 Back","🏠 Main Menu"]]))
+    except Exception: logger.exception("AI photo upload failed")
+    return True
+
+
+def candle_ai_prompt():
+    return """You are analyzing a Quotex-style trading chart screenshot. Analyze ONLY visible evidence. Never invent indicators, prices, candles, volume, RSI, MACD, Fibonacci, Bollinger Bands, news, or time. If evidence is missing, say not visible. Check: (1) at least 20 visible candles, (2) timeframe if visible, (3) trend over ~20 candles, (4) momentum over last 5, (5) last 3 candle pattern, (6) support/resistance, (7) volume/RSI/MACD/Fibonacci/Bollinger only if visible, (8) confirmation using at least 2 independent visible signals. If fewer than 20 candles, blurry, cropped/unclear, text-only, or conflicting, output WAIT. Confidence must be evidence-based; never claim certainty. Output Bengali + English mix with: Chart Analysis, Trend, Candle Pattern, Support/Resistance, Momentum, Volatility, Signal UP/DOWN/WAIT, Confidence band, Next Candle Time if visible/inferable from visible clock/timeframe, Signal Time + Direction, Risk note. Strong UP requires multiple visible confirmations such as trend/support/bullish pattern. Strong DOWN requires multiple visible confirmations such as trend/resistance/bearish pattern. RSI/MACD/news may be used only when actually visible. Prediction is not a guarantee."""
+
+
+def analyze_candle_state(message):
+    uid=message.from_user.id; st=STATES.get(uid)
+    if not st or st.get("action")!="candle_upload": return False
+    text=(message.text or "").strip()
+    if text=="🗑️ Clear Candles": st["images"]=[]; _state_set(uid,st); bot.send_message(message.chat.id,"🗑️ Screenshots cleared.",reply_markup=make_keyboard([["🔍 Analyze Candles","🗑️ Clear Candles"],["🔙 Back","🏠 Main Menu"]])); return True
+    if text!="🔍 Analyze Candles": return False
+    file_ids=list(st.get("images") or [])
+    if not file_ids: bot.send_message(message.chat.id,"📸 আগে screenshot upload করুন."); return True
+    u=get_user(uid); reset_user_daily_state(uid); u=get_user(uid); vip=vip_is_active(u); limit=int(u["ai_limit_vip"] if vip else u["ai_limit_nonvip"])
+    if int(u["ai_usage_count"] or 0)>=limit and not is_master(uid):
+        clear_state(uid); bot.send_message(message.chat.id,"⛔ আজকের AI limit শেষ.",reply_markup=main_keyboard(uid)); return True
+    bot.send_message(message.chat.id,"🔎 AI chart analysis চলছে…")
+    try:
+        raws=[]
+        for fid in file_ids:
+            info=bot.get_file(fid); raws.append(bot.download_file(info.file_path))
+        result=gemini_analyze_candle_images(raws)
+        status="OK" if result and not result.startswith("⚠️") else "FAILED"
+        with DB_LOCK:
+            conn=db()
+            try:
+                conn.execute("UPDATE users SET ai_usage_count=ai_usage_count+1,ai_usage_date=? WHERE user_id=?",(_daily_reset_key(),uid))
+                conn.execute("INSERT INTO ai_usage_log(user_id,image_count,status,result_summary,created_at) VALUES(?,?,?,?,?)",(uid,len(raws),status,result[:1000],utc_iso(now_utc())))
+                conn.commit()
+            finally: conn.close()
+    except Exception:
+        logger.exception("AI analysis failed"); result="⚠️ ANALYSIS FAILED\n\n📸 Screenshot download/analyze করা যায়নি. Clear screenshot আবার পাঠান."; status="FAILED"
+        try:
+            with DB_LOCK:
+                conn=db(); conn.execute("INSERT INTO ai_usage_log(user_id,image_count,status,result_summary,created_at) VALUES(?,?,?,?,?)",(uid,len(file_ids),status,result,utc_iso(now_utc()))); conn.commit(); conn.close()
+        except Exception: pass
+    clear_state(uid)
+    u=get_user(uid); reset_user_daily_state(uid); u=get_user(uid); mode=u["mm_current_mode"] or "BASE"; amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100)
+    extra=f"\n\n━━━━━━━━━━━━━━━━━━\n💰 <b>Money Management</b>\n💵 Trade: <b>{money(amount)}</b>\n📈 WIN হলে: <b>+{money(int(round(amount*(float(u['mm_payout_percent'] or 85)/100))) )}</b>\n📉 LOSS হলে: <b>{'M1 '+money(u['mm_m1_cents']) if mode=='BASE' else 'Next BASE'}</b>" if int(u["mm_enabled"] or 0) else ""
+    bot.send_message(message.chat.id,"🤖 <b>AI CANDLE ANALYSIS</b>\n\n"+result+extra+"\n\n⚠️ Prediction — guarantee নয়.",reply_markup=main_keyboard(uid)); return True
+
+
+def ai_settings_menu(message):
+    uid=message.from_user.id
+    if not can(uid,"settings"): return bot.send_message(message.chat.id,"⛔ Access denied.",reply_markup=admin_keyboard())
+    bot.send_message(message.chat.id,
+        f"🤖 <b>AI SETTINGS</b>\n\nAI: <b>{get_setting('candle_ai_enabled','OFF')}</b>\nVIP limit: <b>{get_setting('candle_ai_vip_limit','50')}/day</b>\nNon-VIP limit: <b>{get_setting('candle_ai_nonvip_limit','3')}/day</b>\nMax screenshots: <b>{get_setting('candle_ai_max_images','3')}</b>\nConfidence min: <b>{get_setting('candle_ai_confidence_min','70')}%</b>",
+        reply_markup=make_keyboard([["🤖 AI ON/OFF","⭐ VIP Limit"],["👤 Non-VIP Limit","🖼️ Max Screenshots"],["🎯 Confidence Min","📊 AI Usage Stats"],["🔙 Back","🏠 Main Menu"]]))
+
+
+def _user_search(message, mode, value):
+    value=value.strip(); row=None
+    with DB_LOCK:
+        conn=db()
+        try:
+            if mode=="ID" and value.isdigit(): row=conn.execute("SELECT * FROM users WHERE user_id=?",(int(value),)).fetchone()
+            elif mode=="USERNAME": row=conn.execute("SELECT * FROM users WHERE lower(username)=lower(?)",(value.lstrip('@'),)).fetchone()
+            elif mode=="NAME": row=conn.execute("SELECT * FROM users WHERE lower(first_name) LIKE lower(?) ORDER BY user_id DESC LIMIT 1",(f"%{value}%",)).fetchone()
+        finally: conn.close()
+    if not row: return bot.send_message(message.chat.id,"📭 User পাওয়া যায়নি.",reply_markup=admin_keyboard())
+    _state_set(message.from_user.id,{"action":"user_action","target_id":row["user_id"]})
+    bot.send_message(message.chat.id,f"👤 <b>USER DETAILS</b>\n\nID: <code>{row['user_id']}</code>\nUsername: @{escape(row['username'] or '—')}\nName: {escape(row['first_name'] or '—')}\nStatus: <b>{row['status']}</b>\nVIP Until: {escape(row['vip_until'] or 'Unlimited/—')}\nWallet: <b>{money(row['wallet_cents'])}</b>\nWarnings: <b>{row['warning_count']}</b>",reply_markup=make_keyboard([["⭐ VIP","🚫 Block"],["💳 Wallet","📩 Message"],["⚠️ Warn","♻️ Reset"],["👥 Referrals","📊 Stats"],["🔙 Back","🏠 Main Menu"]]))
+
+
+def admin_category_keyboard():
+    return make_keyboard([["📊 Signals","👥 Users"],["⭐ VIP","💰 Money"],["🎁 Referral","⚙️ Settings"],["📈 Analytics","📝 Content"],["🔙 Back","🏠 Main Menu"]])
+
+
+def admin_keyboard():
+    return admin_category_keyboard()
+
+
+def handle_admin_button(message):
+    text=(message.text or "").strip(); uid=message.from_user.id
+    if text=="📊 Signals": return bot.send_message(message.chat.id,"📊 <b>SIGNALS</b>",reply_markup=make_keyboard([["➕ Add Future Signals","📋 Future Signal List"],["✏️ Edit Signal","🗑️ Delete Signal"],["🧹 Clear Future Signals","📤 Auto Send ON/OFF"],["🎯 Signal Audience","⚡ Live Session"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="👥 Users": return bot.send_message(message.chat.id,"👥 <b>USERS</b>",reply_markup=make_keyboard([["🔍 Search User","👥 All Users"],["🚫 Blocked Users","⚠️ Warning List"],["📩 Message User","📢 Broadcast"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="⭐ VIP": return bot.send_message(message.chat.id,"⭐ <b>VIP MANAGEMENT</b>",reply_markup=make_keyboard([["📋 VIP List","➕ Add VIP"],["⏰ Expiry Table","❌ Remove VIP"],["📢 Send Reminder","🆔 Pending UID"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="💰 Money": return bot.send_message(message.chat.id,"💰 <b>MONEY</b>",reply_markup=make_keyboard([["💸 Withdrawals","📊 Withdrawal Reports"],["💳 Wallet Adjust","💰 Referral History"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="🎁 Referral": return bot.send_message(message.chat.id,"🎁 <b>REFERRAL</b>",reply_markup=make_keyboard([["📋 Pending Referral","✅ Approved Referral"],["❌ Rejected Referral","⚠️ Referral Warning"],["🚫 Blocked Referral","💰 Referral History"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="⚙️ Settings": return bot.send_message(message.chat.id,"⚙️ <b>SETTINGS</b>",reply_markup=make_keyboard([["🛠️ Maintenance ON/OFF","⚡ Live ON/OFF"],["🎟️ Set Free Limit","💵 Set Min Withdraw"],["💸 Withdraw ON/OFF","🔔 Auto Notification ON/OFF"],["🤖 AI Settings","🛡️ Sub-admins"],["🎯 Notify Targets","⚙️ Trading Contract"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="📈 Analytics": return bot.send_message(message.chat.id,"📈 <b>ANALYTICS</b>",reply_markup=make_keyboard([["📊 Dashboard","📈 Result Stats"],["👥 User Stats","💰 Revenue"],["🤖 AI Usage Stats","🔙 Back"]]))
+    if text=="📝 Content": return admin_text_editor(message)
+    if text=="🤖 AI Settings": return ai_settings_menu(message)
+    if text=="🤖 AI ON/OFF":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        old=get_setting("candle_ai_enabled","OFF"); new="OFF" if old=="ON" else "ON"; set_setting("candle_ai_enabled",new)
+        return bot.send_message(message.chat.id,f"🤖 AI: <b>{new}</b>",reply_markup=admin_keyboard())
+    if text=="⭐ VIP Limit":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        _state_set(uid,{"action":"set_ai_vip_limit"}); return bot.send_message(message.chat.id,"⭐ VIP AI daily limit দিন. Example: 50",reply_markup=back_keyboard())
+    if text=="👤 Non-VIP Limit":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        _state_set(uid,{"action":"set_ai_nonvip_limit"}); return bot.send_message(message.chat.id,"👤 Non-VIP AI daily limit দিন. Example: 3",reply_markup=back_keyboard())
+    if text=="🖼️ Max Screenshots":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        _state_set(uid,{"action":"set_candle_max_images"}); return bot.send_message(message.chat.id,"🖼️ Max screenshots দিন (1–10).",reply_markup=back_keyboard())
+    if text=="🎯 Confidence Min":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        _state_set(uid,{"action":"set_ai_confidence"}); return bot.send_message(message.chat.id,"🎯 Minimum confidence % দিন. Example: 70",reply_markup=back_keyboard())
+    if text=="📊 AI Usage Stats": return _ai_usage_stats(message)
+    if text=="🔍 Search User": _state_set(uid,{"action":"user_search_mode"}); return bot.send_message(message.chat.id,"Search by:",reply_markup=make_keyboard([["🆔 By ID","👤 By Username"],["📝 By Name"],["🔙 Back","🏠 Main Menu"]]))
+    if text=="⚠️ Warning List": return _warning_list(message)
+    if text=="👥 All Users": return _all_users(message)
+    if text=="🚫 Blocked Users": return _blocked_users(message)
+    if text=="📋 VIP List": return _vip_list(message)
+    if text=="⏰ Expiry Table": return _vip_expiry_table(message)
+    if text=="➕ Add VIP": _state_set(uid,{"action":"vip_add_id"}); return bot.send_message(message.chat.id,"Telegram ID লিখুন:",reply_markup=back_keyboard())
+    if text=="❌ Remove VIP": _state_set(uid,{"action":"vip_remove_id"}); return bot.send_message(message.chat.id,"Telegram ID লিখুন:",reply_markup=back_keyboard())
+    if text=="📢 Send Reminder": return _vip_expiry_table(message,reminder=True)
+    if text=="📋 Pending Referral": return _referral_review_list(message,"PENDING")
+    if text=="✅ Approved Referral": return _referral_review_list(message,"PAID")
+    if text=="❌ Rejected Referral": return _referral_review_list(message,"REJECTED")
+    if text=="⚠️ Referral Warning": _state_set(uid,{"action":"referral_warn_id"}); return bot.send_message(message.chat.id,"Referral user Telegram ID দিন:",reply_markup=back_keyboard())
+    if text=="🚫 Blocked Referral": return _referral_review_list(message,"BLOCKED")
+    if text=="💰 Referral History": return admin_referral_history(message)
+    if text=="📊 Dashboard": return admin_analytics(message)
+    if text=="👥 User Stats": return _all_users(message,stats=True)
+    if text=="💰 Revenue": return admin_withdrawal_report(message)
+    if text=="🤖 AI Usage Stats": return _ai_usage_stats(message)
+    # legacy submenu buttons remain available
+    return LEGACY_HANDLE_ADMIN_BUTTON(message)
+
+
+def _all_users(message,stats=False):
+    if not can(message.from_user.id,"users"): return bot.send_message(message.chat.id,"⛔ Access denied.",reply_markup=admin_keyboard())
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT user_id,username,first_name,status,wallet_cents,warning_count,vip_until FROM users ORDER BY user_id DESC LIMIT 30").fetchall()
+        finally: conn.close()
+    lines=["👥 <b>USERS</b>"]
+    for r in rows: lines.append(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {r['status']} | {money(r['wallet_cents'])} | W:{r['warning_count']}")
+    bot.send_message(message.chat.id,"\n".join(lines),reply_markup=admin_keyboard())
+
+
+def _blocked_users(message):
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT user_id,username,first_name,warning_count FROM users WHERE blocked=1 OR status='BLOCKED' ORDER BY user_id DESC").fetchall()
+        finally: conn.close()
+    msg="🚫 <b>BLOCKED USERS</b>\n\n"+"\n".join(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | W:{r['warning_count']}" for r in rows) if rows else "🚫 No blocked users."
+    bot.send_message(message.chat.id,msg,reply_markup=admin_keyboard())
+
+
+def _warning_list(message):
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT user_id,username,warning_count,warning_reason FROM users WHERE warning_count>0 ORDER BY warning_count DESC LIMIT 30").fetchall()
+        finally: conn.close()
+    msg="⚠️ <b>WARNING LIST</b>\n\n"+"\n".join(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {r['warning_count']}/3 | {escape(r['warning_reason'] or '')}" for r in rows) if rows else "⚠️ No warnings."
+    bot.send_message(message.chat.id,msg,reply_markup=admin_keyboard())
+
+
+def _vip_list(message):
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT user_id,username,first_name,vip_until FROM users WHERE status='VIP' ORDER BY vip_until IS NULL DESC,vip_until ASC LIMIT 50").fetchall()
+        finally: conn.close()
+    msg="⭐ <b>VIP LIST</b>\n\n"+"\n".join(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {escape(r['vip_until'] or 'Unlimited')}" for r in rows) if rows else "⭐ No VIP users."
+    bot.send_message(message.chat.id,msg,reply_markup=admin_keyboard())
+
+
+def _vip_expiry_table(message,reminder=False):
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT user_id,username,vip_until FROM users WHERE status='VIP' AND vip_until IS NOT NULL ORDER BY vip_until ASC LIMIT 50").fetchall()
+        finally: conn.close()
+    now=now_bd(); lines=["⏰ <b>VIP EXPIRY TABLE</b>"]
+    for r in rows:
+        try: days=max(0,int((datetime.fromisoformat(r['vip_until']).astimezone(BD_TZ)-now).total_seconds()/86400))
+        except Exception: days=-1
+        lines.append(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {escape(r['vip_until'])} | {days} days")
+        if reminder and days<=7:
+            try: bot.send_message(r['user_id'],f"📢 VIP reminder\n⏰ Expires: <b>{escape(r['vip_until'])}</b>")
+            except Exception: pass
+    bot.send_message(message.chat.id,"\n".join(lines) if len(lines)>1 else "⏰ No expiring VIP.",reply_markup=admin_keyboard())
+
+
+def _referral_review_list(message,status):
+    with DB_LOCK:
+        conn=db()
+        try: rows=conn.execute("SELECT * FROM referrals WHERE status=? ORDER BY id DESC LIMIT 20",(status,)).fetchall()
+        finally: conn.close()
+    if not rows: return bot.send_message(message.chat.id,f"🎁 No {status} referrals.",reply_markup=admin_keyboard())
+    for r in rows:
+        kb=types.InlineKeyboardMarkup()
+        if status in ("PENDING","QUALIFIED"):
+            kb.row(types.InlineKeyboardButton("✅ Approve",callback_data=f"refapprove:{r['id']}"),types.InlineKeyboardButton("❌ Reject",callback_data=f"refreject:{r['id']}"),types.InlineKeyboardButton("⚠️ Warn",callback_data=f"refwarn:{r['id']}"))
+        bot.send_message(message.chat.id,f"🎁 <b>Referral #{r['id']}</b>\nReferrer: <code>{r['referrer_id']}</code>\nUser: <code>{r['referred_id']}</code>\nUID: <code>{escape(r['quotex_uid'] or '—')}</code>\nDeposit attested: {money(r['deposit_amount_cents'])}\nStatus: <b>{r['status']}</b>\nRisk: {r['risk_flag']} {escape(r['risk_note'] or '')}",reply_markup=kb if status in ("PENDING","QUALIFIED") else None)
+
+
+def _ai_usage_stats(message):
+    with DB_LOCK:
+        conn=db()
+        try:
+            a=conn.execute("SELECT COUNT(*) n,COALESCE(SUM(image_count),0) images FROM ai_usage_log WHERE date(created_at)=date('now')").fetchone()
+            rows=conn.execute("SELECT user_id,COUNT(*) n FROM ai_usage_log GROUP BY user_id ORDER BY n DESC LIMIT 10").fetchall()
+        finally: conn.close()
+    lines=[f"🤖 <b>AI USAGE</b>\nToday: {a['n']} analyses / {a['images']} screenshots",""]
+    lines += [f"<code>{r['user_id']}</code> — {r['n']} analyses" for r in rows]
+    bot.send_message(message.chat.id,"\n".join(lines),reply_markup=admin_keyboard())
+
+
+# ------------------------- State override ---------------------
+_LEGACY_FINAL_STATE = LEGACY_HANDLE_STATE
+
+def handle_state(message):
+    uid=message.from_user.id; text=(message.text or "").strip(); st=STATES.get(uid)
+    if st: _state_set(uid,st); st=STATES.get(uid)
+    if text in ("🔙 Back","🏠 Main Menu","❌ Cancel") and st and st.get("action") not in ("withdraw_admin_action",):
+        clear_state(uid); send_main_menu(message.chat.id,uid,"🏠 Main Menu"); return True
+    if not st: return _LEGACY_FINAL_STATE(message)
+    try:
+        action=st.get("action")
+        if action=="uid_confirm":
+            if text=="🔗 Register on Quotex":
+                link=get_setting("quotex_ref_link",os.getenv("QUOTEX_REF_LINK","").strip())
+                if link: bot.send_message(message.chat.id,f"🔗 <b>Register on Quotex</b>\n{escape(link)}")
+                return True
+            if text=="✅ সব ঠিক আছে": _record_uid_confirmation(uid); return _submit_uid_after_confirm(message)
+            if text=="❌ Cancel": clear_state(uid); bot.send_message(message.chat.id,"❌ Cancelled.",reply_markup=main_keyboard(uid)); return True
+            raise ValueError("Confirmation button ব্যবহার করুন.")
+        if action=="user_search_mode":
+            if text=="🆔 By ID": _state_set(uid,{"action":"user_search_value","mode":"ID"})
+            elif text=="👤 By Username": _state_set(uid,{"action":"user_search_value","mode":"USERNAME"})
+            elif text=="📝 By Name": _state_set(uid,{"action":"user_search_value","mode":"NAME"})
+            else: raise ValueError("Search option বেছে নিন.")
+            bot.send_message(message.chat.id,"Search value দিন:",reply_markup=back_keyboard()); return True
+        if action=="user_search_value": _user_search(message,st["mode"],text); return True
+        if action=="user_action":
+            tid=int(st["target_id"])
+            if text=="🚫 Block":
+                with DB_LOCK:
+                    conn=db(); conn.execute("UPDATE users SET blocked=1,status='BLOCKED' WHERE user_id=?",(tid,)); conn.commit(); conn.close()
+                admin_audit(uid,"BLOCK",tid); clear_state(uid); return bot.send_message(message.chat.id,"🚫 User blocked.",reply_markup=admin_keyboard())
+            if text=="⚠️ Warn": _state_set(uid,{"action":"warn_target_reason","target_id":tid}); return bot.send_message(message.chat.id,"Warning reason লিখুন:",reply_markup=back_keyboard())
+            if text=="♻️ Reset":
+                with DB_LOCK:
+                    conn=db(); conn.execute("UPDATE users SET blocked=0,status='FREE',warning_count=0,warning_reason=NULL WHERE user_id=?",(tid,)); conn.commit(); conn.close()
+                admin_audit(uid,"USER_RESET",tid); clear_state(uid); return bot.send_message(message.chat.id,"♻️ User reset.",reply_markup=admin_keyboard())
+            if text=="📩 Message": _state_set(uid,{"action":"message_user","target_id":tid}); return bot.send_message(message.chat.id,"Message লিখুন:",reply_markup=back_keyboard())
+            if text=="⭐ VIP": _state_set(uid,{"action":"vip_add_id","target_id":tid}); return bot.send_message(message.chat.id,"VIP duration নির্বাচন করুন:",reply_markup=make_keyboard([["7 Days","15 Days","30 Days"],["60 Days","90 Days","♾️ Unlimited"],["🔙 Back","🏠 Main Menu"]]))
+            return True
+        if action=="warn_target_reason":
+            warn_user(int(st["target_id"]),text,uid); clear_state(uid); return bot.send_message(message.chat.id,"⚠️ Warning added.",reply_markup=admin_keyboard())
+        if action=="message_user":
+            tid=int(st["target_id"]); bot.send_message(tid,text); 
+            with DB_LOCK:
+                conn=db(); conn.execute("INSERT INTO user_messages(user_id,admin_id,message,created_at) VALUES(?,?,?,?)",(tid,uid,text,utc_iso(now_utc()))); conn.commit(); conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,"📩 Message sent.",reply_markup=admin_keyboard())
+        if action=="referral_warn_id":
+            warn_user(int(text),"Admin referral review warning",uid); clear_state(uid); return bot.send_message(message.chat.id,"⚠️ Warning added.",reply_markup=admin_keyboard())
+        if action=="vip_add_id":
+            target=int(st.get("target_id") or text); 
+            if text in ("7 Days","15 Days","30 Days","60 Days","90 Days","♾️ Unlimited"):
+                days={"7 Days":7,"15 Days":15,"30 Days":30,"60 Days":60,"90 Days":90,"♾️ Unlimited":0}[text]
+                with DB_LOCK:
+                    conn=db(); u=conn.execute("SELECT vip_until FROM users WHERE user_id=?",(target,)).fetchone()
+                    old=u["vip_until"] if u else None
+                    new=None if days==0 else (now_bd()+timedelta(days=days)).isoformat()
+                    conn.execute("UPDATE users SET status='VIP',vip_until=?,vip_started_at=?,vip_reminder_7d_sent=0,vip_reminder_3d_sent=0 WHERE user_id=?",(new,utc_iso(now_utc()),target))
+                    conn.execute("INSERT INTO vip_history(user_id,action,days,old_until,new_until,admin_id,created_at) VALUES(?,?,?,?,?,?,?)",(target,"GRANT",days,old,new,uid,utc_iso(now_utc()))); conn.commit(); conn.close()
+                _qualify_referral_after_vip(target,uid); admin_audit(uid,"VIP_GRANT",target,text); clear_state(uid)
+                label="Unlimited" if days==0 else f"{days} days"; exp="Unlimited" if not new else datetime.fromisoformat(new).astimezone(BD_TZ).strftime("%d %b %Y %I:%M %p")
+                try: bot.send_message(target,f"⭐ <b>VIP হয়েছেন!</b>\n📅 Duration: <b>{label}</b>\n⏰ Expires: <b>{exp}</b>",reply_markup=main_keyboard(target))
+                except Exception: pass
+                release_referral_bonuses(); return bot.send_message(message.chat.id,"✅ VIP updated.",reply_markup=admin_keyboard())
+            raise ValueError("VIP duration button ব্যবহার করুন.")
+        if action=="vip_remove_id":
+            target=int(text)
+            with DB_LOCK:
+                conn=db(); conn.execute("UPDATE users SET status='FREE',vip_until=NULL WHERE user_id=?",(target,)); conn.execute("INSERT INTO vip_history(user_id,action,admin_id,created_at) VALUES(?,?,?,?)",(target,"REMOVE",uid,utc_iso(now_utc()))); conn.commit(); conn.close()
+            admin_audit(uid,"VIP_REMOVE",target); clear_state(uid); return bot.send_message(message.chat.id,"❌ VIP removed.",reply_markup=admin_keyboard())
+        if action=="set_ai_vip_limit":
+            n=max(1,min(500,int(text))); set_setting("candle_ai_vip_limit",n)
+            with DB_LOCK:
+                conn=db(); conn.execute("UPDATE users SET ai_limit_vip=?",(n,)); conn.commit(); conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,f"⭐ VIP AI limit: {n}/day",reply_markup=admin_keyboard())
+        if action=="set_ai_nonvip_limit":
+            n=max(1,min(100,int(text))); set_setting("candle_ai_nonvip_limit",n)
+            with DB_LOCK:
+                conn=db(); conn.execute("UPDATE users SET ai_limit_nonvip=?",(n,)); conn.commit(); conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,f"👤 Non-VIP AI limit: {n}/day",reply_markup=admin_keyboard())
+        if action=="set_ai_confidence":
+            n=max(50,min(99,int(text))); set_setting("candle_ai_confidence_min",n); clear_state(uid); return bot.send_message(message.chat.id,f"🎯 Minimum confidence: {n}%",reply_markup=admin_keyboard())
+        if action=="set_candle_max_images":
+            n=max(1,min(10,int(text))); set_setting("candle_ai_max_images",n); clear_state(uid); return bot.send_message(message.chat.id,f"🖼️ Max screenshots: {n}",reply_markup=admin_keyboard())
+        if action=="mm_setup":
+            if "balance" not in st: st["balance"]=float(text.replace("$","")); st["step"]=1; _state_set(uid,st); return bot.send_message(message.chat.id,"🎯 Daily Win Target কত? Example: 30",reply_markup=back_keyboard())
+            if st.get("step")==1: st["target"]=float(text.replace("$","")); st["step"]=2; _state_set(uid,st); return bot.send_message(message.chat.id,"🛑 Daily Loss Limit কত? Example: 20",reply_markup=back_keyboard())
+            st["loss"]=float(text.replace("$","")); base,m1=mm_configure(uid,st["balance"],st["target"],st["loss"],float(get_setting("mm_payout_percent","85"))); clear_state(uid); return bot.send_message(message.chat.id,f"✅ MM configured.\n💵 Base: <b>{money(base)}</b>\n💲 M1: <b>{money(m1)}</b>\n📈 Payout: <b>{get_setting('mm_payout_percent','85')}%</b>",reply_markup=mm_keyboard())
+        if action=="mm_set_base":
+            n=max(1.0,float(text.replace("$",""))); with_conn=db();
+            try: with_conn.execute("UPDATE users SET mm_base_cents=? WHERE user_id=?",(int(round(n*100)),uid)); with_conn.commit()
+            finally: with_conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,"✅ Base updated.",reply_markup=mm_keyboard())
+        if action=="mm_set_m1":
+            n=max(1.0,float(text.replace("$",""))); with_conn=db();
+            try: with_conn.execute("UPDATE users SET mm_m1_cents=? WHERE user_id=?",(int(round(n*100)),uid)); with_conn.commit()
+            finally: with_conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,"✅ M1 updated.",reply_markup=mm_keyboard())
+        if action=="mm_set_payout":
+            n=max(1,min(100,float(text))); with_conn=db();
+            try: with_conn.execute("UPDATE users SET mm_payout_percent=? WHERE user_id=?",(n,uid)); with_conn.commit()
+            finally: with_conn.close()
+            clear_state(uid); return bot.send_message(message.chat.id,"✅ Payout updated.",reply_markup=mm_keyboard())
+        return _LEGACY_FINAL_STATE(message)
+    except Exception as exc:
+        logger.exception("Final state handler error")
+        bot.send_message(message.chat.id,"❌ <b>Error</b>\n\n"+escape(str(exc)),reply_markup=back_keyboard()); return True
+
+
+# ------------------------- Admin callback additions -----------
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("refapprove:"))
+def final_refapprove(call):
+    if not can(call.from_user.id,"vip"):
+        bot.answer_callback_query(call.id,"Access denied",show_alert=True); return
+    rid=int(call.data.split(":",1)[1])
+    with DB_LOCK:
+        conn=db()
+        try:
+            r=conn.execute("SELECT * FROM referrals WHERE id=? AND status IN ('PENDING','QUALIFIED')",(rid,)).fetchone()
+            if not r: bot.answer_callback_query(call.id,"Referral not pending",show_alert=True); return
+            conn.execute("UPDATE referrals SET status='QUALIFIED',qualified_at=?,reviewed_by=?,reviewed_at=? WHERE id=?",(utc_iso(now_utc()),call.from_user.id,utc_iso(now_utc()),rid)); conn.commit()
+        finally: conn.close()
+    release_referral_bonuses(); admin_audit(call.from_user.id,"REFERRAL_APPROVE",rid); bot.answer_callback_query(call.id,"Approved");
+    try: bot.send_message(r["referred_id"],"✅ Referral review completed: <b>APPROVED</b>")
+    except Exception: pass
+    try: bot.send_message(r["referrer_id"],f"💰 Referral #{rid} approved and bonus released: <b>{money(r['bonus_cents'])}</b>")
+    except Exception: pass
+    try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+    except Exception: pass
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("refreject:"))
+def final_refreject(call):
+    if not can(call.from_user.id,"vip"):
+        bot.answer_callback_query(call.id,"Access denied",show_alert=True); return
+    rid=int(call.data.split(":",1)[1]);
+    kb=types.InlineKeyboardMarkup(); reasons=[("💰 Deposit করা হয়নি","deposit"),("🆔 UID পাওয়া যায়নি","uid"),("📊 Trade করা হয়নি","trade"),("🔗 Link দিয়ে account করা হয়নি","link"),("⚠️ Fake Proof","fake"),("✏️ Custom Reason","custom")]
+    for i in range(0,len(reasons),2): kb.row(*[types.InlineKeyboardButton(reasons[j][0],callback_data=f"refreason:{rid}:{reasons[j][1]}") for j in range(i,min(i+2,len(reasons)))])
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"❌ <b>Reject Reason</b>",reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("refwarn:"))
+def final_refwarn(call):
+    if not can(call.from_user.id,"vip"):
+        bot.answer_callback_query(call.id,"Access denied",show_alert=True); return
+    rid=int(call.data.split(":",1)[1])
+    with DB_LOCK:
+        conn=db();
+        try: r=conn.execute("SELECT referred_id FROM referrals WHERE id=?",(rid,)).fetchone()
+        finally: conn.close()
+    if r: warn_user(r["referred_id"],"Referral manual review warning",call.from_user.id,rid,"REFERRAL")
+    bot.answer_callback_query(call.id,"Warning added")
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("refreason:"))
+def final_refreason(call):
+    if not can(call.from_user.id,"vip"):
+        bot.answer_callback_query(call.id,"Access denied",show_alert=True); return
+    _,rid,reason=call.data.split(":",2); rid=int(rid)
+    labels={"deposit":"Deposit করা হয়নি","uid":"UID পাওয়া যায়নি","trade":"Trade করা হয়নি","link":"Link দিয়ে account করা হয়নি","fake":"Fake Proof"}
+    if reason=="custom":
+        _state_set(call.from_user.id,{"action":"ref_custom_reason","referral_id":rid}); bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"Custom reject reason লিখুন:",reply_markup=back_keyboard()); return
+    _reject_referral(rid,labels.get(reason,reason),call.from_user.id,reason); bot.answer_callback_query(call.id,"Rejected")
+
+
+def _reject_referral(rid,reason,admin_id,reason_type="custom"):
+    with DB_LOCK:
+        conn=db()
+        try:
+            r=conn.execute("SELECT * FROM referrals WHERE id=?",(rid,)).fetchone()
+            if not r: return
+            conn.execute("UPDATE referrals SET status='REJECTED',reject_reason=?,reject_reason_type=?,rejected_by=?,rejected_at=?,reviewed_by=?,reviewed_at=? WHERE id=?",(reason,reason_type,admin_id,utc_iso(now_utc()),admin_id,utc_iso(now_utc()),rid)); conn.commit()
+        finally: conn.close()
+    admin_audit(admin_id,"REFERRAL_REJECT",rid,reason)
+    for target in (r["referred_id"],r["referrer_id"]):
+        try: bot.send_message(target,f"❌ <b>Referral #{rid} rejected</b>\nReason: {escape(reason)}")
+        except Exception: pass
+
+
+# Extend handle_state with custom referral reason by wrapping the final handler.
+_PREV_HANDLE_STATE=handle_state
+def handle_state(message):
+    uid=message.from_user.id; st=STATES.get(uid)
+    if st and st.get("action")=="ref_custom_reason":
+        try:
+            _reject_referral(int(st["referral_id"]),message.text or "Custom reason",uid,"custom"); clear_state(uid); bot.send_message(message.chat.id,"❌ Referral rejected.",reply_markup=admin_keyboard()); return True
+        except Exception as exc: bot.send_message(message.chat.id,"❌ "+escape(str(exc))); return True
+    return _PREV_HANDLE_STATE(message)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("mmres:"))
+def final_mm_result(call):
+    try:
+        _,sid_s,mode,res=call.data.split(":",3); sid=int(sid_s); uid=call.from_user.id
+        if mode not in ("BASE","M1") or res not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
+        with DB_LOCK:
+            conn=db()
+            try:
+                if mode=="BASE":
+                    if conn.execute("SELECT 1 FROM signal_user_results WHERE signal_id=? AND user_id=?",(sid,uid)).fetchone():
+                        bot.answer_callback_query(call.id,"Already submitted.",show_alert=True); return
+                    conn.execute("INSERT INTO signal_user_results(signal_id,user_id,result,created_at) VALUES(?,?,?,?)",(sid,uid,res,utc_iso(now_utc())))
+                    conn.commit()
+            finally: conn.close()
+        if mode=="BASE" and res in ("WIN","LOSS"):
+            _mm_trade_result(uid,sid,res,"BASE")
+        if mode=="BASE" and res=="LOSS":
+            u=get_user(uid); reset_user_daily_state(uid); u=get_user(uid)
+            if u and int(u["mm_enabled"] or 0) and not int(u["mm_stop"] or 0):
+                m1=int(u["mm_m1_cents"] or 0)
+                kb=types.InlineKeyboardMarkup(); kb.row(types.InlineKeyboardButton(f"💵 M1 {money(m1)}",callback_data=f"mmnoop:{sid}")); kb.row(types.InlineKeyboardButton("✅ M1 WIN",callback_data=f"mmres:{sid}:M1:WIN"),types.InlineKeyboardButton("❌ M1 LOSS",callback_data=f"mmres:{sid}:M1:LOSS"),types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"mmres:{sid}:M1:SKIP"))
+                bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=kb)
+            else:
+                bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        elif mode=="BASE":
+            bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        else:
+            if res in ("WIN","LOSS"): _mm_trade_result(uid,sid,"M1 WIN" if res=="WIN" else "M1 LOSS","M1")
+            bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        bot.answer_callback_query(call.id,"Result saved")
+        u=get_user(uid)
+        try:
+            bot.send_message(uid, f"📊 Result: <b>{'M1 ' if mode=='M1' else ''}{res}</b>\n➡️ Next: <b>{u['mm_current_mode'] if u else 'BASE'}</b>")
+        except Exception: pass
+    except Exception as exc:
+        logger.exception("MM result callback failed"); bot.answer_callback_query(call.id,"Error: "+str(exc),show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("mmnoop:"))
+def final_mmnoop(call):
+    bot.answer_callback_query(call.id,"Use WIN / LOSS / SKIP buttons below.")
+
+
+# Replace the old signal result callback by adding M1 callbacks via a new
+# dedicated prefix. Existing sigres remains backward-compatible for Base.
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("m1res:"))
+def final_m1_result(call):
+    try:
+        _,sid_s,res=call.data.split(":",2); sid=int(sid_s); uid=call.from_user.id
+        if res not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
+        _mm_trade_result(uid,sid,"M1 WIN" if res=="WIN" else "M1 LOSS" if res=="LOSS" else "SKIP","M1")
+        bot.answer_callback_query(call.id,"M1 result saved")
+        bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+    except Exception as exc: bot.answer_callback_query(call.id,str(exc),show_alert=True)
+
+
+# Add a safe wrapper for the old sigres function's post-processing by
+# replacing its callable name is not enough for registered handlers, so patch
+# the function body behavior through a small helper used by future deliveries.
+def _base_result_markup(signal_id,user_id):
+    with DB_LOCK:
+        conn=db()
+        try: row=conn.execute("SELECT result FROM signal_user_results WHERE signal_id=? AND user_id=?",(signal_id,user_id)).fetchone()
+        finally: conn.close()
+    if row: return None
+    kb=types.InlineKeyboardMarkup(); kb.row(types.InlineKeyboardButton("✅ WIN",callback_data=f"sigres:{signal_id}:WIN"),types.InlineKeyboardButton("❌ LOSS",callback_data=f"sigres:{signal_id}:LOSS"),types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"sigres:{signal_id}:SKIP")); return kb
+
+
+def patched_format_signal_final(signal):
+    signal_datetime=bd_from_iso(signal["signal_at_utc"]); up=signal["direction"]=="UP"; icon="🟢⬆️" if up else "🔴⬇️"; label="UP / BUY" if up else "DOWN / SELL / PUT"
+    return ("━━━━━━━━━━━━━━━━━━\n🚨 <b>SM QUATEX SURE SHORT</b>\n━━━━━━━━━━━━━━━━━━\n\n"+f"📅 <b>{signal_datetime.strftime('%d %B %Y')}</b>\n💱 Pair: <b>{escape(signal['pair'])}</b>\n⏰ Time: <b>{signal_datetime.strftime('%I:%M %p')}</b>\n{icon} Direction: <b>{label}</b>\n🎯 Confidence: <b>{escape(signal['confidence'])}</b>\n\n━━━━━━━━━━━━━━━━━━")
+
+format_signal=patched_format_signal_final
+
+
+def patched_deliver_signal_final(user_id, signal_id, source="manual"):
+    signal=get_signal(signal_id)
+    if not signal or not signal["active"] or not audience_allows(signal,user_id) or not quota_available(user_id): return False,"not_allowed"
+    with DB_LOCK:
+        conn=db()
+        try:
+            if conn.execute("SELECT 1 FROM deliveries WHERE signal_id=? AND user_id=?",(signal_id,user_id)).fetchone(): return False,"already"
+            conn.execute("INSERT INTO deliveries(signal_id,user_id,delivered_at,source) VALUES(?,?,?,?)",(signal_id,user_id,utc_iso(now_utc()),source))
+            u=conn.execute("SELECT status FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if u and u["status"]!="VIP": conn.execute("UPDATE users SET free_used=free_used+1 WHERE user_id=?",(user_id,))
+            conn.commit()
+        finally: conn.close()
+    try:
+        reset_user_daily_state(user_id); u=get_user(user_id)
+        text=patched_format_signal_final(signal)
+        if u and int(u["mm_enabled"] or 0) and not int(u["mm_stop"] or 0):
+            mode=u["mm_current_mode"] or "BASE"; amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100); profit=int(round(amount*float(u["mm_payout_percent"] or 85)/100))
+            text += f"\n\n💰 <b>Money Management</b>\n💵 Trade: <b>{money(amount)}</b>\n📈 WIN হলে: <b>+{money(profit)}</b>\n📉 LOSS হলে M1: <b>{money(u['mm_m1_cents'])}</b>"
+        bot.send_message(user_id,text,reply_markup=result_buttons(signal_id,user_id))
+        return True,"sent"
+    except Exception:
+        logger.exception("Final signal delivery failed")
+        with DB_LOCK:
+            conn=db()
+            try:
+                conn.execute("DELETE FROM deliveries WHERE signal_id=? AND user_id=?",(signal_id,user_id)); conn.execute("UPDATE users SET free_used=MAX(0,free_used-1) WHERE user_id=? AND status!='VIP'",(user_id,)); conn.commit()
+            finally: conn.close()
+        return False,"send_error"
+
+deliver_signal=patched_deliver_signal_final
+
+
+def vote_menu(message):
+    uid=message.from_user.id; signal=next_signal_for_user(uid)
+    if not signal: return bot.send_message(message.chat.id,"📭 কোনো signal vote করার জন্য নেই।",reply_markup=main_keyboard(uid))
+    with DB_LOCK:
+        conn=db()
+        try: vote=conn.execute("SELECT vote FROM votes WHERE signal_id=? AND user_id=?",(signal["id"],uid)).fetchone()
+        finally: conn.close()
+    reset_user_daily_state(uid); u=get_user(uid)
+    mm=(f"\n\n💰 <b>Money Management</b>\n💵 Trade: <b>{money(u['mm_m1_cents'] if (u['mm_current_mode']=='M1') else u['mm_base_cents'])}</b>\n📈 WIN হলে: <b>+{money(int(round((u['mm_m1_cents'] if u['mm_current_mode']=='M1' else u['mm_base_cents'])*float(u['mm_payout_percent'] or 85)/100)))}</b>\n📉 LOSS হলে M1: <b>{money(u['mm_m1_cents'])}</b>" if u and int(u['mm_enabled'] or 0) else "")
+    if vote: return bot.send_message(message.chat.id,patched_format_signal_final(signal)+mm+f"\n\n🗳️ Your vote: <b>{escape(vote['vote'])}</b>",reply_markup=main_keyboard(uid))
+    _state_set(uid,{"action":"vote","signal_id":signal["id"]})
+    bot.send_message(message.chat.id,patched_format_signal_final(signal)+mm+"\n\n🗳️ Vote নির্বাচন করুন:",reply_markup=make_keyboard([["🟢 UP / BUY","🔴 DOWN / SELL"],["⏭️ SKIP"],["🔙 Back","🏠 Main Menu"]]))
+
+
+def main():
+    if not safe_startup_migration(): logger.error("DB startup had errors; polling will still retry")
+    try: backup_database()
+    except Exception: logger.exception("Initial backup failed")
+    # Threads are independent; one failure must never kill the bot.
+    for target,name in [(auto_signal_loop,"auto_signal_loop"),(backup_loop,"backup_loop"),(vip_expiry_loop,"vip_expiry_loop"),(mm_daily_reset_loop,"mm_daily_reset_loop"),(cleanup_states_loop,"cleanup_states_loop"),(ai_limit_reset_loop,"ai_limit_reset_loop")]:
+        try: threading.Thread(target=target,daemon=True,name=name).start()
+        except Exception: logger.exception("Could not start %s",name)
+    if not os.getenv("GEMINI_API_KEY","").strip():
+        try: bot.send_message(ADMIN_ID,"⚠️ <b>Gemini API key missing</b>\nAI Candle Analysis will stay unavailable until GEMINI_API_KEY is added.")
+        except Exception: logger.info("Gemini key missing; admin notification could not be sent")
+    logger.info("SM QUATEX SURE SHORT started")
+    while True:
+        try:
+            try: bot.remove_webhook()
+            except Exception: logger.exception("Webhook cleanup failed")
+            try: me=bot.get_me(); logger.info("Telegram connected as @%s (%s)",getattr(me,"username","unknown"),getattr(me,"id","?"))
+            except Exception: logger.exception("Telegram authentication failed"); time.sleep(5); continue
+            bot.infinity_polling(skip_pending=False,timeout=30,long_polling_timeout=30)
+        except Exception:
+            logger.exception("Polling crashed; reconnecting")
+            time.sleep(5)
 
 
 # ============================================================
