@@ -4,6 +4,11 @@ import time
 import sqlite3
 import threading
 import logging
+import base64
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from html import escape
@@ -339,10 +344,6 @@ def init_db():
                 "free_limit": "4",
 
                 "referral_bonus": "1.00",
-
-                "quotex_ref_link": QUOTEX_REF_LINK,
-
-                "free_cycle_days": "2",
 
                 "min_withdraw": "5.00",
 
@@ -784,6 +785,10 @@ def main_keyboard(user_id):
         ],
 
         [
+            "📸 AI Candle Analysis"
+        ],
+
+        [
             "❓ Help / FAQ"
         ]
 
@@ -870,13 +875,36 @@ def admin_keyboard():
 
 
 def mm_keyboard():
+
     return make_keyboard([
-        ["💵 Starting Balance", "🎯 Daily Profit Target"],
-        ["🛑 Daily Loss Limit", "🧮 Calculate MM"],
-        ["🟢 MM ON/OFF", "📊 MM Status"],
-        ["🔄 Reset Today", "🔙 Back"],
-        ["🏠 Main Menu"]
+
+        [
+            "💵 Set Balance",
+            "🎯 Set Profit Target"
+        ],
+
+        [
+            "🛑 Set Loss Limit",
+            "💲 Set Base Trade"
+        ],
+
+        [
+            "1️⃣ Set M1 Trade",
+            "🔢 Max Trades/Day"
+        ],
+
+        [
+            "📊 MM Status",
+            "🛑 Stop MM Today"
+        ],
+
+        [
+            "🔙 Back",
+            "🏠 Main Menu"
+        ]
+
     ])
+
 
 # ============================================================
 # SIGNAL PARSER
@@ -1901,101 +1929,74 @@ def auto_signal_loop():
 # ============================================================
 
 def mm_get(user_id):
+
+    keys = [
+        "balance",
+        "profit_target",
+        "loss_limit",
+        "base_trade",
+        "m1_trade",
+        "max_trades",
+        "stop_mm"
+    ]
+
+    result = {}
+
+
     with DB_LOCK:
-        conn=db()
+
+        conn = db()
+
         try:
-            row=conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-            if not row:
-                return {"balance":"0","profit_target":"0","loss_limit":"0","base_trade":"0","m1_trade":"0","enabled":"OFF","next_type":"BASE","daily_profit":"0","daily_loss":"0","date":now_bd().date().isoformat()}
-            return {
-                "balance": money(int(row["mm_balance_cents"] or 0)),
-                "profit_target": money(int(row["mm_profit_target_cents"] or 0)),
-                "loss_limit": money(int(row["mm_loss_limit_cents"] or 0)),
-                "base_trade": money(int(row["mm_base_cents"] or 0)),
-                "m1_trade": money(int(row["mm_m1_cents"] or 0)),
-                "enabled": "ON" if int(row["mm_enabled"] or 0) else "OFF",
-                "next_type": row["mm_next_type"] or "BASE",
-                "daily_profit": money(int(row["mm_daily_profit_cents"] or 0)),
-                "daily_loss": money(int(row["mm_daily_loss_cents"] or 0)),
-                "date": row["mm_date"] or now_bd().date().isoformat()
-            }
+
+            for key in keys:
+
+                row = conn.execute(
+                    """
+                    SELECT value
+                    FROM settings
+                    WHERE key=?
+                    """,
+                    (
+                        f"mm:{user_id}:{key}",
+                    )
+                ).fetchone()
+
+
+                if row:
+
+                    result[key] = row["value"]
+
+                else:
+
+                    if key == "stop_mm":
+
+                        result[key] = "OFF"
+
+                    elif key == "max_trades":
+
+                        result[key] = "0"
+
+                    else:
+
+                        result[key] = "0"
+
+
         finally:
+
             conn.close()
+
+
+    return result
 
 
 def mm_set(user_id, key, value):
-    # Legacy helper retained for old state flows; new MM writes to user columns.
-    col={
-        "balance":"mm_balance_cents",
-        "profit_target":"mm_profit_target_cents",
-        "loss_limit":"mm_loss_limit_cents",
-        "base_trade":"mm_base_cents",
-        "m1_trade":"mm_m1_cents"
-    }.get(key)
-    if not col:
-        return
-    cents=int(round(float(str(value).replace("$","").strip())*100))
-    with DB_LOCK:
-        conn=db()
-        try:
-            conn.execute(f"UPDATE users SET {col}=? WHERE user_id=?", (max(0,cents),user_id))
-            conn.commit()
-        finally:
-            conn.close()
 
-
-def calculate_mm(user_id):
-    """Auto-calculate BASE/M1 using a 1.88x return assumption (0.88x net profit).
-    The formula limits one BASE+M1 losing cycle to the configured daily loss limit.
-    """
-    with DB_LOCK:
-        conn=db()
-        try:
-            row=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
-            if not row: return False,"User not found."
-            balance=int(row["mm_balance_cents"] or 0)
-            target=int(row["mm_profit_target_cents"] or 0)
-            loss_limit=int(row["mm_loss_limit_cents"] or 0)
-            if balance<=0 or target<=0 or loss_limit<=0:
-                return False,"আগে Starting Balance, Daily Profit Target এবং Daily Loss Limit তিনটিই দিন।"
-            net_factor=0.88
-            cycle_factor=1+(1+1/net_factor) # BASE + M1 = 3.2727 × BASE
-            base=min(balance*0.01, loss_limit/cycle_factor, target/10)
-            base=max(1.0, base)
-            if base*cycle_factor>loss_limit:
-                base=loss_limit/cycle_factor
-            if base<1:
-                return False,"Daily Loss Limit খুব কম; valid trade amount তৈরি করা যাচ্ছে না।"
-            m1=(base+base)/net_factor
-            base_c=max(1,int(round(base)))
-            m1_c=max(base_c,int(round(m1)))
-            today=now_bd().date().isoformat()
-            conn.execute("UPDATE users SET mm_base_cents=?,mm_m1_cents=?,mm_enabled=1,mm_next_type='BASE',mm_date=?,mm_daily_profit_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0 WHERE user_id=?",(base_c,m1_c,today,user_id))
-            conn.commit()
-            return True,f"BASE ${base_c/100:.2f} | M1 ${m1_c/100:.2f}"
-        finally:
-            conn.close()
-
-
-def mm_status_text(user_id):
-    mm=mm_get(user_id)
-    target=float(mm["profit_target"]); limit=float(mm["loss_limit"])
-    profit=float(mm["daily_profit"]); loss=float(mm["daily_loss"])
-    stopped=(profit>=target>0 or loss>=limit>0)
-    return (
-        "💰 <b>MONEY MANAGEMENT</b>\n\n"
-        f"Status: <b>{mm['enabled']}</b>\n"
-        f"Starting Balance: <b>${float(mm['balance']):.2f}</b>\n"
-        f"Daily Profit Target: <b>${target:.2f}</b>\n"
-        f"Daily Loss Limit: <b>${limit:.2f}</b>\n\n"
-        f"BASE: <b>${float(mm['base_trade']):.2f}</b>\n"
-        f"M1: <b>${float(mm['m1_trade']):.2f}</b>\n"
-        f"Current P/L: <b>${profit-loss:.2f}</b>\n"
-        f"Next Trade: <b>{mm['next_type']}</b> — <b>${float(mm['m1_trade'] if mm['next_type']=='M1' else mm['base_trade']):.2f}</b>\n"
-        f"Today Profit: <b>${profit:.2f}</b>\n"
-        f"Today Loss: <b>${loss:.2f}</b>\n\n"
-        + ("🛑 Daily limit reached — MM stopped." if stopped else "📌 Payout assumption: 1.88x return / 0.88x net profit.")
+    set_setting(
+        f"mm:{user_id}:{key}",
+        value
     )
+
 
 # ============================================================
 # MAIN MENU
@@ -2315,21 +2316,83 @@ def status_menu(message):
 # ============================================================
 
 def start_uid_submission(message):
-    user_id=message.from_user.id
-    current_user=get_user(user_id)
-    if current_user and current_user["status"]=="VIP":
-        bot.send_message(message.chat.id,"⭐ আপনি already VIP।",reply_markup=main_keyboard(user_id)); return
+
+    user_id = message.from_user.id
+
+    current_user = get_user(
+        user_id
+    )
+
+
+    if (
+        current_user
+        and
+        current_user["status"] == "VIP"
+    ):
+
+        bot.send_message(
+            message.chat.id,
+            "⭐ আপনি already VIP।",
+            reply_markup=main_keyboard(
+                user_id
+            )
+        )
+
+        return
+
+
     with DB_LOCK:
-        conn=db()
+
+        conn = db()
+
         try:
-            pending=conn.execute("SELECT 1 FROM uid_submissions WHERE user_id=? AND status='PENDING'",(user_id,)).fetchone()
-        finally: conn.close()
+
+            pending = conn.execute(
+                """
+                SELECT 1
+                FROM uid_submissions
+
+                WHERE
+                    user_id=?
+                    AND status='PENDING'
+                """,
+                (
+                    user_id,
+                )
+            ).fetchone()
+
+        finally:
+
+            conn.close()
+
+
     if pending:
-        bot.send_message(message.chat.id,"⏳ আপনার UID already pending আছে।",reply_markup=main_keyboard(user_id)); return
-    try: link=get_setting("quotex_ref_link",QUOTEX_REF_LINK)
-    except Exception: link=QUOTEX_REF_LINK
-    bot.send_message(message.chat.id,"🆔 <b>Quotex VIP Registration</b>\n\nপ্রথমে referral link দিয়ে account/register করুন। তারপর নিচের button চাপুন।",reply_markup=make_keyboard([["🔗 Register on Quotex"],["✅ I Have Registered"],["🔙 Back","🏠 Main Menu"]]))
-    STATES[user_id]={"action":"uid_notice","link":link}
+
+        bot.send_message(
+            message.chat.id,
+            "⏳ আপনার UID already pending আছে।",
+            reply_markup=main_keyboard(
+                user_id
+            )
+        )
+
+        return
+
+
+    STATES[user_id] = {
+        "action": "uid"
+    }
+
+
+    bot.send_message(
+        message.chat.id,
+
+        "🆔 <b>Quotex UID</b>\n\n"
+        "আপনার Quotex UID পাঠান।\n\n"
+        "/cancel দিয়ে বাতিল করতে পারবেন।",
+
+        reply_markup=back_keyboard()
+    )
 
 
 # ============================================================
@@ -2917,8 +2980,47 @@ def result_menu(message):
 # ============================================================
 
 def mm_menu(message):
-    user_id=message.from_user.id
-    bot.send_message(message.chat.id, mm_status_text(user_id)+"\n\nSet the 3 inputs, then tap 🧮 Calculate MM.", reply_markup=mm_keyboard())
+
+    user_id = message.from_user.id
+
+    mm = mm_get(
+        user_id
+    )
+
+
+    bot.send_message(
+
+        message.chat.id,
+
+        "💰 <b>MONEY MANAGEMENT</b>\n\n"
+
+        f"Balance: "
+        f"${float(mm['balance']):.2f}\n"
+
+        f"Profit Target: "
+        f"${float(mm['profit_target']):.2f}\n"
+
+        f"Loss Limit: "
+        f"${float(mm['loss_limit']):.2f}\n"
+
+        f"Base Trade: "
+        f"${float(mm['base_trade']):.2f}\n"
+
+        f"M1 Trade: "
+        f"${float(mm['m1_trade']):.2f}\n"
+
+        f"Max Trades/Day: "
+        f"{mm['max_trades']}\n"
+
+        f"Stop Today: "
+        f"{mm['stop_mm']}\n\n"
+
+        "ℹ️ Money Management optional.\n"
+        "MM setup না করলেও Future Signal কাজ করবে.",
+
+        reply_markup=mm_keyboard()
+    )
+
 
 # ============================================================
 # ADMIN PANEL
@@ -4500,17 +4602,6 @@ def handle_state(message):
         # UID
         # ====================================================
 
-        if action == "uid_notice":
-            if text=="🔗 Register on Quotex":
-                link=state.get("link") or QUOTEX_REF_LINK
-                bot.send_message(message.chat.id,f"🔗 Register: {escape(link)}",reply_markup=make_keyboard([["✅ I Have Registered"],["🔙 Back","🏠 Main Menu"]]))
-                return True
-            if text=="✅ I Have Registered":
-                STATES[user_id]={"action":"uid"}
-                bot.send_message(message.chat.id,"🆔 এখন আপনার Quotex UID পাঠান।",reply_markup=back_keyboard())
-                return True
-            return True
-
         if action == "uid":
 
             current = get_user(user_id)
@@ -6035,14 +6126,10 @@ def handle_state(message):
             for row in users:
 
                 try:
-                    user_live_message=live_message
-                    mm=mm_get(row["user_id"])
-                    if mm["enabled"]=="ON":
-                        amount=mm["m1_trade"] if mm["next_type"]=="M1" else mm["base_trade"]
-                        user_live_message += f"\n\n💰 <b>MM {mm['next_type']} TRADE: ${float(amount):.2f}</b>"
+
                     bot.send_message(
                         row["user_id"],
-                        user_live_message,
+                        live_message,
                         reply_markup=live_result_markup(live_signal_id)
                     )
 
@@ -6079,14 +6166,44 @@ def handle_state(message):
         # ====================================================
 
         if action == "mm":
-            key=state["key"]
-            try: value=float(text.replace("$","").strip())
-            except Exception: raise ValueError("শুধু একটি valid number দিন।")
-            if value<=0: raise ValueError("Amount অবশ্যই 0-এর বেশি হতে হবে।")
-            mm_set(user_id,key,value)
-            clear_state(user_id)
-            bot.send_message(message.chat.id,"✅ Saved. এখন অন্য 2টি value দিন এবং 🧮 Calculate MM চাপুন।",reply_markup=mm_keyboard())
+
+            key = state["key"]
+
+            value = text.replace(
+                "$",
+                ""
+            ).strip()
+
+
+            if key == "max_trades":
+
+                int(value)
+
+            else:
+
+                float(value)
+
+
+            mm_set(
+                user_id,
+                key,
+                value
+            )
+
+
+            clear_state(
+                user_id
+            )
+
+
+            bot.send_message(
+                message.chat.id,
+                "✅ Money Management value saved.",
+                reply_markup=mm_keyboard()
+            )
+
             return True
+
 
         # ====================================================
         # WITHDRAW
@@ -6858,6 +6975,9 @@ def message_router(message):
         return
 
 
+    if text == "📸 AI Candle Analysis":
+        return start_candle_analysis(message)
+
     if text == "❓ Help / FAQ":
 
         help_menu(
@@ -6871,41 +6991,82 @@ def message_router(message):
     # MONEY MANAGEMENT BUTTONS
     # ========================================================
 
-    if text in ("💵 Starting Balance","🎯 Daily Profit Target","🛑 Daily Loss Limit"):
-        key={"💵 Starting Balance":"balance","🎯 Daily Profit Target":"profit_target","🛑 Daily Loss Limit":"loss_limit"}[text]
-        STATES[user_id]={"action":"mm","key":key}
-        label={"balance":"Starting Balance","profit_target":"Daily Profit Target","loss_limit":"Daily Loss Limit"}[key]
-        bot.send_message(message.chat.id,f"💰 {label} USD-তে পাঠান।\nExample: <code>100</code>",reply_markup=back_keyboard())
+    mm_buttons = {
+
+        "💵 Set Balance":
+            "balance",
+
+        "🎯 Set Profit Target":
+            "profit_target",
+
+        "🛑 Set Loss Limit":
+            "loss_limit",
+
+        "💲 Set Base Trade":
+            "base_trade",
+
+        "1️⃣ Set M1 Trade":
+            "m1_trade",
+
+        "🔢 Max Trades/Day":
+            "max_trades"
+
+    }
+
+
+    if text in mm_buttons:
+
+        STATES[user_id] = {
+
+            "action": "mm",
+
+            "key":
+                mm_buttons[text]
+
+        }
+
+
+        bot.send_message(
+
+            message.chat.id,
+
+            f"Enter "
+            f"<b>"
+            f"{mm_buttons[text].replace('_',' ').title()}"
+            f"</b>:",
+
+            reply_markup=back_keyboard()
+        )
+
         return
 
-    if text=="🧮 Calculate MM":
-        ok,msg=calculate_mm(user_id)
-        bot.send_message(message.chat.id,("✅ MM calculated successfully.\n" if ok else "❌ ")+msg,reply_markup=mm_keyboard())
+
+    if text == "📊 MM Status":
+
+        mm_menu(
+            message
+        )
+
         return
 
-    if text=="🟢 MM ON/OFF":
-        mm=mm_get(user_id)
-        new="OFF" if mm["enabled"]=="ON" else "ON"
-        with DB_LOCK:
-            conn=db()
-            try:
-                conn.execute("UPDATE users SET mm_enabled=?,mm_next_type=CASE WHEN ?=1 THEN COALESCE(NULLIF(mm_next_type,''),'BASE') ELSE 'BASE' END WHERE user_id=?",(1 if new=="ON" else 0,1 if new=="ON" else 0,user_id)); conn.commit()
-            finally: conn.close()
-        bot.send_message(message.chat.id,f"🟢 Money Management: <b>{new}</b>",reply_markup=mm_keyboard())
+
+    if text == "🛑 Stop MM Today":
+
+        mm_set(
+            user_id,
+            "stop_mm",
+            "ON"
+        )
+
+
+        bot.send_message(
+            message.chat.id,
+            "🛑 Money Management আজকের জন্য stopped.",
+            reply_markup=mm_keyboard()
+        )
+
         return
 
-    if text=="📊 MM Status":
-        bot.send_message(message.chat.id,mm_status_text(user_id),reply_markup=mm_keyboard())
-        return
-
-    if text=="🔄 Reset Today":
-        with DB_LOCK:
-            conn=db()
-            try:
-                conn.execute("UPDATE users SET mm_daily_profit_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0,mm_next_type='BASE',mm_date=? WHERE user_id=?",(now_bd().date().isoformat(),user_id)); conn.commit()
-            finally: conn.close()
-        bot.send_message(message.chat.id,"🔄 Today's MM state reset. Next trade: BASE.",reply_markup=mm_keyboard())
-        return
 
     # ========================================================
     # ADMIN
@@ -7005,8 +7166,6 @@ def migrate_final_schema():
             _ensure_column(conn, "users", "mm_daily_loss_cents", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "users", "mm_trade_count", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(conn, "users", "mm_date", "TEXT")
-            _ensure_column(conn, "users", "mm_enabled", "INTEGER NOT NULL DEFAULT 0")
-            _ensure_column(conn, "users", "mm_next_type", "TEXT NOT NULL DEFAULT 'BASE'")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS referral_levels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7037,8 +7196,7 @@ def migrate_final_schema():
                     result TEXT NOT NULL,
                     amount_cents INTEGER NOT NULL,
                     pnl_cents INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    trade_type TEXT NOT NULL DEFAULT 'BASE'
+                    created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS live_signal_user_results (
                     live_signal_id INTEGER NOT NULL,
@@ -7046,27 +7204,6 @@ def migrate_final_schema():
                     result TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(live_signal_id,user_id)
-                );
-                CREATE TABLE IF NOT EXISTS signal_user_trades (
-                    signal_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    trade_type TEXT NOT NULL,
-                    result TEXT NOT NULL,
-                    amount_cents INTEGER NOT NULL DEFAULT 0,
-                    pnl_cents INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY(signal_id,user_id,trade_type),
-                    FOREIGN KEY(signal_id) REFERENCES signals(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS live_user_trades (
-                    live_signal_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    trade_type TEXT NOT NULL,
-                    result TEXT NOT NULL,
-                    amount_cents INTEGER NOT NULL DEFAULT 0,
-                    pnl_cents INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY(live_signal_id,user_id,trade_type)
                 );
             """)
             for min_refs, bonus in [(a,b) for a,b,_ in REFERRAL_LEVEL_DEFAULTS]:
@@ -7086,7 +7223,7 @@ def migrate_final_schema():
                     conn.execute("UPDATE users SET wallet_cents=wallet_cents+? WHERE user_id=?", (row["amount_cents"], row["user_id"]))
                     conn.execute("INSERT INTO wallet_tx(user_id,amount_cents,kind,note,created_at) VALUES(?,?,?,?,?)", (row["user_id"], row["amount_cents"], "WITHDRAW_REFUND", "Duplicate pending withdrawal migration refund", utc_iso(now_utc())))
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_pending_withdrawal_per_user ON withdrawals(user_id) WHERE status='PENDING'")
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_uid_per_account ON uid_submissions(quotex_uid)")
+            # UID uniqueness is already enforced by uid_submissions.quotex_uid UNIQUE.
             conn.commit()
         finally:
             conn.close()
@@ -7237,21 +7374,17 @@ def ensure_signal_user_results():
 
 
 def result_buttons(signal_id, user_id):
-    mm=mm_get(user_id)
-    trade_type=mm["next_type"] if mm["enabled"]=="ON" else "BASE"
     with DB_LOCK:
         conn=db()
         try:
-            row=conn.execute("SELECT 1 FROM signal_user_trades WHERE signal_id=? AND user_id=? AND trade_type=?",(signal_id,user_id,trade_type)).fetchone()
+            row=conn.execute("SELECT result FROM signal_user_results WHERE signal_id=? AND user_id=?",(signal_id,user_id)).fetchone()
         finally: conn.close()
     if row:
         return None
-    amount=float(mm["m1_trade"] if trade_type=="M1" else mm["base_trade"]) if mm["enabled"]=="ON" else 0
-    label=f"{trade_type} ${amount:.2f}" if amount else trade_type
     kb=types.InlineKeyboardMarkup()
-    kb.row(types.InlineKeyboardButton(f"✅ WIN {label}", callback_data=f"sigres:{signal_id}:{trade_type}:WIN"), types.InlineKeyboardButton(f"❌ LOSS {label}", callback_data=f"sigres:{signal_id}:{trade_type}:LOSS"))
-    kb.row(types.InlineKeyboardButton("⏭️ SKIP", callback_data=f"sigres:{signal_id}:{trade_type}:SKIP"))
+    kb.row(types.InlineKeyboardButton("✅ WIN", callback_data=f"sigres:{signal_id}:WIN"), types.InlineKeyboardButton("❌ LOSE", callback_data=f"sigres:{signal_id}:LOSS"), types.InlineKeyboardButton("⏭️ SKIP", callback_data=f"sigres:{signal_id}:SKIP"))
     return kb
+
 
 def patched_deliver_signal(user_id, signal_id, source="manual"):
     signal=get_signal(signal_id)
@@ -7269,7 +7402,7 @@ def patched_deliver_signal(user_id, signal_id, source="manual"):
             conn.commit()
         finally: conn.close()
     try:
-        bot.send_message(user_id, format_signal_for_user(signal,user_id), reply_markup=result_buttons(signal_id,user_id))
+        bot.send_message(user_id, format_signal(signal), reply_markup=result_buttons(signal_id,user_id))
         secure_process_referral_bonus(user_id)
         return True,"sent"
     except Exception as exc:
@@ -7291,15 +7424,6 @@ def patched_format_signal(signal):
     icon="🟢⬆️" if up else "🔴⬇️"
     label="UP / BUY" if up else "DOWN / SELL / PUT"
     return ("━━━━━━━━━━━━━━━━━━\n🚨 <b>SM QUATEX SURE SHORT</b>\n━━━━━━━━━━━━━━━━━━\n\n"+f"📅 <b>{signal_datetime.strftime('%d %B %Y')}</b>\n"+f"💱 Pair: <b>{escape(signal['pair'])}</b>\n"+f"⏰ Time: <b>{signal_datetime.strftime('%I:%M %p')}</b>\n"+f"{icon} Direction: <b>{label}</b>\n"+f"🎯 Confidence: <b>{escape(signal['confidence'])}</b>\n\n━━━━━━━━━━━━━━━━━━")
-
-
-def format_signal_for_user(signal,user_id):
-    text=patched_format_signal(signal)
-    mm=mm_get(user_id)
-    if mm["enabled"]=="ON":
-        amount=mm["m1_trade"] if mm["next_type"]=="M1" else mm["base_trade"]
-        text += f"\n\n💰 <b>MM {mm['next_type']} TRADE: ${float(amount):.2f}</b>"
-    return text
 
 
 def admin_result_stats(message):
@@ -7407,6 +7531,7 @@ def admin_keyboard():
         ["🛠️ Maintenance ON/OFF", "⚡ Live ON/OFF"],
         ["🎟️ Set Free Limit", "💵 Set Min Withdraw"],
         ["💸 Withdraw ON/OFF", "🔔 Auto Notification ON/OFF"],
+        ["🤖 Candle AI ON/OFF", "🖼️ Max Candle Pics"],
         ["🔙 Back", "🏠 Main Menu"],
     ])
 
@@ -7415,7 +7540,7 @@ def handle_admin_button(message):
     text=message.text; uid=message.from_user.id
     permission_map={
         "➕ Add Future Signals":"signals","📋 Future Signal List":"signals","✏️ Edit Signal":"signals","🗑️ Delete Signal":"signals","🧹 Clear Future Signals":"signals","📤 Auto Send ON/OFF":"signals","🎯 Signal Audience":"signals",
-        "⚡ Live Session":"live","🆔 Pending UID":"uid","⭐ Manage VIP":"vip","💸 Withdrawals":"withdraw","📊 Withdrawal Reports":"withdraw","👥 Referral History":"analytics","💳 Wallet Adjust":"wallet","📢 Broadcast":"broadcast","👥 Users":"users","📊 Analytics":"analytics","📈 Result Stats":"analytics","🎯 Notify Targets":"notifications","⚙️ Settings":"settings","📝 Bot Text Editor":"text","🎟️ Set Free Limit":"settings","💵 Set Min Withdraw":"settings","💸 Withdraw ON/OFF":"settings","🛠️ Maintenance ON/OFF":"settings","⚡ Live ON/OFF":"settings","🔔 Auto Notification ON/OFF":"notifications"
+        "⚡ Live Session":"live","🆔 Pending UID":"uid","⭐ Manage VIP":"vip","💸 Withdrawals":"withdraw","📊 Withdrawal Reports":"withdraw","👥 Referral History":"analytics","💳 Wallet Adjust":"wallet","📢 Broadcast":"broadcast","👥 Users":"users","📊 Analytics":"analytics","📈 Result Stats":"analytics","🎯 Notify Targets":"notifications","⚙️ Settings":"settings","📝 Bot Text Editor":"text","🎟️ Set Free Limit":"settings","💵 Set Min Withdraw":"settings","💸 Withdraw ON/OFF":"settings","🛠️ Maintenance ON/OFF":"settings","⚡ Live ON/OFF":"settings","🔔 Auto Notification ON/OFF":"notifications","🤖 Candle AI ON/OFF":"settings","🖼️ Max Candle Pics":"settings"
     }
     if text in permission_map and not can(uid, permission_map[text]):
         return bot.send_message(message.chat.id,"⛔ You do not have permission for this section.",reply_markup=admin_keyboard())
@@ -7457,6 +7582,16 @@ def handle_admin_button(message):
     if text=="🔔 Auto Notification ON/OFF":
         if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
         old=get_setting("auto_notification","ON"); new="OFF" if old=="ON" else "ON"; set_setting("auto_notification",new); return bot.send_message(message.chat.id,f"🔔 Auto Notification: <b>{new}</b>",reply_markup=admin_keyboard())
+    if text=="🤖 Candle AI ON/OFF":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        old=get_setting("candle_ai_enabled","OFF")
+        new="OFF" if old=="ON" else "ON"
+        set_setting("candle_ai_enabled",new)
+        return bot.send_message(message.chat.id,f"🤖 Candle AI: <b>{new}</b>",reply_markup=admin_keyboard())
+    if text=="🖼️ Max Candle Pics":
+        if not is_master(uid): return bot.send_message(message.chat.id,"⛔ Master Admin only.",reply_markup=admin_keyboard())
+        STATES[uid]={"action":"set_candle_max_images"}
+        return bot.send_message(message.chat.id,"🖼️ এক user সর্বোচ্চ কতটি screenshot upload করতে পারবে?\n১–১০ এর মধ্যে সংখ্যা দিন.",reply_markup=back_keyboard())
     # Preserve all legacy admin buttons and handlers.
     return LEGACY_HANDLE_ADMIN_BUTTON(message)
 
@@ -7476,6 +7611,18 @@ def handle_state(message):
         clear_state(uid); send_main_menu(message.chat.id,uid,"🏠 <b>Main Menu</b>"); return True
     try:
         action=st.get("action")
+        if action=="set_candle_max_images":
+            if not is_master(uid):
+                raise ValueError("Master Admin only.")
+            value=int(text)
+            if value < 1 or value > 10:
+                raise ValueError("১ থেকে ১০ এর মধ্যে সংখ্যা দিন.")
+            set_setting("candle_ai_max_images",str(value))
+            clear_state(uid)
+            return bot.send_message(message.chat.id,f"🖼️ Max Candle Pics: <b>{value}</b>",reply_markup=admin_keyboard())
+        if action=="candle_upload":
+            analyze_candle_state(message)
+            return True
         if action=="withdraw_method":
             methods={"🟢 BKASH":"BKASH","🔵 NAGAD":"NAGAD","🟠 BINANCE":"BINANCE"}
             if text not in methods: raise ValueError("Payment method button ব্যবহার করুন.")
@@ -7818,97 +7965,55 @@ def uid_cancel_callback(call):
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("sigres:"))
 def signal_result_callback(call):
     try:
-        parts=call.data.split(":")
-        uid=call.from_user.id
-        if len(parts)==3:
-            _,sid_s,result=parts; trade_type="BASE"
-        else:
-            _,sid_s,trade_type,result=parts
-        sid=int(sid_s)
-        trade_type=trade_type.upper(); result=result.upper()
-        if trade_type not in ("BASE","M1") or result not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
-        mm=mm_get(uid)
-        expected=mm["next_type"] if mm["enabled"]=="ON" else "BASE"
-        if trade_type!=expected:
-            bot.answer_callback_query(call.id,f"Next trade is {expected}.",show_alert=True); return
+        _, sid_s, result=call.data.split(":",2); sid=int(sid_s); uid=call.from_user.id
+        if result not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
         with DB_LOCK:
             conn=db()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                if conn.execute("SELECT 1 FROM signal_user_trades WHERE signal_id=? AND user_id=? AND trade_type=?",(sid,uid,trade_type)).fetchone():
-                    conn.rollback(); bot.answer_callback_query(call.id,"Already submitted.",show_alert=True); return
-                amount=int(round(float(mm["m1_trade"] if trade_type=="M1" else mm["base_trade"])*100)) if mm["enabled"]=="ON" else 0
-                pnl=0 if result=="SKIP" or amount<=0 else (int(round(amount*0.88)) if result=="WIN" else -amount)
-                conn.execute("INSERT INTO signal_user_trades(signal_id,user_id,trade_type,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?,?)",(sid,uid,trade_type,result,amount,pnl,utc_iso(now_utc())))
-                if trade_type=="BASE" and result=="LOSS" and mm["enabled"]=="ON":
-                    next_type="M1"
-                else:
-                    next_type="BASE"
-                if mm["enabled"]=="ON" and result!="SKIP":
-                    conn.execute("INSERT INTO mm_trades(user_id,signal_id,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?)",(uid,sid,result,amount,pnl,utc_iso(now_utc())))
-                    conn.execute("UPDATE users SET mm_next_type=?,mm_trade_count=mm_trade_count+1,mm_daily_profit_cents=mm_daily_profit_cents+?,mm_daily_loss_cents=mm_daily_loss_cents+? WHERE user_id=?",(next_type,max(pnl,0),max(-pnl,0),uid))
-                    u2=conn.execute("SELECT mm_profit_target_cents,mm_loss_limit_cents,mm_daily_profit_cents,mm_daily_loss_cents FROM users WHERE user_id=?",(uid,)).fetchone()
-                    if (u2["mm_profit_target_cents"]>0 and u2["mm_daily_profit_cents"]>=u2["mm_profit_target_cents"]) or (u2["mm_loss_limit_cents"]>0 and u2["mm_daily_loss_cents"]>=u2["mm_loss_limit_cents"]):
-                        conn.execute("UPDATE users SET mm_stop=1,mm_enabled=0,mm_next_type='BASE' WHERE user_id=?",(uid,))
+                if conn.execute("SELECT 1 FROM signal_user_results WHERE signal_id=? AND user_id=?",(sid,uid)).fetchone():
+                    conn.rollback(); bot.answer_callback_query(call.id,"Already submitted for this signal.",show_alert=True); return
+                conn.execute("INSERT INTO signal_user_results(signal_id,user_id,result,created_at) VALUES(?,?,?,?)",(sid,uid,result,utc_iso(now_utc())))
+                # Keep aggregate signal result as the latest admin-visible outcome only if admin explicitly reveals it later.
                 conn.commit()
             finally: conn.close()
         bot.answer_callback_query(call.id,"Saved: "+result)
-        if trade_type=="BASE" and result=="LOSS" and mm["enabled"]=="ON":
-            bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=result_buttons(sid,uid))
-        else:
-            try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
-            except Exception: pass
+        try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        except Exception: pass
+        if result in ("WIN","LOSS"):
+            apply_mm_result(uid,sid,result)
     except Exception as exc:
         try: bot.answer_callback_query(call.id,"Error: "+str(exc),show_alert=True)
         except Exception: pass
+
 
 @bot.callback_query_handler(func=lambda call: (call.data or "").startswith("liveres:"))
 def live_result_callback(call):
     try:
-        parts=call.data.split(":")
-        uid=call.from_user.id
-        if len(parts)==3:
-            _,lid_s,result=parts; trade_type="BASE"
-        else:
-            _,lid_s,trade_type,result=parts
-        lid=int(lid_s); trade_type=trade_type.upper(); result=result.upper()
-        if trade_type not in ("BASE","M1") or result not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
-        mm=mm_get(uid); expected=mm["next_type"] if mm["enabled"]=="ON" else "BASE"
-        if trade_type!=expected:
-            bot.answer_callback_query(call.id,f"Next trade is {expected}.",show_alert=True); return
+        _, lid_s, result=call.data.split(":",2); lid=int(lid_s); uid=call.from_user.id
+        if result not in ("WIN","LOSS","SKIP"): raise ValueError("Invalid result")
         with DB_LOCK:
             conn=db()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                if conn.execute("SELECT 1 FROM live_user_trades WHERE live_signal_id=? AND user_id=? AND trade_type=?",(lid,uid,trade_type)).fetchone():
-                    conn.rollback(); bot.answer_callback_query(call.id,"Already submitted.",show_alert=True); return
-                amount=int(round(float(mm["m1_trade"] if trade_type=="M1" else mm["base_trade"])*100)) if mm["enabled"]=="ON" else 0
-                pnl=0 if result=="SKIP" or amount<=0 else (int(round(amount*0.88)) if result=="WIN" else -amount)
-                conn.execute("INSERT INTO live_user_trades(live_signal_id,user_id,trade_type,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?,?)",(lid,uid,trade_type,result,amount,pnl,utc_iso(now_utc())))
-                if mm["enabled"]=="ON" and result!="SKIP":
-                    next_type="M1" if trade_type=="BASE" and result=="LOSS" else "BASE"
-                    conn.execute("INSERT INTO mm_trades(user_id,signal_id,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?)",(uid,None,result,amount,pnl,utc_iso(now_utc())))
-                    conn.execute("UPDATE users SET mm_next_type=?,mm_trade_count=mm_trade_count+1,mm_daily_profit_cents=mm_daily_profit_cents+?,mm_daily_loss_cents=mm_daily_loss_cents+? WHERE user_id=?",(next_type,max(pnl,0),max(-pnl,0),uid))
-                    u2=conn.execute("SELECT mm_profit_target_cents,mm_loss_limit_cents,mm_daily_profit_cents,mm_daily_loss_cents FROM users WHERE user_id=?",(uid,)).fetchone()
-                    if (u2["mm_profit_target_cents"]>0 and u2["mm_daily_profit_cents"]>=u2["mm_profit_target_cents"]) or (u2["mm_loss_limit_cents"]>0 and u2["mm_daily_loss_cents"]>=u2["mm_loss_limit_cents"]):
-                        conn.execute("UPDATE users SET mm_stop=1,mm_enabled=0,mm_next_type='BASE' WHERE user_id=?",(uid,))
+                if conn.execute("SELECT 1 FROM live_signal_user_results WHERE live_signal_id=? AND user_id=?",(lid,uid)).fetchone():
+                    conn.rollback(); bot.answer_callback_query(call.id,"Already submitted for this live signal.",show_alert=True); return
+                conn.execute("INSERT INTO live_signal_user_results(live_signal_id,user_id,result,created_at) VALUES(?,?,?,?)",(lid,uid,result,utc_iso(now_utc())))
                 conn.commit()
             finally: conn.close()
         bot.answer_callback_query(call.id,"Saved: "+result)
-        if trade_type=="BASE" and result=="LOSS" and mm["enabled"]=="ON":
-            kb=types.InlineKeyboardMarkup(); kb.row(types.InlineKeyboardButton("✅ M1 WIN",callback_data=f"liveres:{lid}:M1:WIN"),types.InlineKeyboardButton("❌ M1 LOSS",callback_data=f"liveres:{lid}:M1:LOSS")); kb.row(types.InlineKeyboardButton("⏭️ M1 SKIP",callback_data=f"liveres:{lid}:M1:SKIP")); bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=kb)
-        else:
-            try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
-            except Exception: pass
+        try: bot.edit_message_reply_markup(call.message.chat.id,call.message.message_id,reply_markup=None)
+        except Exception: pass
     except Exception as exc:
         try: bot.answer_callback_query(call.id,"Error: "+str(exc),show_alert=True)
         except Exception: pass
 
+
 def live_result_markup(live_signal_id):
     kb=types.InlineKeyboardMarkup()
-    kb.row(types.InlineKeyboardButton("✅ WIN",callback_data=f"liveres:{live_signal_id}:BASE:WIN"),types.InlineKeyboardButton("❌ LOSS",callback_data=f"liveres:{live_signal_id}:BASE:LOSS"))
-    kb.row(types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"liveres:{live_signal_id}:BASE:SKIP"))
+    kb.row(types.InlineKeyboardButton("✅ WIN",callback_data=f"liveres:{live_signal_id}:WIN"),types.InlineKeyboardButton("❌ LOSE",callback_data=f"liveres:{live_signal_id}:LOSS"),types.InlineKeyboardButton("⏭️ SKIP",callback_data=f"liveres:{live_signal_id}:SKIP"))
     return kb
+
 
 def patched_admin_withdrawals(message):
     uid=message.from_user.id
@@ -7935,8 +8040,27 @@ def withdraw_admin_action_keyboard():
     return make_keyboard([["✅ Approve Withdrawal","❌ Reject Withdrawal"],["🔙 Back","🏠 Main Menu"]])
 
 def apply_mm_result(user_id, signal_id, result):
-    # Legacy compatibility. New signal/live callbacks process MM atomically.
-    return True
+    with DB_LOCK:
+        conn=db()
+        try:
+            u=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if not u: return
+            today=now_bd().date().isoformat()
+            if u["mm_date"]!=today:
+                conn.execute("UPDATE users SET mm_date=?,mm_daily_profit_cents=0,mm_daily_loss_cents=0,mm_trade_count=0,mm_stop=0 WHERE user_id=?",(today,user_id)); u=conn.execute("SELECT * FROM users WHERE user_id=?",(user_id,)).fetchone()
+            if int(u["mm_stop"] or 0): return
+            if int(u["mm_max_trades"] or 0)>0 and int(u["mm_trade_count"] or 0)>=int(u["mm_max_trades"]): return
+            base=int(u["mm_base_cents"] or 100); m1=int(u["mm_m1_cents"] or 200)
+            # Base -> M1 after a loss; after either result, next trade is Base. No M2.
+            prev=conn.execute("SELECT result,amount_cents FROM mm_trades WHERE user_id=? ORDER BY id DESC LIMIT 1",(user_id,)).fetchone()
+            amount=m1 if prev and prev["result"]=="LOSS" else base
+            payout=int(round(amount*float(get_setting("mm_payout","0.80"))))
+            pnl=payout if result=="WIN" else -amount
+            conn.execute("INSERT INTO mm_trades(user_id,signal_id,result,amount_cents,pnl_cents,created_at) VALUES(?,?,?,?,?,?)",(user_id,signal_id,result,amount,pnl,utc_iso(now_utc())))
+            conn.execute("UPDATE users SET mm_trade_count=mm_trade_count+1,mm_daily_profit_cents=mm_daily_profit_cents+?,mm_daily_loss_cents=mm_daily_loss_cents+? WHERE user_id=?",(max(pnl,0),max(-pnl,0),user_id))
+            conn.commit()
+        finally: conn.close()
+
 
 def start_withdrawal_flow(message):
     uid=message.from_user.id
@@ -7956,17 +8080,324 @@ deliver_signal = patched_deliver_signal
 format_signal = patched_format_signal
 admin_withdrawals = patched_admin_withdrawals
 
-# Add new settings/defaults after migration.
-# Safe import-time migration: create the base schema before reading settings.
-init_db()
-migrate_final_schema()
-ensure_signal_user_results()
-set_setting("referral_min_signals", get_setting("referral_min_signals","1"))
-set_setting("referral_hold_hours", get_setting("referral_hold_hours","24"))
-set_setting("withdraw_hold_hours", get_setting("withdraw_hold_hours","0"))
-set_setting("auto_notification", get_setting("auto_notification","ON"))
-set_setting("mm_payout", get_setting("mm_payout","1.88"))
-set_setting("free_cycle_days", get_setting("free_cycle_days","2"))
+# ============================================================
+# SAFE STARTUP MIGRATION
+# ============================================================
+
+def safe_startup_migration():
+    """Initialize/migrate the DB without letting a legacy-data issue kill polling."""
+    try:
+        init_db()
+    except Exception:
+        logger.exception("Base database initialization failed.")
+        return False
+
+    try:
+        migrate_final_schema()
+    except Exception:
+        logger.exception("Final schema migration failed; continuing with base schema.")
+
+    try:
+        ensure_signal_user_results()
+    except Exception:
+        logger.exception("Signal-user result migration failed.")
+
+    defaults = {
+        "referral_min_signals": "1",
+        "referral_hold_hours": "24",
+        "withdraw_hold_hours": "0",
+        "auto_notification": "ON",
+        "mm_payout": "0.80",
+        "candle_ai_enabled": "OFF",
+        "candle_ai_max_images": "3",
+        "candle_ai_model": "gemini-2.5-flash",
+    }
+
+    for key, value in defaults.items():
+        try:
+            if get_setting(key, "") == "":
+                set_setting(key, value)
+        except Exception:
+            logger.exception("Could not initialize setting %s", key)
+
+    return True
+
+
+# ============================================================
+# AI CANDLE / CHART SCREENSHOT ANALYSIS
+# ============================================================
+
+def candle_ai_enabled():
+    return get_setting("candle_ai_enabled", "OFF") == "ON"
+
+
+def candle_ai_max_images():
+    try:
+        return max(1, min(10, int(get_setting("candle_ai_max_images", "3"))))
+    except Exception:
+        return 3
+
+
+def candle_ai_prompt():
+    return (
+        "You are analyzing screenshots of a Quotex-style trading chart. "
+        "Analyze ONLY what is visibly present in the uploaded screenshots. "
+        "Do not claim certainty and do not invent hidden candles, prices, indicators, or timeframes. "
+        "Identify visible trend, momentum, support/resistance, candle patterns, and confirmations or contradictions. "
+        "Give a probabilistic scenario for the NEXT 1 candle and NEXT 2 candles. "
+        "For each use UP, DOWN, or WAIT and briefly explain the visible evidence. "
+        "If the chart is unclear, cropped, or lacks enough candle context, use WAIT/INSUFFICIENT DATA. "
+        "Never promise profit or guaranteed accuracy. "
+        "Answer concisely in Bengali with headings: "
+        "📊 Chart Analysis, 📈 Trend, 🕯️ Candle Pattern, 🧱 Support/Resistance, "
+        "➡️ Next 1 Candle, ➡️ Next 2 Candles, ⚠️ Risk/Uncertainty."
+    )
+
+
+def gemini_analyze_candle_images(image_bytes_list):
+    """Optional Gemini REST integration; never crashes the Telegram bot."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return (
+            "⚠️ <b>AI Candle Analysis চালু করা যাচ্ছে না.</b>\n\n"
+            "Admin-কে Railway Variables-এ <code>GEMINI_API_KEY</code> সেট করতে হবে।"
+        )
+
+    model = os.getenv(
+        "GEMINI_MODEL",
+        get_setting("candle_ai_model", "gemini-2.5-flash")
+    ).strip() or "gemini-2.5-flash"
+
+    parts = [{"text": candle_ai_prompt()}]
+    for raw in image_bytes_list:
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(raw).decode("ascii")
+            }
+        })
+
+    payload = json.dumps({
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1400
+        }
+    }).encode("utf-8")
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + urllib.parse.quote(model, safe="")
+        + ":generateContent?key="
+        + urllib.parse.quote(api_key, safe="")
+    )
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return "⚠️ AI কোনো analysis result দেয়নি। Screenshot পরিষ্কার করে আবার চেষ্টা করুন."
+        output_parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "\n".join(
+            str(p.get("text", "")).strip()
+            for p in output_parts
+            if p.get("text")
+        ).strip()
+        return answer or "⚠️ AI analysis result খালি এসেছে."
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")[:800]
+        except Exception:
+            detail = str(exc)
+        logger.exception("Gemini HTTP error")
+        return f"⚠️ AI service error. পরে আবার চেষ্টা করুন.\n<code>{escape(detail)}</code>"
+    except Exception:
+        logger.exception("Gemini candle analysis failed")
+        return "⚠️ AI analysis এখন করা যায়নি। Screenshot আবার upload করে চেষ্টা করুন."
+
+
+def start_candle_analysis(message):
+    uid = message.from_user.id
+
+    if not candle_ai_enabled() and not is_master(uid):
+        return bot.send_message(
+            message.chat.id,
+            "🤖 <b>AI Candle Analysis বর্তমানে OFF.</b>",
+            reply_markup=main_keyboard(uid)
+        )
+
+    limit = candle_ai_max_images()
+    STATES[uid] = {"action": "candle_upload", "images": []}
+
+    bot.send_message(
+        message.chat.id,
+        f"📸 <b>AI Candle Analysis</b>\n\n"
+        f"একসাথে সর্বোচ্চ <b>{limit}টি</b> candle/chart screenshot upload করতে পারবেন.\n"
+        f"Screenshot পাঠানোর পর <b>🔍 Analyze Candles</b> চাপুন.\n\n"
+        f"⚠️ এটি prediction; guarantee নয়।",
+        reply_markup=make_keyboard([
+            ["🔍 Analyze Candles", "🗑️ Clear Candles"],
+            ["🔙 Back", "🏠 Main Menu"]
+        ])
+    )
+
+
+def handle_candle_photo(message):
+    uid = message.from_user.id
+    state = STATES.get(uid)
+
+    if not state or state.get("action") != "candle_upload":
+        return False
+
+    if not candle_ai_enabled() and not is_master(uid):
+        clear_state(uid)
+        bot.send_message(
+            message.chat.id,
+            "🤖 AI Candle Analysis বর্তমানে OFF.",
+            reply_markup=main_keyboard(uid)
+        )
+        return True
+
+    limit = candle_ai_max_images()
+    images = state.setdefault("images", [])
+
+    if len(images) >= limit:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Maximum <b>{limit}টি</b> screenshot already added.\n"
+            "এখন 🔍 Analyze Candles চাপুন.",
+            reply_markup=make_keyboard([
+                ["🔍 Analyze Candles", "🗑️ Clear Candles"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+        return True
+
+    try:
+        photo = message.photo[-1]
+        images.append(photo.file_id)
+        remaining = limit - len(images)
+        if remaining:
+            notice = f"✅ Screenshot {len(images)}/{limit} added.\nআরও {remaining}টি দিতে পারেন."
+        else:
+            notice = "✅ Maximum screenshot count reached.\nএখন 🔍 Analyze Candles চাপুন."
+
+        bot.send_message(
+            message.chat.id,
+            notice,
+            reply_markup=make_keyboard([
+                ["🔍 Analyze Candles", "🗑️ Clear Candles"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+    except Exception:
+        logger.exception("Candle photo state error")
+        bot.send_message(
+            message.chat.id,
+            "❌ Screenshot নেওয়া যায়নি. আবার চেষ্টা করুন."
+        )
+
+    return True
+
+
+def analyze_candle_state(message):
+    uid = message.from_user.id
+    state = STATES.get(uid)
+
+    if not state or state.get("action") != "candle_upload":
+        return False
+
+    text = (message.text or "").strip()
+
+    if text == "🗑️ Clear Candles":
+        state["images"] = []
+        bot.send_message(
+            message.chat.id,
+            "🗑️ সব screenshot clear করা হয়েছে.\nআবার screenshot upload করুন.",
+            reply_markup=make_keyboard([
+                ["🔍 Analyze Candles", "🗑️ Clear Candles"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+        return True
+
+    if text != "🔍 Analyze Candles":
+        return False
+
+    file_ids = list(state.get("images") or [])
+    if not file_ids:
+        bot.send_message(
+            message.chat.id,
+            "📸 আগে অন্তত ১টি candle/chart screenshot upload করুন.",
+            reply_markup=make_keyboard([
+                ["🔍 Analyze Candles", "🗑️ Clear Candles"],
+                ["🔙 Back", "🏠 Main Menu"]
+            ])
+        )
+        return True
+
+    if not candle_ai_enabled() and not is_master(uid):
+        clear_state(uid)
+        bot.send_message(
+            message.chat.id,
+            "🤖 AI Candle Analysis বর্তমানে OFF.",
+            reply_markup=main_keyboard(uid)
+        )
+        return True
+
+    bot.send_message(
+        message.chat.id,
+        "🔎 Screenshotগুলো analyze করছি… একটু অপেক্ষা করুন."
+    )
+
+    image_bytes = []
+    try:
+        for file_id in file_ids:
+            info = bot.get_file(file_id)
+            raw = bot.download_file(info.file_path)
+            image_bytes.append(raw)
+
+        result = gemini_analyze_candle_images(image_bytes)
+    except Exception:
+        logger.exception("Could not download candle screenshot")
+        result = "⚠️ Screenshot download/analyze করা যায়নি। আবার চেষ্টা করুন."
+
+    clear_state(uid)
+
+    bot.send_message(
+        message.chat.id,
+        "🤖 <b>AI CANDLE ANALYSIS</b>\n\n"
+        + result
+        + "\n\n⚠️ <b>নোট:</b> এটি chart screenshot-ভিত্তিক সম্ভাব্য analysis; "
+          "পরের candle নিশ্চিতভাবে কী হবে তা guarantee করা যায় না.",
+        reply_markup=main_keyboard(uid)
+    )
+
+    return True
+
+
+@bot.message_handler(content_types=["photo"])
+def candle_photo_handler(message):
+    try:
+        handle_candle_photo(message)
+    except Exception:
+        logger.exception("Unhandled candle photo handler error")
+        try:
+            bot.send_message(
+                message.chat.id,
+                "❌ Screenshot process করা যায়নি. আবার চেষ্টা করুন."
+            )
+        except Exception:
+            pass
+
 
 
 # ============================================================
@@ -8092,10 +8523,13 @@ def backup_loop():
 
 def main():
 
-    init_db()
-    migrate_final_schema()
-    ensure_signal_user_results()
-    backup_database()
+    if not safe_startup_migration():
+        logger.error("Database startup initialization had errors; attempting polling anyway.")
+
+    try:
+        backup_database()
+    except Exception:
+        logger.exception("Initial backup failed; continuing.")
 
 
     threading.Thread(
