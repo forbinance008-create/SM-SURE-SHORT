@@ -745,60 +745,23 @@ def make_keyboard(rows):
     return keyboard
 
 
+def _safe_vip_label(user_id):
+    try:
+        return _vip_button_label(user_id)
+    except Exception:
+        return "⭐ JOIN VIP"
+
+
 def main_keyboard(user_id):
 
     rows = [
-
-        [
-            "📊 Future Signals",
-            "⚡ Live Signals"
-        ],
-
-        [
-            "🗳️ Vote",
-            "📈 Signal Result"
-        ],
-
-        [
-            "👤 My Status",
-            "🆔 Submit Quotex UID"
-        ],
-
-        [
-            "💰 Money Management",
-            "💵 Wallet"
-        ],
-
-        [
-            "💸 Request Withdraw",
-            "👥 Referral Link"
-        ],
-
-        [
-            "📜 Signal History",
-            "📖 VIP Rules"
-        ],
-
-        [
-            "📜 Trading Contract",
-            "🔔 Notifications"
-        ],
-
-        [
-            "📸 AI Candle Analysis"
-        ],
-
-        [
-            "❓ Help / FAQ"
-        ]
-
+        ["📊 Signals", "💰 My Account"],
+        ["💵 Money Management", "🎁 Referral"],
+        ["⚙️ Settings", _safe_vip_label(user_id)],
     ]
 
     if is_master(user_id) or get_permissions(user_id):
-
-        rows.append([
-            "👑 Admin Control"
-        ])
+        rows.append(["👑 Admin Control"])
 
     return make_keyboard(rows)
 
@@ -6769,6 +6732,904 @@ def LEGACY_HANDLE_STATE(message):
 
 
 # ============================================================
+# NAVIGATION LAYER — category menus, smart Back, missing buttons
+# (added; no existing feature removed)
+# ============================================================
+import copy as _copy
+
+NAV_MENU = {}    # user_id -> current menu key
+NAV_INPUT = {}   # user_id -> {"action":..., ...}  (nav-layer private input state)
+
+NAV_PARENT = {
+    "main": "main", "signals": "main", "my_account": "main", "wallet": "my_account",
+    "mm": "main", "referral": "main", "settings": "main", "vip": "main",
+    "admin": "main", "admin_signals": "admin", "admin_users": "admin", "admin_vip": "admin",
+    "admin_money": "admin", "admin_referral": "admin", "admin_settings": "admin",
+    "admin_analytics": "admin", "admin_content": "admin", "admin_search": "admin_users",
+}
+
+_BB = ["🔙 Back", "🏠 Main Menu"]
+
+
+def _nav_is_admin(uid):
+    try:
+        return bool(is_master(uid) or get_permissions(uid))
+    except Exception:
+        return False
+
+
+def _vip_button_label(uid):
+    try:
+        u = get_user(uid)
+        if u and vip_is_active(u):
+            left = ""
+            try:
+                if u["vip_until"]:
+                    d = (datetime.fromisoformat(u["vip_until"]).astimezone(BD_TZ) - now_bd()).days
+                    left = f": {max(d, 0)}d"
+            except Exception:
+                left = ""
+            return "⭐ VIP" + (left if left else ": Active")
+    except Exception:
+        pass
+    return "⭐ JOIN VIP"
+
+
+def signals_menu():
+    return make_keyboard([["📊 Future Signals", "⚡ Live Signals"], ["🤖 AI Analysis"], _BB])
+
+
+def my_account_menu():
+    return make_keyboard([["👤 My Status", "💵 Wallet"], ["🆔 Submit Quotex UID"], ["📜 Trading Contract"], _BB])
+
+
+def wallet_menu_kb():
+    return make_keyboard([["💰 Balance", "💸 Withdraw"], ["📜 History"], _BB])
+
+
+def referral_menu_kb():
+    return make_keyboard([["👥 Referral Link", "📊 Referral Stats"], ["🏆 Leaderboard", "🎁 Bonus Info"], _BB])
+
+
+def settings_menu_kb():
+    return make_keyboard([["🔔 Notifications", "❓ Help / FAQ"], ["📖 Tutorial", "💬 Support"], ["📜 Terms"], _BB])
+
+
+def vip_menu_kb(uid):
+    u = get_user(uid)
+    if u and vip_is_active(u):
+        return make_keyboard([["🔄 Renew VIP", "📊 My Status"], _BB])
+    return make_keyboard([["🆔 Submit UID", "🔗 Register on Quotex"], _BB])
+
+
+def admin_signals_kb():
+    return make_keyboard([
+        ["➕ Add Future Signals", "📋 Future Signal List"], ["✏️ Edit Signal", "🗑️ Delete Signal"],
+        ["🧹 Clear Future Signals", "📤 Auto Send ON/OFF"], ["🎯 Signal Audience", "⚡ Live Session"],
+        ["📊 Signal Debug", "📈 Signal Performance"], _BB])
+
+
+def admin_users_kb():
+    return make_keyboard([
+        ["🔍 Search User", "👥 All Users"], ["🚫 Blocked Users", "⚠️ Warning List"],
+        ["📩 Message User", "📢 Broadcast"], ["📋 Broadcast History", "📊 User Stats"],
+        ["📤 Export Users CSV"], _BB])
+
+
+def admin_vip_kb():
+    return make_keyboard([
+        ["📋 VIP List", "➕ Add VIP"], ["⏰ Expiry Table", "❌ Remove VIP"],
+        ["📢 Send Reminder", "🔄 Pending Renewals"], ["🆔 Pending UID", "📊 VIP Stats"], _BB])
+
+
+def admin_money_kb():
+    return make_keyboard([
+        ["💸 Withdrawals", "📊 Withdrawal Reports"], ["💳 Wallet Adjust", "💰 Referral History"],
+        ["📊 Revenue Report"], _BB])
+
+
+def admin_referral_kb():
+    return make_keyboard([
+        ["📋 Pending Referral", "✅ Approved Referral"], ["❌ Rejected Referral", "⚠️ Referral Warning"],
+        ["🚫 Blocked Referral", "💰 Referral History"], ["🏆 Leaderboard"], _BB])
+
+
+def admin_settings_kb():
+    return make_keyboard([
+        ["🛠️ Maintenance ON/OFF", "⚡ Live ON/OFF"], ["🎟️ Set Free Limit", "💵 Set Min Withdraw"],
+        ["💸 Withdraw ON/OFF", "🔔 Auto Notification ON/OFF"], ["🤖 AI Settings", "🛡️ Sub-admins"],
+        ["🎯 Notify Targets", "🔗 Quotex Link"], ["📊 Withdrawal Limit/Day", "📝 Bot Text Editor"], _BB])
+
+
+def admin_analytics_kb():
+    return make_keyboard([
+        ["📊 Dashboard", "📈 Result Stats"], ["👥 User Stats", "💰 Revenue"],
+        ["🤖 AI Usage Stats", "📊 Daily Report"], _BB])
+
+
+def admin_content_kb():
+    return make_keyboard([
+        ["📝 Text Editor", "👋 Welcome Text"], ["📊 Signal Text", "⭐ VIP Text"],
+        ["💰 MM Text", "💸 Withdraw Text"], ["🎁 Referral Text", "🛠️ Error Text"],
+        ["🔔 Reminder Text"], _BB])
+
+
+def admin_home_kb():
+    return make_keyboard([
+        ["📊 Signals", "👥 Users"], ["⭐ VIP", "💰 Money"], ["🎁 Referral", "⚙️ Settings"],
+        ["📈 Analytics", "📝 Content"], _BB])
+
+
+def admin_search_kb():
+    return make_keyboard([["🆔 By ID", "👤 By Username"], ["📝 By Name"], _BB])
+
+
+_MENU_TABLE = {
+    "signals": ("📊 <b>SIGNALS</b>", lambda u: signals_menu()),
+    "my_account": ("💰 <b>MY ACCOUNT</b>", lambda u: my_account_menu()),
+    "wallet": ("💵 <b>WALLET</b>", lambda u: wallet_menu_kb()),
+    "referral": ("🎁 <b>REFERRAL</b>", lambda u: referral_menu_kb()),
+    "settings": ("⚙️ <b>SETTINGS</b>", lambda u: settings_menu_kb()),
+    "vip": ("⭐ <b>VIP</b>", lambda u: vip_menu_kb(u)),
+    "admin": ("👑 <b>ADMIN CONTROL</b>", lambda u: admin_home_kb()),
+    "admin_signals": ("📊 <b>SIGNALS</b>", lambda u: admin_signals_kb()),
+    "admin_users": ("👥 <b>USERS</b>", lambda u: admin_users_kb()),
+    "admin_vip": ("⭐ <b>VIP</b>", lambda u: admin_vip_kb()),
+    "admin_money": ("💰 <b>MONEY</b>", lambda u: admin_money_kb()),
+    "admin_referral": ("🎁 <b>REFERRAL</b>", lambda u: admin_referral_kb()),
+    "admin_settings": ("⚙️ <b>SETTINGS</b>", lambda u: admin_settings_kb()),
+    "admin_analytics": ("📈 <b>ANALYTICS</b>", lambda u: admin_analytics_kb()),
+    "admin_content": ("📝 <b>CONTENT</b>", lambda u: admin_content_kb()),
+    "admin_search": ("🔍 <b>SEARCH USER</b>", lambda u: admin_search_kb()),
+}
+
+
+def show_menu(chat_id, uid, key):
+    try:
+        if key == "main":
+            NAV_MENU[uid] = "main"
+            send_main_menu(chat_id, uid, "🏠 <b>Main Menu</b>")
+            return True
+        if key.startswith("admin") and not _nav_is_admin(uid):
+            NAV_MENU[uid] = "main"
+            send_main_menu(chat_id, uid, "⛔ Admin access নেই.")
+            return True
+        title, builder = _MENU_TABLE[key]
+        NAV_MENU[uid] = key
+        bot.send_message(chat_id, title, reply_markup=builder(uid))
+    except Exception:
+        logger.exception("show_menu failed")
+        try:
+            NAV_MENU[uid] = "main"
+            send_main_menu(chat_id, uid, "🏠 <b>Main Menu</b>")
+        except Exception:
+            pass
+    return True
+
+
+def handle_back_button(message, state=None):
+    uid = message.from_user.id
+    cur = NAV_MENU.get(uid, "main")
+    prev = (state or {}).get("previous_menu") if isinstance(state, dict) else None
+    had_state = (uid in STATES) or (uid in NAV_INPUT)
+    NAV_INPUT.pop(uid, None)
+    try:
+        clear_state(uid)
+    except Exception:
+        STATES.pop(uid, None)
+    if prev and prev in _MENU_TABLE:
+        target = prev
+    elif had_state and cur in _MENU_TABLE:
+        target = cur
+    else:
+        target = NAV_PARENT.get(cur, "main")
+    if target not in _MENU_TABLE and target != "main":
+        target = "main"
+    return show_menu(message.chat.id, uid, target)
+
+
+def set_user_state(user_id, action, previous_menu=None, **extra):
+    data = {"action": action, "previous_menu": previous_menu or NAV_MENU.get(user_id, "main")}
+    data.update(extra)
+    try:
+        _state_set(user_id, data)
+    except Exception:
+        STATES[user_id] = data
+
+
+class _MsgProxy:
+    """Wraps a Telegram message with overridden text (safe, no copy())."""
+    def __init__(self, message, text):
+        object.__setattr__(self, "_m", message)
+        object.__setattr__(self, "text", text)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_m"), name)
+
+
+def _legacy(message, legacy_text):
+    return message_router(_MsgProxy(message, legacy_text))
+
+
+def _admin_legacy(message, label):
+    return handle_admin_button(_MsgProxy(message, label))
+
+
+def _say(message, text, kb=None):
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+
+def _q(sql, args=()):
+    with DB_LOCK:
+        conn = db()
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+
+# ---------------- user leaf functions ----------------
+def wallet_balance(message):
+    u = get_user(message.from_user.id)
+    bal = int((u["wallet_cents"] if u else 0) or 0)
+    _say(message, f"💰 <b>BALANCE</b>\n\n💵 Wallet: <b>${bal/100:.2f}</b>", wallet_menu_kb())
+
+
+def wallet_history(message):
+    uid = message.from_user.id
+    rows = _q("SELECT * FROM wallet_tx WHERE user_id=? ORDER BY id DESC LIMIT 15", (uid,))
+    if not rows:
+        return _say(message, "📭 কোনো transaction নেই.", wallet_menu_kb())
+    out = ["📜 <b>HISTORY</b>", ""]
+    for r in rows:
+        k = r.keys()
+        amt = int(r["amount_cents"]) if "amount_cents" in k and r["amount_cents"] is not None else 0
+        note = escape(str(r["note"] if "note" in k and r["note"] else (r["type"] if "type" in k else "")))
+        when = escape(str(r["created_at"] if "created_at" in k else ""))[:16]
+        out.append(f"• {when} | ${amt/100:+.2f} | {note}")
+    _say(message, "\n".join(out), wallet_menu_kb())
+
+
+def referral_stats(message):
+    u = get_user(message.from_user.id)
+    n = int((u["refs_count"] if u else 0) or 0)
+    _say(message, f"📊 <b>REFERRAL STATS</b>\n\n👥 Total Referrals: <b>{n}</b>", referral_menu_kb())
+
+
+def referral_leaderboard(message):
+    rows = _q("SELECT user_id,first_name,username,refs_count FROM users WHERE refs_count>0 ORDER BY refs_count DESC LIMIT 10")
+    if not rows:
+        return _say(message, "📭 এখনও কোনো referral নেই.", None)
+    out = ["🏆 <b>LEADERBOARD</b>", ""]
+    for i, r in enumerate(rows, 1):
+        name = escape(r["first_name"] or r["username"] or str(r["user_id"]))
+        out.append(f"{i}. {name} — {r['refs_count']} referrals")
+    _say(message, "\n".join(out))
+
+
+def referral_bonus_info(message):
+    try:
+        rows = _q("SELECT min_refs,bonus_cents FROM referral_levels WHERE enabled=1 ORDER BY min_refs")
+    except Exception:
+        rows = []
+    out = ["🎁 <b>BONUS INFO</b>", ""]
+    out += [f"👥 {r['min_refs']} referrals → ${r['bonus_cents']/100:.2f}" for r in rows] or ["Bonus tier এখনও set হয়নি."]
+    _say(message, "\n".join(out), referral_menu_kb())
+
+
+def _text_or(key, default):
+    try:
+        v = get_setting(key, "")
+        return v if v else default
+    except Exception:
+        return default
+
+
+def tutorial_menu(message):
+    _say(message, _text_or("tutorial_text", "📖 <b>TUTORIAL</b>\n\n1️⃣ Quotex account খুলুন\n2️⃣ $15+ deposit করুন\n3️⃣ UID submit করুন\n4️⃣ Admin review → VIP\n5️⃣ Signal এ WIN/LOSS/SKIP দিন"), settings_menu_kb())
+
+
+def support_menu(message):
+    _say(message, _text_or("support_text", "💬 <b>SUPPORT</b>\n\nসাহায্যের জন্য admin-এর সাথে যোগাযোগ করুন."), settings_menu_kb())
+
+
+def terms_menu(message):
+    _say(message, _text_or("terms_text", "📜 <b>TERMS</b>\n\nTrading ঝুঁকিপূর্ণ. নিজ দায়িত্বে trade করুন."), settings_menu_kb())
+
+
+def join_vip_menu(message):
+    uid = message.from_user.id
+    u = get_user(uid)
+    if u and vip_is_active(u):
+        left = "—"
+        try:
+            if u["vip_until"]:
+                left = f"{max((datetime.fromisoformat(u['vip_until']).astimezone(BD_TZ) - now_bd()).days, 0)} days"
+        except Exception:
+            pass
+        text = ("━━━━━━━━━━━━━━━━━━\n⭐ <b>VIP STATUS</b>\n━━━━━━━━━━━━━━━━━━\n\n🎉 আপনি VIP!\n\n"
+                f"⭐ Status: ACTIVE\n⏰ Expires: {escape(str(u['vip_until'] or '—'))[:10]}\n⏳ Days Left: {left}\n\n"
+                "✅ Unlimited Signals • Live Signals • AI 50/day • Priority Support\n\n"
+                "📖 VIP RULES:\n⏰ Expiry 7 days আগে reminder\n🆔 Admin review")
+    else:
+        text = ("━━━━━━━━━━━━━━━━━━\n⭐ <b>JOIN VIP</b>\n━━━━━━━━━━━━━━━━━━\n\n🎉 VIP সুবিধা:\n"
+                "✅ Unlimited Future & Live Signals\n✅ AI Analysis 50/day\n✅ Priority Support\n✅ No Free Limit\n\n"
+                "📖 VIP RULES:\n👤 Non-VIP Free Limit: 4 signals (২ দিনের cycle)\n🆔 UID verification admin review করবে\n\n"
+                "💰 VIP পেতে:\n১. 🔗 Quotex Account (referral link)\n২. 💰 $15+ deposit\n৩. 🆔 UID Submit\n৪. ✅ Admin Review")
+    NAV_MENU[uid] = "vip"
+    _say(message, text, vip_menu_kb(uid))
+
+
+def renew_vip_menu(message):
+    uid = message.from_user.id
+    try:
+        _legacy(message, "🆔 Submit Quotex UID")
+    except Exception:
+        _say(message, "🔄 Renew করতে UID আবার submit করুন.", vip_menu_kb(uid))
+
+
+def _register_link(message):
+    link = _text_or("quotex_ref_link", "")
+    _say(message, f"🔗 <b>Quotex Register</b>\n\n{escape(link)}" if link else "⚠️ Admin এখনও Quotex link set করেনি.", vip_menu_kb(message.from_user.id))
+
+
+# ---------------- admin leaf functions ----------------
+def _count(sql, args=()):
+    try:
+        return int(_q(sql, args)[0][0] or 0)
+    except Exception:
+        return 0
+
+
+def admin_user_stats(message):
+    t = _count("SELECT COUNT(*) FROM users")
+    v = _count("SELECT COUNT(*) FROM users WHERE status='VIP'")
+    b = _count("SELECT COUNT(*) FROM users WHERE blocked=1")
+    _say(message, f"📊 <b>USER STATS</b>\n\n👥 Total: {t}\n⭐ VIP: {v}\n🚫 Blocked: {b}\n🆓 Free: {max(t-v-b,0)}", admin_users_kb())
+
+
+def admin_vip_stats(message):
+    v = _count("SELECT COUNT(*) FROM users WHERE status='VIP'")
+    soon = _count("SELECT COUNT(*) FROM users WHERE status='VIP' AND vip_until IS NOT NULL AND vip_until<=?", (utc_iso(now_utc() + timedelta(days=7)),))
+    _say(message, f"📊 <b>VIP STATS</b>\n\n⭐ Active VIP: {v}\n⏰ Expiring ≤7d: {soon}", admin_vip_kb())
+
+
+def admin_revenue_report(message):
+    w = _count("SELECT COALESCE(SUM(wallet_cents),0) FROM users")
+    vipn = _count("SELECT COUNT(*) FROM users WHERE status='VIP'")
+    _say(message, f"📊 <b>REVENUE REPORT</b>\n\n💵 Total wallet liability: ${w/100:.2f}\n⭐ VIP: {vipn}", admin_money_kb())
+
+
+def admin_daily_report(message):
+    d = now_bd().strftime("%Y-%m-%d")
+    nu = _count("SELECT COUNT(*) FROM users WHERE created_at LIKE ?", (d + "%",))
+    sg = _count("SELECT COUNT(*) FROM signals WHERE signal_date=?", (d,))
+    _say(message, f"📊 <b>DAILY REPORT</b> ({d})\n\n👥 New users: {nu}\n📊 Signals today: {sg}", admin_analytics_kb())
+
+
+def admin_signal_debug(message):
+    a = _count("SELECT COUNT(*) FROM signals WHERE active=1")
+    s = _count("SELECT COUNT(*) FROM signals WHERE auto_sent=1")
+    _say(message, f"📊 <b>SIGNAL DEBUG</b>\n\n✅ Active: {a}\n📤 Auto-sent: {s}\n🕒 Now (BD): {now_bd().strftime('%d %b %Y %I:%M %p')}", admin_signals_kb())
+
+
+def admin_signal_performance(message):
+    rows = _q("SELECT result,COUNT(*) n FROM signal_user_results GROUP BY result")
+    d = {r["result"]: r["n"] for r in rows}
+    w, l = d.get("WIN", 0), d.get("LOSS", 0)
+    acc = (w / (w + l) * 100) if (w + l) else 0
+    _say(message, f"📈 <b>SIGNAL PERFORMANCE</b>\n\n✅ WIN: {w}\n❌ LOSS: {l}\n⏭️ SKIP: {d.get('SKIP',0)}\n🎯 Accuracy: {acc:.1f}%", admin_signals_kb())
+
+
+def admin_export_users(message):
+    import csv, io
+    rows = _q("SELECT user_id,username,first_name,status,vip_until,wallet_cents,refs_count,blocked,created_at FROM users")
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow(["user_id", "username", "first_name", "status", "vip_until", "wallet_cents", "refs_count", "blocked", "created_at"])
+    for r in rows:
+        wr.writerow(list(r))
+    f = io.BytesIO(buf.getvalue().encode("utf-8"))
+    f.name = "users.csv"
+    bot.send_document(message.chat.id, f, reply_markup=admin_users_kb())
+
+
+def admin_broadcast_history(message):
+    try:
+        rows = _q("SELECT * FROM broadcast_history ORDER BY id DESC LIMIT 10")
+    except Exception:
+        rows = []
+    if not rows:
+        return _say(message, "📭 Broadcast history নেই.", admin_users_kb())
+    _say(message, "📋 <b>BROADCAST HISTORY</b>\n\n" + "\n".join(f"• {escape(str(dict(r))[:120])}" for r in rows), admin_users_kb())
+
+
+def admin_pending_renewals(message):
+    rows = _q("SELECT user_id,vip_until FROM users WHERE status='VIP' AND vip_until IS NOT NULL AND vip_until<=? ORDER BY vip_until LIMIT 30",
+              (utc_iso(now_utc() + timedelta(days=7)),))
+    _say(message, "🔄 <b>PENDING RENEWALS</b>\n\n" + ("\n".join(f"<code>{r['user_id']}</code> — {escape(str(r['vip_until']))[:10]}" for r in rows) or "📭 কেউ নেই."), admin_vip_kb())
+
+
+def _ask_setting(message, key, label, back_menu, numeric=False):
+    NAV_INPUT[message.from_user.id] = {"action": "set_setting", "key": key, "numeric": numeric, "back": back_menu}
+    cur = _text_or(key, "—")
+    _say(message, f"✏️ <b>{label}</b>\nCurrent: <code>{escape(str(cur))[:200]}</code>\n\nনতুন value পাঠান (বাতিল: 🔙 Back)", make_keyboard([_BB]))
+
+
+CONTENT_KEYS = {
+    "👋 Welcome Text": ("welcome", "Welcome Text"), "📊 Signal Text": ("signal_text", "Signal Text"),
+    "⭐ VIP Text": ("vip_text", "VIP Text"), "💰 MM Text": ("mm_text", "MM Text"),
+    "💸 Withdraw Text": ("withdraw_text", "Withdraw Text"), "🎁 Referral Text": ("referral_text", "Referral Text"),
+    "🛠️ Error Text": ("error_text", "Error Text"), "🔔 Reminder Text": ("reminder_text", "Reminder Text"),
+}
+
+
+def _user_profile(message, row):
+    uid = row["user_id"]
+    refs = row["refs_count"] or 0
+    text = ("━━━━━━━━━━━━━━━━━━\n👤 <b>USER PROFILE</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 ID: <code>{uid}</code>\n📛 @{escape(row['username'] or '-')}\n📝 {escape(row['first_name'] or '-')}\n"
+            f"⭐ Status: {escape(str(row['status']))}\n📅 VIP Until: {escape(str(row['vip_until'] or '—'))[:10]}\n"
+            f"💰 Wallet: ${(row['wallet_cents'] or 0)/100:.2f}\n👥 Referrals: {refs}\n"
+            f"🚫 Blocked: {'Yes' if row['blocked'] else 'No'}\n📅 Joined: {escape(str(row['created_at']))[:10]}\n━━━━━━━━━━━━━━━━━━")
+    ik = types.InlineKeyboardMarkup()
+    ik.row(types.InlineKeyboardButton("⭐ VIP", callback_data=f"navu:vip:{uid}"), types.InlineKeyboardButton("🚫 Block/Unblock", callback_data=f"navu:block:{uid}"))
+    ik.row(types.InlineKeyboardButton("📩 Message", callback_data=f"navu:msg:{uid}"), types.InlineKeyboardButton("💳 Wallet", callback_data=f"navu:wallet:{uid}"))
+    ik.row(types.InlineKeyboardButton("📊 Stats", callback_data=f"navu:stats:{uid}"), types.InlineKeyboardButton("♻️ Reset", callback_data=f"navu:reset:{uid}"))
+    bot.send_message(message.chat.id, text, reply_markup=ik)
+    bot.send_message(message.chat.id, "ℹ️ Search আবার করতে নিচের button ব্যবহার করুন.", reply_markup=admin_search_kb())
+
+
+def _search_user(message, mode, query):
+    q = query.strip().lstrip("@")
+    if mode == "id":
+        rows = _q("SELECT * FROM users WHERE user_id=?", (int(q),)) if q.isdigit() else []
+    elif mode == "username":
+        rows = _q("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (q,))
+    else:
+        rows = _q("SELECT * FROM users WHERE LOWER(first_name) LIKE LOWER(?) LIMIT 5", (f"%{q}%",))
+    if not rows:
+        return _say(message, "📭 User পাওয়া যায়নি", admin_search_kb())
+    for r in rows[:5]:
+        _user_profile(message, r)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("navu:"))
+def nav_user_action(call):
+    try:
+        if not _nav_is_admin(call.from_user.id):
+            return bot.answer_callback_query(call.id, "⛔ Admin only", show_alert=True)
+        _, act, uid_s = call.data.split(":", 2)
+        tid = int(uid_s)
+        if act == "block":
+            with DB_LOCK:
+                conn = db()
+                try:
+                    conn.execute("UPDATE users SET blocked=1-COALESCE(blocked,0) WHERE user_id=?", (tid,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            bot.answer_callback_query(call.id, "✅ Block status toggled")
+        elif act == "reset":
+            with DB_LOCK:
+                conn = db()
+                try:
+                    conn.execute("UPDATE users SET free_used=0 WHERE user_id=?", (tid,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            bot.answer_callback_query(call.id, "♻️ Reset done")
+        elif act == "stats":
+            r = _q("SELECT result,COUNT(*) n FROM signal_user_results WHERE user_id=? GROUP BY result", (tid,))
+            bot.answer_callback_query(call.id, ", ".join(f"{x['result']}:{x['n']}" for x in r) or "No results", show_alert=True)
+        elif act == "msg":
+            NAV_INPUT[call.from_user.id] = {"action": "msg_user", "target": tid, "back": "admin_users"}
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, f"📩 <code>{tid}</code> কে পাঠাতে message লিখুন:", reply_markup=make_keyboard([_BB]))
+        elif act == "wallet":
+            NAV_INPUT[call.from_user.id] = {"action": "wallet_adj", "target": tid, "back": "admin_users"}
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, f"💳 <code>{tid}</code> — amount দিন (USD, যেমন 5 বা -2.5):", reply_markup=make_keyboard([_BB]))
+        elif act == "vip":
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "⭐ VIP দিতে ⭐ VIP → ➕ Add VIP ব্যবহার করুন.", reply_markup=admin_vip_kb())
+    except Exception:
+        logger.exception("nav_user_action failed")
+        try:
+            bot.answer_callback_query(call.id, "❌ Failed")
+        except Exception:
+            pass
+
+
+def _nav_input_handler(message):
+    uid = message.from_user.id
+    st = NAV_INPUT.get(uid)
+    text = (message.text or "").strip()
+    act = st["action"]
+    back = st.get("back", "admin")
+    try:
+        if act == "search":
+            NAV_INPUT.pop(uid, None)
+            _search_user(message, st["mode"], text)
+            return
+        if act == "set_setting":
+            val = text
+            if st.get("numeric"):
+                float(val)
+            set_setting(st["key"], val)
+            NAV_INPUT.pop(uid, None)
+            _say(message, "✅ Saved.", None)
+            return show_menu(message.chat.id, uid, back)
+        if act == "wd_custom_reason":
+            return _wd_custom_reason(message, st)
+        if act == "msg_user_id":
+            tid = int(text)
+            NAV_INPUT[uid] = {"action": "msg_user", "target": tid, "back": back}
+            return _say(message, f"📩 <code>{tid}</code> কে পাঠাতে message লিখুন:", make_keyboard([_BB]))
+        if act == "msg_user":
+            NAV_INPUT.pop(uid, None)
+            bot.send_message(st["target"], text)
+            _say(message, "✅ Message sent.")
+            return show_menu(message.chat.id, uid, back)
+        if act == "wallet_adj":
+            cents = int(round(float(text) * 100))
+            with DB_LOCK:
+                conn = db()
+                try:
+                    conn.execute("UPDATE users SET wallet_cents=COALESCE(wallet_cents,0)+? WHERE user_id=?", (cents, st["target"]))
+                    conn.commit()
+                finally:
+                    conn.close()
+            NAV_INPUT.pop(uid, None)
+            _say(message, f"✅ Wallet adjusted {cents/100:+.2f}$")
+            return show_menu(message.chat.id, uid, back)
+    except ValueError:
+        _say(message, "❌ সঠিক সংখ্যা দিন.")
+    except Exception as exc:
+        logger.exception("nav input failed")
+        NAV_INPUT.pop(uid, None)
+        _say(message, "❌ " + escape(str(exc)))
+
+
+# ---------------- dispatcher ----------------
+_USER_TO_LEGACY = {
+    "🤖 AI Analysis": "📸 AI Candle Analysis",
+    "💸 Withdraw": "💸 Request Withdraw",
+    "🆔 Submit UID": "🆔 Submit Quotex UID",
+}
+_NAV_CATS_USER = {"📊 Signals": "signals", "💰 My Account": "my_account", "💵 Wallet": "wallet",
+                  "🎁 Referral": "referral", "⚙️ Settings": "settings"}
+_NAV_CATS_ADMIN = {"📊 Signals": "admin_signals", "👥 Users": "admin_users", "⭐ VIP": "admin_vip",
+                   "💰 Money": "admin_money", "🎁 Referral": "admin_referral", "⚙️ Settings": "admin_settings",
+                   "📈 Analytics": "admin_analytics", "📝 Content": "admin_content"}
+_ADMIN_OWN = {
+    "📊 Signal Debug": admin_signal_debug, "📈 Signal Performance": admin_signal_performance,
+    "📋 Broadcast History": admin_broadcast_history, "📊 User Stats": admin_user_stats,
+    "👥 User Stats": admin_user_stats, "📤 Export Users CSV": admin_export_users,
+    "🔄 Pending Renewals": admin_pending_renewals, "📊 VIP Stats": admin_vip_stats,
+    "📊 Revenue Report": admin_revenue_report, "💰 Revenue": admin_revenue_report,
+    "📊 Daily Report": admin_daily_report,
+}
+_ADMIN_LEGACY_ALIASES = {
+    "🏆 Leaderboard": None, "📊 Dashboard": "📊 Dashboard", "📈 Result Stats": "📈 Result Stats",
+    "🤖 AI Usage Stats": "🤖 AI Usage Stats",
+}
+_NAV_ALL = set(_USER_TO_LEGACY) | set(_NAV_CATS_USER) | set(_NAV_CATS_ADMIN) | set(_ADMIN_OWN) | set(CONTENT_KEYS) | {
+    "🔙 Back", "🏠 Main Menu", "❌ Cancel", "👑 Admin Control", "💰 My Account", "💵 Money Management",
+    "💰 Balance", "📜 History", "📊 Referral Stats", "🏆 Leaderboard", "🎁 Bonus Info", "📖 Tutorial",
+    "💬 Support", "📜 Terms", "📩 Message User", "📝 Text Editor", "📝 Bot Text Editor", "🔄 Renew VIP", "🔗 Register on Quotex", "🔗 Quotex Link", "📊 Withdrawal Limit/Day",
+    "🔍 Search User", "🆔 By ID", "👤 By Username", "📝 By Name", "👥 Referral Link", "📊 My Status",
+    "📜 Signal History",
+}
+
+
+def _nav_match(message):
+    try:
+        if message.content_type != "text":
+            return False
+        uid = message.from_user.id
+        t = (message.text or "").strip()
+        if uid in NAV_INPUT:
+            return True
+        if uid in STATES:
+            return t in ("🔙 Back", "🏠 Main Menu")
+        return t in _NAV_ALL or t.startswith("⭐ VIP") or t.startswith("⭐ JOIN VIP")
+    except Exception:
+        return False
+
+
+@bot.message_handler(func=_nav_match, content_types=["text"])
+def nav_dispatcher(message):
+    uid = message.from_user.id
+    t = (message.text or "").strip()
+    try:
+        register_user(message.from_user)
+        if t in ("🏠 Main Menu", "❌ Cancel"):
+            NAV_INPUT.pop(uid, None)
+            try:
+                clear_state(uid)
+            except Exception:
+                STATES.pop(uid, None)
+            return show_menu(message.chat.id, uid, "main")
+        if t == "🔙 Back":
+            return handle_back_button(message, STATES.get(uid))
+        if uid in NAV_INPUT:
+            return _nav_input_handler(message)
+        if maintenance_blocked(uid):
+            return _say(message, "🛠️ Bot maintenance mode-এ আছে.", main_keyboard(uid))
+
+        cur = NAV_MENU.get(uid, "main")
+        in_admin = cur.startswith("admin") and _nav_is_admin(uid)
+
+        if t == "👑 Admin Control":
+            return show_menu(message.chat.id, uid, "admin")
+        if (t.startswith("⭐ VIP") or t.startswith("⭐ JOIN VIP")) and not (in_admin and t in CONTENT_KEYS):
+            if in_admin and t == "⭐ VIP":
+                return show_menu(message.chat.id, uid, "admin_vip")
+            return join_vip_menu(message)
+
+        if in_admin:
+            if t in _NAV_CATS_ADMIN:
+                return show_menu(message.chat.id, uid, _NAV_CATS_ADMIN[t])
+            if t == "🔍 Search User":
+                return show_menu(message.chat.id, uid, "admin_search")
+            if t in ("🆔 By ID", "👤 By Username", "📝 By Name"):
+                mode = {"🆔 By ID": "id", "👤 By Username": "username", "📝 By Name": "name"}[t]
+                NAV_INPUT[uid] = {"action": "search", "mode": mode, "back": "admin_search"}
+                return _say(message, "🔍 Search value পাঠান:", make_keyboard([_BB]))
+            if t in _ADMIN_OWN:
+                return _ADMIN_OWN[t](message)
+            if t == "🏆 Leaderboard":
+                return referral_leaderboard(message)
+            if t in ("📝 Text Editor", "📝 Bot Text Editor"):
+                return admin_text_editor(message)
+            if t == "📩 Message User":
+                NAV_INPUT[uid] = {"action": "msg_user_id", "back": cur}
+                return _say(message, "📩 User Telegram ID দিন:", make_keyboard([_BB]))
+            if t in CONTENT_KEYS:
+                k, lbl = CONTENT_KEYS[t]
+                return _ask_setting(message, k, lbl, "admin_content")
+            if t == "🔗 Quotex Link":
+                return _ask_setting(message, "quotex_ref_link", "Quotex Link", "admin_settings")
+            if t == "📊 Withdrawal Limit/Day":
+                return _ask_setting(message, "withdraw_limit_day", "Withdrawal Limit/Day", "admin_settings", True)
+            _admin_legacy(message, t)
+            if uid not in STATES and uid not in NAV_INPUT and cur in _MENU_TABLE:
+                title, builder = _MENU_TABLE[cur]
+                bot.send_message(message.chat.id, "📍 " + title, reply_markup=builder(uid))
+            return
+
+        # ---- user side ----
+        if t in _NAV_CATS_USER:
+            return show_menu(message.chat.id, uid, _NAV_CATS_USER[t])
+        if t == "💰 My Account":
+            return show_menu(message.chat.id, uid, "my_account")
+        if t == "💵 Money Management":
+            NAV_MENU[uid] = "mm"
+            return _legacy(message, "💰 Money Management")
+        if t == "💰 Balance":
+            return wallet_balance(message)
+        if t == "📜 History":
+            return wallet_history(message)
+        if t == "📊 Referral Stats":
+            return referral_stats(message)
+        if t == "🏆 Leaderboard":
+            return referral_leaderboard(message)
+        if t == "🎁 Bonus Info":
+            return referral_bonus_info(message)
+        if t == "📖 Tutorial":
+            return tutorial_menu(message)
+        if t == "💬 Support":
+            return support_menu(message)
+        if t == "📜 Terms":
+            return terms_menu(message)
+        if t == "🔄 Renew VIP":
+            return renew_vip_menu(message)
+        if t == "🔗 Register on Quotex":
+            return _register_link(message)
+        if t in _USER_TO_LEGACY:
+            return _legacy(message, _USER_TO_LEGACY[t])
+        if t == "📊 My Status":
+            return _legacy(message, "👤 My Status")
+        return _legacy(message, t)
+    except Exception:
+        logger.exception("nav_dispatcher failed for %r", t)
+        try:
+            show_menu(message.chat.id, uid, "main")
+        except Exception:
+            pass
+
+# ============================================================
+# END NAVIGATION LAYER
+# ============================================================
+
+
+
+# ============================================================
+# WITHDRAWAL SERIAL + INLINE APPROVE/REJECT (serial_no is a STRING)
+# ============================================================
+WD_REJECT_REASONS = {"bal": "Balance issue", "method": "Wrong method", "acct": "Wrong account", "susp": "Suspicious"}
+
+
+def _next_wd_serial(conn):
+    day = now_bd().strftime("%Y%m%d")
+    prefix = f"WD-{day}-"
+    row = conn.execute("SELECT COUNT(*) FROM withdrawals WHERE serial_no LIKE ?", (prefix + "%",)).fetchone()
+    n = int(row[0] or 0) + 1
+    while conn.execute("SELECT 1 FROM withdrawals WHERE serial_no=?", (f"{prefix}{n:04d}",)).fetchone():
+        n += 1
+    return f"{prefix}{n:04d}"
+
+
+def _wd_user_submitted_text(serial, cents, method, account):
+    return ("━━━━━━━━━━━━━━━━━━\n✅ <b>WITHDRAWAL SUBMITTED</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Serial: <code>{escape(serial)}</code>\n💸 Amount: {money(cents)}\n📱 Method: {escape(str(method))}\n"
+            f"👤 Account: <code>{escape(str(account))}</code>\n\n📝 Admin review করবে\n⏳ 24 ঘণ্টায় process\n━━━━━━━━━━━━━━━━━━")
+
+
+def _wd_admin_text(serial, uid, method, account, cents):
+    return ("━━━━━━━━━━━━━━━━━━\n💸 <b>NEW WITHDRAWAL</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Serial: <code>{escape(serial)}</code>\n👤 User: <code>{uid}</code>\n📱 Method: {escape(str(method))}\n"
+            f"👤 Account: <code>{escape(str(account))}</code>\n💸 Amount: {money(cents)}\n━━━━━━━━━━━━━━━━━━")
+
+
+def _wd_inline_kb(serial):
+    ik = types.InlineKeyboardMarkup()
+    ik.row(types.InlineKeyboardButton("✅ Approve", callback_data=f"wdok:{serial}"),
+           types.InlineKeyboardButton("❌ Reject", callback_data=f"wdno:{serial}"))
+    return ik
+
+
+def _wd_reason_kb(serial):
+    ik = types.InlineKeyboardMarkup()
+    ik.row(types.InlineKeyboardButton("💰 Balance issue", callback_data=f"wdrs:{serial}:bal"))
+    ik.row(types.InlineKeyboardButton("📱 Wrong method", callback_data=f"wdrs:{serial}:method"))
+    ik.row(types.InlineKeyboardButton("👤 Wrong account", callback_data=f"wdrs:{serial}:acct"))
+    ik.row(types.InlineKeyboardButton("⚠️ Suspicious", callback_data=f"wdrs:{serial}:susp"))
+    ik.row(types.InlineKeyboardButton("✏️ Custom", callback_data=f"wdrs:{serial}:custom"))
+    return ik
+
+
+def _wd_decide(admin_id, serial, approve, reason=""):
+    """Returns (ok, message, user_id, cents). Serial stays a string."""
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            r = conn.execute("SELECT * FROM withdrawals WHERE serial_no=? AND status='PENDING'", (serial,)).fetchone()
+            if not r:
+                conn.rollback()
+                return False, "Withdrawal already processed বা পাওয়া যায়নি.", None, 0
+            if approve:
+                hu = r["hold_until"]
+                if hu:
+                    try:
+                        dt = datetime.fromisoformat(hu)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=UTC)
+                        if dt.astimezone(UTC) > now_utc():
+                            conn.rollback()
+                            return False, "Withdrawal hold এখনও শেষ হয়নি.", None, 0
+                    except Exception:
+                        pass
+                conn.execute("UPDATE withdrawals SET status='APPROVED',reviewed_at=?,reviewed_by=? WHERE serial_no=? AND status='PENDING'",
+                             (utc_iso(now_utc()), admin_id, serial))
+            else:
+                conn.execute("UPDATE withdrawals SET status='REJECTED',reviewed_at=?,reviewed_by=?,review_note=? WHERE serial_no=? AND status='PENDING'",
+                             (utc_iso(now_utc()), admin_id, reason, serial))
+                conn.execute("UPDATE users SET wallet_cents=wallet_cents+? WHERE user_id=?", (r["amount_cents"], r["user_id"]))
+                conn.execute("INSERT INTO wallet_tx(user_id,amount_cents,kind,note,created_at) VALUES(?,?,?,?,?)",
+                             (r["user_id"], r["amount_cents"], "WITHDRAW_REFUND", f"Rejected {serial}: {reason}", utc_iso(now_utc())))
+            conn.commit()
+            uid_, cents = r["user_id"], r["amount_cents"]
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+            raise
+        finally:
+            conn.close()
+    try: admin_audit(admin_id, "WITHDRAW_DECISION", uid_, f"{serial} {'APPROVED' if approve else 'REJECTED ' + reason}")
+    except Exception: pass
+    return True, "OK", uid_, cents
+
+
+def _wd_notify_user(uid_, serial, cents, approve, reason=""):
+    try:
+        if approve:
+            t = f"✅ <b>WITHDRAWAL APPROVED</b>\n\n🆔 {escape(serial)}\n💸 {money(cents)}"
+        else:
+            t = f"❌ <b>WITHDRAWAL REJECTED</b>\n\n🆔 {escape(serial)}\nReason: {escape(reason)}\n💰 Amount refunded"
+        bot.send_message(uid_, t, reply_markup=main_keyboard(uid_))
+    except Exception:
+        logger.exception("WD user notify failed")
+
+
+def _wd_admin_ok(call):
+    if not (is_master(call.from_user.id) or can(call.from_user.id, "withdraw")):
+        bot.answer_callback_query(call.id, "⛔ Access denied", show_alert=True)
+        return False
+    return True
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("wdok:"))
+def wd_approve_callback(call):
+    try:
+        if not _wd_admin_ok(call): return
+        serial = call.data.split(":", 1)[1]
+        ok, msg, u, c = _wd_decide(call.from_user.id, serial, True)
+        bot.answer_callback_query(call.id, "✅ Approved" if ok else msg, show_alert=not ok)
+        if ok:
+            _wd_notify_user(u, serial, c, True)
+            try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except Exception: pass
+            bot.send_message(call.message.chat.id, f"✅ {escape(serial)} approved.")
+    except Exception:
+        logger.exception("wd_approve_callback failed")
+        try: bot.answer_callback_query(call.id, "❌ Failed")
+        except Exception: pass
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("wdno:"))
+def wd_reject_callback(call):
+    try:
+        if not _wd_admin_ok(call): return
+        serial = call.data.split(":", 1)[1]
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, f"❌ Reject reason বেছে নিন — <code>{escape(serial)}</code>", reply_markup=_wd_reason_kb(serial))
+    except Exception:
+        logger.exception("wd_reject_callback failed")
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("wdrs:"))
+def wd_reason_callback(call):
+    try:
+        if not _wd_admin_ok(call): return
+        _, serial, key = call.data.split(":", 2)
+        if key == "custom":
+            NAV_INPUT[call.from_user.id] = {"action": "wd_custom_reason", "serial": serial, "back": "admin_money"}
+            bot.answer_callback_query(call.id)
+            return bot.send_message(call.message.chat.id, "✏️ Custom reason লিখুন:", reply_markup=make_keyboard([["🔙 Back", "🏠 Main Menu"]]))
+        reason = WD_REJECT_REASONS.get(key, "Rejected")
+        ok, msg, u, c = _wd_decide(call.from_user.id, serial, False, reason)
+        bot.answer_callback_query(call.id, "❌ Rejected" if ok else msg, show_alert=not ok)
+        if ok:
+            _wd_notify_user(u, serial, c, False, reason)
+            bot.send_message(call.message.chat.id, f"❌ {escape(serial)} rejected ({escape(reason)}). Refunded.")
+    except Exception:
+        logger.exception("wd_reason_callback failed")
+        try: bot.answer_callback_query(call.id, "❌ Failed")
+        except Exception: pass
+
+
+def _wd_custom_reason(message, st):
+    ok, msg, u, c = _wd_decide(message.from_user.id, st["serial"], False, message.text.strip()[:200])
+    NAV_INPUT.pop(message.from_user.id, None)
+    if ok:
+        _wd_notify_user(u, st["serial"], c, False, message.text.strip()[:200])
+        _say(message, f"❌ {escape(st['serial'])} rejected. Refunded.", admin_money_kb())
+    else:
+        _say(message, "⚠️ " + escape(msg), admin_money_kb())
+
+
+def _wd_column_migration():
+    with DB_LOCK:
+        conn = db()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(withdrawals)").fetchall()}
+            for c, d in (("serial_no", "TEXT"), ("reviewed_by", "INTEGER"), ("hold_until", "TEXT"), ("review_note", "TEXT")):
+                if c not in cols:
+                    conn.execute(f"ALTER TABLE withdrawals ADD COLUMN {c} {d}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_serial ON withdrawals(serial_no)")
+            # backfill old rows so every withdrawal has a serial
+            for r in conn.execute("SELECT id,created_at FROM withdrawals WHERE serial_no IS NULL OR serial_no=''").fetchall():
+                day = str(r["created_at"] or "")[:10].replace("-", "") or now_bd().strftime("%Y%m%d")
+                conn.execute("UPDATE withdrawals SET serial_no=? WHERE id=?", (f"WD-{day}-{int(r['id']):04d}", r["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ============================================================
 # MAIN MESSAGE ROUTER
 # ============================================================
 
@@ -7690,7 +8551,7 @@ def __clean_handle_state_v2(message):
                     if not u or u["wallet_cents"]<a: raise ValueError("Wallet balance changed; request cancelled.")
                     if conn.execute("SELECT 1 FROM withdrawals WHERE user_id=? AND status='PENDING'",(uid,)).fetchone(): raise ValueError("Pending withdrawal exists.")
                     conn.execute("UPDATE users SET wallet_cents=wallet_cents-? WHERE user_id=? AND wallet_cents>=?",(a,uid,a))
-                    conn.execute("INSERT INTO withdrawals(user_id,amount_cents,method,account,status,created_at,hold_until) VALUES(?,?,?,?,?,?,?)",(uid,a,method,account,"PENDING",utc_iso(now_utc()),hold))
+                    serial=_next_wd_serial(conn); conn.execute("INSERT INTO withdrawals(user_id,amount_cents,method,account,status,created_at,hold_until,serial_no) VALUES(?,?,?,?,?,?,?,?)",(uid,a,method,account,"PENDING",utc_iso(now_utc()),hold,serial))
                     conn.execute("INSERT INTO wallet_tx(user_id,amount_cents,kind,note,created_at) VALUES(?,?,?,?,?)",(uid,-a,"WITHDRAW_HOLD","Withdrawal request",utc_iso(now_utc())))
                     conn.commit()
                 except Exception:
@@ -7698,9 +8559,9 @@ def __clean_handle_state_v2(message):
                 finally: conn.close()
             admin_audit(uid,"WITHDRAW_REQUEST",uid,f"{method} {money(a)}")
             clear_state(uid)
-            bot.send_message(message.chat.id,"✅ Withdrawal request submitted. Admin review করবে.",reply_markup=main_keyboard(uid));
-            try: bot.send_message(ADMIN_ID,f"💸 <b>NEW WITHDRAWAL</b>\nUser: <code>{uid}</code>\nMethod: {method}\nAccount: <code>{escape(account)}</code>\nAmount: <b>{money(a)}</b>",reply_markup=admin_keyboard())
-            except Exception: pass
+            bot.send_message(message.chat.id,_wd_user_submitted_text(serial,a,method,account),reply_markup=main_keyboard(uid));
+            try: bot.send_message(ADMIN_ID,_wd_admin_text(serial,uid,method,account,a),reply_markup=_wd_inline_kb(serial))
+            except Exception: logger.exception("Withdrawal admin notify failed")
             return True
         if action=="text_pick":
             key=st["map"].get(text)
@@ -9284,8 +10145,8 @@ def __clean_handle_admin_button_v3(message):
     if text=="👥 User Stats": return _all_users(message,stats=True)
     if text=="💰 Revenue": return admin_withdrawal_report(message)
     if text=="🤖 AI Usage Stats": return _ai_usage_stats(message)
-    # legacy submenu buttons remain available
-    return LEGACY_HANDLE_ADMIN_BUTTON(message)
+    # legacy submenu buttons remain available (v2 adds permission checks)
+    return __clean_handle_admin_button_v2(message)
 
 
 def _all_users(message,stats=False):
@@ -9368,7 +10229,7 @@ def _ai_usage_stats(message):
 
 
 # ------------------------- State override ---------------------
-_LEGACY_FINAL_STATE = LEGACY_HANDLE_STATE
+_LEGACY_FINAL_STATE = __clean_handle_state_v2  # v2 covers withdraw/text/candle/subadmin states, then falls back to legacy
 
 def __clean_handle_state_v3(message):
     uid=message.from_user.id; text=(message.text or "").strip(); st=STATES.get(uid)
@@ -9728,6 +10589,35 @@ def __clean_main_v2():
 # ============================================================
 # FINAL RUNTIME BINDINGS
 # ============================================================
+admin_keyboard = admin_home_kb
+referral_menu = __clean_referral_menu_v2
+admin_audit = __clean_admin_audit_v2
+normalize_uid = __clean_normalize_uid_v2
+start_uid_submission = __clean_start_uid_submission_v2
+release_referral_bonuses = __clean_release_referral_bonuses_v2
+secure_process_referral_bonus = __clean_secure_process_referral_bonus_v2
+mm_menu = __clean_mm_menu_v2
+result_buttons = __clean_result_buttons_v2
+candle_ai_prompt = __clean_candle_ai_prompt_v2
+analyze_candle_state = __clean_analyze_candle_state_v2
+vote_menu = __clean_vote_menu_v2
+safe_startup_migration = __clean_safe_startup_migration_v2
+
+_orig_safe_startup = safe_startup_migration
+def safe_startup_migration():
+    ok = _orig_safe_startup()
+    try:
+        _wd_column_migration()
+    except Exception:
+        logger.exception("Withdrawal serial migration failed")
+        ok = False
+    return ok
+
+handle_state = handle_state          # single public state dispatcher (explicit)
+handle_admin_button = __clean_handle_admin_button_v3
+admin_text_editor = __clean_admin_text_editor_v2
+admin_subadmins = __clean_admin_subadmins_v2
+admin_notify_targets = __clean_admin_notify_targets_v2
 format_signal = patched_format_signal_final
 deliver_signal = patched_deliver_signal_final
 main = __clean_main_v2
