@@ -745,6 +745,22 @@ def make_keyboard(rows):
     return keyboard
 
 
+def _vip_button_label(uid):
+    try:
+        u = get_user(uid)
+        if u and vip_is_active(u):
+            if u["vip_until"]:
+                try:
+                    d = (datetime.fromisoformat(u["vip_until"]).astimezone(BD_TZ) - now_bd()).days
+                    return f"⭐ VIP: {max(d, 0)}d"
+                except Exception:
+                    pass
+            return "⭐ VIP: ♾️"
+    except Exception:
+        pass
+    return "⭐ JOIN VIP"
+
+
 def _safe_vip_label(user_id):
     try:
         return _vip_button_label(user_id)
@@ -838,34 +854,12 @@ def admin_keyboard():
 
 
 def mm_keyboard():
-
     return make_keyboard([
-
-        [
-            "💵 Set Balance",
-            "🎯 Set Profit Target"
-        ],
-
-        [
-            "🛑 Set Loss Limit",
-            "💲 Set Base Trade"
-        ],
-
-        [
-            "1️⃣ Set M1 Trade",
-            "🔢 Max Trades/Day"
-        ],
-
-        [
-            "📊 MM Status",
-            "🛑 Stop MM Today"
-        ],
-
-        [
-            "🔙 Back",
-            "🏠 Main Menu"
-        ]
-
+        ["⚙️ Setup MM", "🔘 MM ON/OFF"],
+        ["📊 MM Status", "💵 Change Base"],
+        ["💲 Change M1", "📈 Change Payout"],
+        ["🛑 Stop MM Today"],
+        ["🔙 Back", "🏠 Main Menu"]
     ])
 
 
@@ -1825,7 +1819,10 @@ def auto_signal_loop():
                         for target in targets:
 
                             try:
-                                audience = (target["audience"] or "ALL").upper()
+                                try:
+                                    audience = (target["audience"] or "ALL").upper()
+                                except Exception:
+                                    audience = "ALL"
                                 # A group/channel cannot enforce Telegram-user-level VIP membership.
                                 # We therefore use the target audience as a signal-audience filter.
                                 if audience == "VIP" and signal["audience"] != "VIP":
@@ -6745,7 +6742,7 @@ NAV_PARENT = {
     "mm": "main", "referral": "main", "settings": "main", "vip": "main",
     "admin": "main", "admin_signals": "admin", "admin_users": "admin", "admin_vip": "admin",
     "admin_money": "admin", "admin_referral": "admin", "admin_settings": "admin",
-    "admin_analytics": "admin", "admin_content": "admin", "admin_search": "admin_users",
+    "admin_analytics": "admin", "admin_content": "admin", "admin_search": "admin_users", "admin_analysis": "admin_signals",
 }
 
 _BB = ["🔙 Back", "🏠 Main Menu"]
@@ -6756,23 +6753,6 @@ def _nav_is_admin(uid):
         return bool(is_master(uid) or get_permissions(uid))
     except Exception:
         return False
-
-
-def _vip_button_label(uid):
-    try:
-        u = get_user(uid)
-        if u and vip_is_active(u):
-            left = ""
-            try:
-                if u["vip_until"]:
-                    d = (datetime.fromisoformat(u["vip_until"]).astimezone(BD_TZ) - now_bd()).days
-                    left = f": {max(d, 0)}d"
-            except Exception:
-                left = ""
-            return "⭐ VIP" + (left if left else ": Active")
-    except Exception:
-        pass
-    return "⭐ JOIN VIP"
 
 
 def signals_menu():
@@ -6806,7 +6786,7 @@ def admin_signals_kb():
     return make_keyboard([
         ["➕ Add Future Signals", "📋 Future Signal List"], ["✏️ Edit Signal", "🗑️ Delete Signal"],
         ["🧹 Clear Future Signals", "📤 Auto Send ON/OFF"], ["🎯 Signal Audience", "⚡ Live Session"],
-        ["📊 Signal Debug", "📈 Signal Performance"], _BB])
+        ["📊 Signal Debug", "📈 Signal Performance"], ["🧠 Analysis Rules"], _BB])
 
 
 def admin_users_kb():
@@ -6857,7 +6837,7 @@ def admin_content_kb():
 def admin_home_kb():
     return make_keyboard([
         ["📊 Signals", "👥 Users"], ["⭐ VIP", "💰 Money"], ["🎁 Referral", "⚙️ Settings"],
-        ["📈 Analytics", "📝 Content"], _BB])
+        ["📈 Analytics", "📝 Content"], ["🧠 Analysis Rules"], _BB])
 
 
 def admin_search_kb():
@@ -6867,6 +6847,8 @@ def admin_search_kb():
 _MENU_TABLE = {
     "signals": ("📊 <b>SIGNALS</b>", lambda u: signals_menu()),
     "my_account": ("💰 <b>MY ACCOUNT</b>", lambda u: my_account_menu()),
+    "mm": ("💵 <b>MONEY MANAGEMENT</b>", lambda u: mm_keyboard()),
+    "admin_analysis": ("🧠 <b>ANALYSIS RULES</b>", lambda u: admin_analysis_kb()),
     "wallet": ("💵 <b>WALLET</b>", lambda u: wallet_menu_kb()),
     "referral": ("🎁 <b>REFERRAL</b>", lambda u: referral_menu_kb()),
     "settings": ("⚙️ <b>SETTINGS</b>", lambda u: settings_menu_kb()),
@@ -7048,7 +7030,7 @@ def join_vip_menu(message):
         except Exception:
             pass
         text = ("━━━━━━━━━━━━━━━━━━\n⭐ <b>VIP STATUS</b>\n━━━━━━━━━━━━━━━━━━\n\n🎉 আপনি VIP!\n\n"
-                f"⭐ Status: ACTIVE\n⏰ Expires: {escape(str(u['vip_until'] or '—'))[:10]}\n⏳ Days Left: {left}\n\n"
+                f"⭐ Status: ACTIVE\n⏰ Expires: {escape(_fmt_dt(u['vip_until'], 'Unlimited'))}\n⏳ Days Left: {left}\n\n"
                 "✅ Unlimited Signals • Live Signals • AI 50/day • Priority Support\n\n"
                 "📖 VIP RULES:\n⏰ Expiry 7 days আগে reminder\n🆔 Admin review")
     else:
@@ -7315,12 +7297,35 @@ _ADMIN_LEGACY_ALIASES = {
     "🤖 AI Usage Stats": "🤖 AI Usage Stats",
 }
 _NAV_ALL = set(_USER_TO_LEGACY) | set(_NAV_CATS_USER) | set(_NAV_CATS_ADMIN) | set(_ADMIN_OWN) | set(CONTENT_KEYS) | {
-    "🔙 Back", "🏠 Main Menu", "❌ Cancel", "👑 Admin Control", "💰 My Account", "💵 Money Management",
+    "🔙 Back", "🏠 Main Menu", "❌ Cancel", "👑 Admin Control", "🧠 Analysis Rules", "➕ Add Analysis Rule", "📋 Analysis Rule List", "🗑️ Remove Analysis Rule", "🔘 Rule ON/OFF", "📊 Analysis Stats", "🎯 Set Confidence Min", "🤖 Analysis ON/OFF", "🔀 Analysis Engine", "💰 My Account", "💵 Money Management",
     "💰 Balance", "📜 History", "📊 Referral Stats", "🏆 Leaderboard", "🎁 Bonus Info", "📖 Tutorial",
     "💬 Support", "📜 Terms", "📩 Message User", "📝 Text Editor", "📝 Bot Text Editor", "🔄 Renew VIP", "🔗 Register on Quotex", "🔗 Quotex Link", "📊 Withdrawal Limit/Day",
     "🔍 Search User", "🆔 By ID", "👤 By Username", "📝 By Name", "👥 Referral Link", "📊 My Status",
     "📜 Signal History",
 }
+
+
+_MENU_LABELS_CACHE = {}
+
+
+def _menu_labels():
+    """Every label that lives on a menu keyboard (not flow-specific buttons like '💸 WD #1')."""
+    if _MENU_LABELS_CACHE.get("v"):
+        return _MENU_LABELS_CACHE["v"]
+    labels = set()
+    for builder in (signals_menu, my_account_menu, wallet_menu_kb, referral_menu_kb, settings_menu_kb, admin_signals_kb, admin_users_kb,
+                    admin_vip_kb, admin_money_kb, admin_referral_kb, admin_settings_kb, admin_analytics_kb, admin_content_kb,
+                    admin_home_kb, admin_search_kb, mm_keyboard):
+        try:
+            for row in builder().keyboard:
+                for b in row:
+                    labels.add(b["text"] if isinstance(b, dict) else b.text)
+        except Exception:
+            pass
+    labels |= {"📊 Signals", "💰 My Account", "💵 Money Management", "🎁 Referral", "⚙️ Settings", "👑 Admin Control"}
+    labels -= {"🔙 Back", "🏠 Main Menu"}
+    _MENU_LABELS_CACHE["v"] = labels
+    return labels
 
 
 def _nav_match(message):
@@ -7329,10 +7334,19 @@ def _nav_match(message):
             return False
         uid = message.from_user.id
         t = (message.text or "").strip()
+        if t in ("🔙 Back", "🏠 Main Menu", "❌ Cancel"):
+            return (uid in STATES) or (uid in NAV_INPUT) or t in _NAV_ALL
+        # A real menu button always wins over a half-finished input state
+        if t in _menu_labels() and (uid in STATES or uid in NAV_INPUT):
+            STATES.pop(uid, None)
+            NAV_INPUT.pop(uid, None)
+            try: clear_state(uid)
+            except Exception: pass
+            return True
         if uid in NAV_INPUT:
             return True
         if uid in STATES:
-            return t in ("🔙 Back", "🏠 Main Menu")
+            return False
         return t in _NAV_ALL or t.startswith("⭐ VIP") or t.startswith("⭐ JOIN VIP")
     except Exception:
         return False
@@ -7381,6 +7395,8 @@ def nav_dispatcher(message):
                 return _ADMIN_OWN[t](message)
             if t == "🏆 Leaderboard":
                 return referral_leaderboard(message)
+            if t in ANALYSIS_ADMIN_BUTTONS:
+                return ANALYSIS_ADMIN_BUTTONS[t](message)
             if t in ("📝 Text Editor", "📝 Bot Text Editor"):
                 return admin_text_editor(message)
             if t == "📩 Message User":
@@ -7619,6 +7635,26 @@ def _wd_column_migration():
             for c, d in (("serial_no", "TEXT"), ("reviewed_by", "INTEGER"), ("hold_until", "TEXT"), ("review_note", "TEXT")):
                 if c not in cols:
                     conn.execute(f"ALTER TABLE withdrawals ADD COLUMN {c} {d}")
+            _extra = {
+                "users": (("warning_count", "INTEGER NOT NULL DEFAULT 0"), ("warning_reason", "TEXT"), ("vip_reminder_7d_sent", "INTEGER NOT NULL DEFAULT 0"),
+                          ("vip_reminder_3d_sent", "INTEGER NOT NULL DEFAULT 0"), ("vip_started_at", "TEXT"), ("ai_usage_count", "INTEGER NOT NULL DEFAULT 0"), ("ai_usage_date", "TEXT")),
+                "referrals": (("status", "TEXT NOT NULL DEFAULT 'PENDING'"), ("quotex_uid", "TEXT"), ("deposit_amount_cents", "INTEGER NOT NULL DEFAULT 0"),
+                              ("warning_count", "INTEGER NOT NULL DEFAULT 0"), ("risk_flag", "INTEGER NOT NULL DEFAULT 0"), ("risk_note", "TEXT"), ("reviewed_by", "INTEGER"),
+                              ("reviewed_at", "TEXT"), ("qualified_at", "TEXT"), ("paid_at", "TEXT"), ("reject_reason", "TEXT"), ("reject_reason_type", "TEXT"),
+                              ("rejected_by", "INTEGER"), ("rejected_at", "TEXT")),
+                "notify_targets": (("target_type", "TEXT NOT NULL DEFAULT 'GROUP'"), ("audience", "TEXT NOT NULL DEFAULT 'ALL'"), ("selected_users", "TEXT NOT NULL DEFAULT ''")),
+            }
+            for _t, _cols in _extra.items():
+                have = {r[1] for r in conn.execute(f"PRAGMA table_info({_t})").fetchall()}
+                if not have:
+                    continue
+                for c, d in _cols:
+                    if c not in have:
+                        conn.execute(f"ALTER TABLE {_t} ADD COLUMN {c} {d}")
+            for _ix in ("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)", "CREATE INDEX IF NOT EXISTS idx_users_name ON users(first_name)",
+                        "CREATE INDEX IF NOT EXISTS idx_referrals_status ON referrals(status)"):
+                try: conn.execute(_ix)
+                except Exception: pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_serial ON withdrawals(serial_no)")
             # backfill old rows so every withdrawal has a serial
             for r in conn.execute("SELECT id,created_at FROM withdrawals WHERE serial_no IS NULL OR serial_no=''").fetchall():
@@ -8651,8 +8687,9 @@ def __clean_handle_state_v2(message):
             bot.send_message(target,"✅ SM QUATEX SURE SHORT notification test.")
             clear_state(uid); bot.send_message(message.chat.id,"✅ Test sent.",reply_markup=admin_keyboard()); return True
         if action=="withdraw_admin_select":
-            if not text.startswith("💸 WD #") or not text[7:].isdigit(): raise ValueError("Withdrawal button ব্যবহার করুন.")
-            wid=int(text[7:])
+            _m=re.match(r"^💸\s*WD\s*#(\d+)$",text)
+            if not _m: raise ValueError("Withdrawal button ব্যবহার করুন.")
+            wid=int(_m.group(1))
             with DB_LOCK:
                 conn=db()
                 try:
@@ -9003,7 +9040,7 @@ def safe_startup_migration():
         "mm_payout": "0.80",
         "candle_ai_enabled": "OFF",
         "candle_ai_max_images": "3",
-        "candle_ai_model": "gemini-2.5-flash",
+        "candle_ai_model": "gemini-3.5-flash",
     }
 
     for key, value in defaults.items():
@@ -9020,8 +9057,7 @@ def safe_startup_migration():
 # AI CANDLE / CHART SCREENSHOT ANALYSIS
 # ============================================================
 
-def candle_ai_enabled():
-    return get_setting("candle_ai_enabled", "OFF") == "ON"
+# (superseded: see rule-based/engine version below)
 
 
 def candle_ai_max_images():
@@ -9047,100 +9083,105 @@ def candle_ai_prompt():
     )
 
 
+GEMINI_RETIRED_PREFIXES = ("gemini-1.", "gemini-2.0", "gemini-2.5", "gemini-pro")
+GEMINI_STATIC_FALLBACKS = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"]
+_GEMINI_CACHE = {"ok": None, "found": [], "found_at": 0.0}
+
+
+def _gemini_http(url, payload=None, timeout=60):
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"},
+                                 method="POST" if payload is not None else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _gemini_discover_models(api_key):
+    """Ask Google which flash models exist right now (ListModels), newest first."""
+    now = time.time()
+    if _GEMINI_CACHE["found"] and now - _GEMINI_CACHE["found_at"] < 3600:
+        return list(_GEMINI_CACHE["found"])
+    found = []
+    try:
+        data = _gemini_http("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=" + urllib.parse.quote(api_key, safe=""), None, 20)
+        for m_ in data.get("models", []):
+            name = str(m_.get("name", "")).replace("models/", "")
+            if "generateContent" not in (m_.get("supportedGenerationMethods") or []):
+                continue
+            if "flash" not in name or any(x in name for x in ("image", "tts", "live", "audio", "embedding", "native", "computer", "robotics", "thinking-exp")):
+                continue
+            if name.startswith(GEMINI_RETIRED_PREFIXES):
+                continue
+            ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+            found.append((float(ver.group(1)) if ver else 0.0, "preview" not in name and "exp" not in name, "lite" not in name, name))
+        found.sort(reverse=True)
+        found = [x[3] for x in found]
+        _GEMINI_CACHE.update(found=found, found_at=now)
+    except Exception as exc:
+        logger.warning("Gemini ListModels failed: %s", str(exc)[:120])
+    return found
+
+
 def gemini_analyze_candle_images(image_bytes_list):
-    """Optional Gemini REST integration; never crashes the Telegram bot."""
+    """Gemini REST call. Tries configured model, then auto-discovered current models. Never raises."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        return (
-            "⚠️ <b>AI Candle Analysis চালু করা যাচ্ছে না.</b>\n\n"
-            "Admin-কে Railway Variables-এ <code>GEMINI_API_KEY</code> সেট করতে হবে।"
-        )
-
-    model = os.getenv(
-        "GEMINI_MODEL",
-        get_setting("candle_ai_model", "gemini-2.5-flash")
-    ).strip() or "gemini-2.5-flash"
+        return ("⚠️ <b>AI Candle Analysis চালু করা যাচ্ছে না.</b>\n\n"
+                "Admin-কে Railway Variables-এ <code>GEMINI_API_KEY</code> সেট করতে হবে।")
+    configured = [os.getenv("GEMINI_MODEL", "").strip(), str(get_setting("candle_ai_model", "") or "").strip()]
+    configured = [m_.replace("models/", "") for m_ in configured if m_]
+    order, seen = [], set()
+    def add(m_):
+        if m_ and m_ not in seen:
+            seen.add(m_); order.append(m_)
+    add(_GEMINI_CACHE["ok"])
+    for m_ in configured:
+        if not m_.startswith(GEMINI_RETIRED_PREFIXES):
+            add(m_)
+    for m_ in _gemini_discover_models(api_key):
+        add(m_)
+    for m_ in GEMINI_STATIC_FALLBACKS:
+        add(m_)
+    for m_ in configured:           # retired names last, only if nothing else works
+        add(m_)
 
     parts = [{"text": candle_ai_prompt()}]
     for raw in image_bytes_list:
-        parts.append({
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": base64.b64encode(raw).decode("ascii")
-            }
-        })
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}})
+    payload = json.dumps({"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1400}}).encode("utf-8")
 
-    payload = json.dumps({
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 1400
-        }
-    }).encode("utf-8")
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + urllib.parse.quote(model, safe="")
-        + ":generateContent?key="
-        + urllib.parse.quote(api_key, safe="")
-    )
-
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return "⚠️ AI কোনো analysis result দেয়নি। Screenshot পরিষ্কার করে আবার চেষ্টা করুন."
-        output_parts = candidates[0].get("content", {}).get("parts", [])
-        answer = "\n".join(
-            str(p.get("text", "")).strip()
-            for p in output_parts
-            if p.get("text")
-        ).strip()
-        return answer or "⚠️ AI analysis result খালি এসেছে."
-    except urllib.error.HTTPError as exc:
+    last_error = "unknown"
+    for model in order[:6]:
         try:
-            detail = exc.read().decode("utf-8", errors="ignore")[:800]
-        except Exception:
-            detail = str(exc)
-        logger.exception("Gemini HTTP error")
-        return f"⚠️ AI service error. পরে আবার চেষ্টা করুন.\n<code>{escape(detail)}</code>"
-    except Exception:
-        logger.exception("Gemini candle analysis failed")
-        return "⚠️ AI analysis এখন করা যায়নি। Screenshot আবার upload করে চেষ্টা করুন."
+            url = ("https://generativelanguage.googleapis.com/v1beta/models/" + urllib.parse.quote(model, safe="")
+                   + ":generateContent?key=" + urllib.parse.quote(api_key, safe=""))
+            data = _gemini_http(url, payload, 60)
+            cands = data.get("candidates") or []
+            if cands:
+                out = "\n".join(str(p.get("text", "")).strip() for p in cands[0].get("content", {}).get("parts", []) if p.get("text")).strip()
+                if out:
+                    _GEMINI_CACHE["ok"] = model
+                    return out
+            last_error = f"{model}: empty response"
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8")).get("error", {}).get("message", "")
+            except Exception:
+                body = ""
+            last_error = f"{model}: HTTP {exc.code} {body[:90]}"
+            if _GEMINI_CACHE["ok"] == model:
+                _GEMINI_CACHE["ok"] = None
+            if exc.code in (401, 403):      # key problem, other models will not help
+                break
+        except Exception as exc:
+            last_error = f"{model}: {str(exc)[:90]}"
+    logger.error("Gemini failed: %s", last_error)
+    return ("⚠️ <b>AI service error</b>\n\nসব model fail হয়েছে। শেষ error:\n"
+            f"<code>{escape(last_error[:220])}</code>\n\n"
+            "Admin: Railway Variables-এ <code>GEMINI_MODEL</code> (যেমন gemini-3.5-flash) দিন.")
 
 
-def start_candle_analysis(message):
-    uid = message.from_user.id
 
-    if not candle_ai_enabled() and not is_master(uid):
-        return bot.send_message(
-            message.chat.id,
-            "🤖 <b>AI Candle Analysis বর্তমানে OFF.</b>",
-            reply_markup=main_keyboard(uid)
-        )
-
-    limit = candle_ai_max_images()
-    STATES[uid] = {"action": "candle_upload", "images": []}
-
-    bot.send_message(
-        message.chat.id,
-        f"📸 <b>AI Candle Analysis</b>\n\n"
-        f"একসাথে সর্বোচ্চ <b>{limit}টি</b> candle/chart screenshot upload করতে পারবেন.\n"
-        f"Screenshot পাঠানোর পর <b>🔍 Analyze Candles</b> চাপুন.\n\n"
-        f"⚠️ এটি prediction; guarantee নয়।",
-        reply_markup=make_keyboard([
-            ["🔍 Analyze Candles", "🗑️ Clear Candles"],
-            ["🔙 Back", "🏠 Main Menu"]
-        ])
-    )
+# (superseded: see rule-based/engine version below)
 
 
 def handle_candle_photo(message):
@@ -9646,7 +9687,7 @@ def final_migration():
                 "referral_qualification":"UID + $15 deposit attestation + admin review",
                 "candle_ai_enabled":"OFF", "candle_ai_max_images":"3",
                 "candle_ai_vip_limit":"50", "candle_ai_nonvip_limit":"3",
-                "candle_ai_confidence_min":"70", "candle_ai_model":"gemini-2.5-flash",
+                "candle_ai_confidence_min":"70", "candle_ai_model":"gemini-3.5-flash",
                 "mm_payout_percent":"85", "mm_min_base":"1.00",
                 "vip_reminder_days":"7,3", "result_reveal":"OFF",
             }
@@ -10100,6 +10141,7 @@ def __clean_admin_keyboard_v3():
 
 def __clean_handle_admin_button_v3(message):
     text=(message.text or "").strip(); uid=message.from_user.id
+    if text in ANALYSIS_ADMIN_BUTTONS: return ANALYSIS_ADMIN_BUTTONS[text](message)
     if text=="📊 Signals": return bot.send_message(message.chat.id,"📊 <b>SIGNALS</b>",reply_markup=make_keyboard([["➕ Add Future Signals","📋 Future Signal List"],["✏️ Edit Signal","🗑️ Delete Signal"],["🧹 Clear Future Signals","📤 Auto Send ON/OFF"],["🎯 Signal Audience","⚡ Live Session"],["🔙 Back","🏠 Main Menu"]]))
     if text=="👥 Users": return bot.send_message(message.chat.id,"👥 <b>USERS</b>",reply_markup=make_keyboard([["🔍 Search User","👥 All Users"],["🚫 Blocked Users","⚠️ Warning List"],["📩 Message User","📢 Broadcast"],["🔙 Back","🏠 Main Menu"]]))
     if text=="⭐ VIP": return bot.send_message(message.chat.id,"⭐ <b>VIP MANAGEMENT</b>",reply_markup=make_keyboard([["📋 VIP List","➕ Add VIP"],["⏰ Expiry Table","❌ Remove VIP"],["📢 Send Reminder","🆔 Pending UID"],["🔙 Back","🏠 Main Menu"]]))
@@ -10132,7 +10174,7 @@ def __clean_handle_admin_button_v3(message):
     if text=="🚫 Blocked Users": return _blocked_users(message)
     if text=="📋 VIP List": return _vip_list(message)
     if text=="⏰ Expiry Table": return _vip_expiry_table(message)
-    if text=="➕ Add VIP": _state_set(uid,{"action":"vip_add_id"}); return bot.send_message(message.chat.id,"Telegram ID লিখুন:",reply_markup=back_keyboard())
+    if text=="➕ Add VIP": _state_set(uid,{"action":"vip_add_id","previous_menu":"admin_vip"}); return bot.send_message(message.chat.id,"🆔 Telegram ID অথবা @username লিখুন:",reply_markup=back_keyboard())
     if text=="❌ Remove VIP": _state_set(uid,{"action":"vip_remove_id"}); return bot.send_message(message.chat.id,"Telegram ID লিখুন:",reply_markup=back_keyboard())
     if text=="📢 Send Reminder": return _vip_expiry_table(message,reminder=True)
     if text=="📋 Pending Referral": return _referral_review_list(message,"PENDING")
@@ -10187,6 +10229,39 @@ def _vip_list(message):
     bot.send_message(message.chat.id,msg,reply_markup=admin_keyboard())
 
 
+
+def _resolve_user_ref(raw):
+    """Accepts Telegram ID or @username; returns int user_id or raises ValueError."""
+    raw = str(raw or "").strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    name = raw.lstrip("@").strip().lower()
+    if not name or not re.fullmatch(r"[a-z0-9_]{3,32}", name):
+        raise ValueError("Telegram ID অথবা @username দিন.")
+    with DB_LOCK:
+        conn = db()
+        try:
+            row = conn.execute("SELECT user_id FROM users WHERE lower(username)=?", (name,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        raise ValueError(f"@{name} নামের কোনো user পাওয়া যায়নি (user-কে আগে bot-এ /start দিতে হবে).")
+    return int(row["user_id"])
+
+
+def _fmt_dt(iso, default="—"):
+    """ISO timestamp -> '08 Oct 2026 01:42 PM' (BD time)."""
+    if not iso:
+        return default
+    try:
+        dt = datetime.fromisoformat(str(iso))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(BD_TZ).strftime("%d %b %Y %I:%M %p")
+    except Exception:
+        return str(iso)[:16]
+
+
 def _vip_expiry_table(message,reminder=False):
     with DB_LOCK:
         conn=db()
@@ -10196,9 +10271,9 @@ def _vip_expiry_table(message,reminder=False):
     for r in rows:
         try: days=max(0,int((datetime.fromisoformat(r['vip_until']).astimezone(BD_TZ)-now).total_seconds()/86400))
         except Exception: days=-1
-        lines.append(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {escape(r['vip_until'])} | {days} days")
+        lines.append(f"<code>{r['user_id']}</code> @{escape(r['username'] or '—')} | {escape(_fmt_dt(r['vip_until']))} | {days} days")
         if reminder and days<=7:
-            try: bot.send_message(r['user_id'],f"📢 VIP reminder\n⏰ Expires: <b>{escape(r['vip_until'])}</b>")
+            try: bot.send_message(r['user_id'],f"📢 VIP reminder\n⏰ Expires: <b>{escape(_fmt_dt(r['vip_until']))}</b>")
             except Exception: pass
     bot.send_message(message.chat.id,"\n".join(lines) if len(lines)>1 else "⏰ No expiring VIP.",reply_markup=admin_keyboard())
 
@@ -10234,11 +10309,13 @@ _LEGACY_FINAL_STATE = __clean_handle_state_v2  # v2 covers withdraw/text/candle/
 def __clean_handle_state_v3(message):
     uid=message.from_user.id; text=(message.text or "").strip(); st=STATES.get(uid)
     if st: _state_set(uid,st); st=STATES.get(uid)
-    if text in ("🔙 Back","🏠 Main Menu","❌ Cancel") and st and st.get("action") not in ("withdraw_admin_action",):
+    if text in ("🔙 Back","🏠 Main Menu","❌ Cancel") and st:
         clear_state(uid); send_main_menu(message.chat.id,uid,"🏠 Main Menu"); return True
     if not st: return _LEGACY_FINAL_STATE(message)
     try:
         action=st.get("action")
+        _ar=_analysis_rules_state(message,st)
+        if _ar is not None: return True
         if action=="uid_confirm":
             if text=="🔗 Register on Quotex":
                 link=get_setting("quotex_ref_link",os.getenv("QUOTEX_REF_LINK","").strip())
@@ -10278,23 +10355,33 @@ def __clean_handle_state_v3(message):
         if action=="referral_warn_id":
             warn_user(int(text),"Admin referral review warning",uid); clear_state(uid); return bot.send_message(message.chat.id,"⚠️ Warning added.",reply_markup=admin_keyboard())
         if action=="vip_add_id":
-            target=int(st.get("target_id") or text); 
+            if not st.get("target_id"):
+                try:
+                    target=_resolve_user_ref(text)
+                except ValueError as exc:
+                    return bot.send_message(message.chat.id,f"❌ {escape(str(exc))}\nআবার দিন বা 🔙 Back চাপুন.",reply_markup=back_keyboard())
+                st["target_id"]=target; _state_set(uid,st)
+                return bot.send_message(message.chat.id,f"⭐ User: <code>{target}</code>\n\nDuration বেছে নিন:",reply_markup=make_keyboard([["7 Days","15 Days","30 Days"],["60 Days","90 Days","♾️ Unlimited"],["🔙 Back","🏠 Main Menu"]]))
+            target=int(st["target_id"])
             if text in ("7 Days","15 Days","30 Days","60 Days","90 Days","♾️ Unlimited"):
                 days={"7 Days":7,"15 Days":15,"30 Days":30,"60 Days":60,"90 Days":90,"♾️ Unlimited":0}[text]
                 with DB_LOCK:
                     conn=db(); u=conn.execute("SELECT vip_until FROM users WHERE user_id=?",(target,)).fetchone()
-                    old=u["vip_until"] if u else None
+                    if not u:
+                        conn.close(); clear_state(uid)
+                        return bot.send_message(message.chat.id,"❌ এই user bot-এ register করা নেই (আগে /start দিতে হবে).",reply_markup=admin_vip_kb())
+                    old=u["vip_until"]
                     new=None if days==0 else (now_bd()+timedelta(days=days)).isoformat()
                     conn.execute("UPDATE users SET status='VIP',vip_until=?,vip_started_at=?,vip_reminder_7d_sent=0,vip_reminder_3d_sent=0 WHERE user_id=?",(new,utc_iso(now_utc()),target))
                     conn.execute("INSERT INTO vip_history(user_id,action,days,old_until,new_until,admin_id,created_at) VALUES(?,?,?,?,?,?,?)",(target,"GRANT",days,old,new,uid,utc_iso(now_utc()))); conn.commit(); conn.close()
                 _qualify_referral_after_vip(target,uid); admin_audit(uid,"VIP_GRANT",target,text); clear_state(uid)
-                label="Unlimited" if days==0 else f"{days} days"; exp="Unlimited" if not new else datetime.fromisoformat(new).astimezone(BD_TZ).strftime("%d %b %Y %I:%M %p")
-                try: bot.send_message(target,f"⭐ <b>VIP হয়েছেন!</b>\n📅 Duration: <b>{label}</b>\n⏰ Expires: <b>{exp}</b>",reply_markup=main_keyboard(target))
+                label="Unlimited" if days==0 else f"{days} days"; exp="Unlimited" if not new else _fmt_dt(new)
+                try: bot.send_message(target,f"⭐ <b>VIP হয়েছেন!</b>\n📅 Duration: <b>{label}</b>\n⏰ Expires: <b>{exp}</b>",reply_markup=main_keyboard(target))
                 except Exception: pass
-                release_referral_bonuses(); return bot.send_message(message.chat.id,"✅ VIP updated.",reply_markup=admin_keyboard())
+                release_referral_bonuses(); return bot.send_message(message.chat.id,"✅ VIP updated.",reply_markup=admin_vip_kb())
             raise ValueError("VIP duration button ব্যবহার করুন.")
         if action=="vip_remove_id":
-            target=int(text)
+            target=_resolve_user_ref(text)
             with DB_LOCK:
                 conn=db(); conn.execute("UPDATE users SET status='FREE',vip_until=NULL WHERE user_id=?",(target,)); conn.execute("INSERT INTO vip_history(user_id,action,admin_id,created_at) VALUES(?,?,?,?)",(target,"REMOVE",uid,utc_iso(now_utc()))); conn.commit(); conn.close()
             admin_audit(uid,"VIP_REMOVE",target); clear_state(uid); return bot.send_message(message.chat.id,"❌ VIP removed.",reply_markup=admin_keyboard())
@@ -10532,7 +10619,8 @@ def patched_deliver_signal_final(user_id, signal_id, source="manual"):
         if u and int(u["mm_enabled"] or 0) and not int(u["mm_stop"] or 0):
             mode=u["mm_current_mode"] or "BASE"; amount=int(u["mm_m1_cents"] or 0) if mode=="M1" else int(u["mm_base_cents"] or 100); profit=int(round(amount*float(u["mm_payout_percent"] or 85)/100))
             text += f"\n\n💰 <b>Money Management</b>\n💵 Trade: <b>{money(amount)}</b>\n📈 WIN হলে: <b>+{money(profit)}</b>\n📉 LOSS হলে M1: <b>{money(u['mm_m1_cents'])}</b>"
-        bot.send_message(user_id,text,reply_markup=result_buttons(signal_id,user_id))
+        kb=result_buttons(signal_id,user_id)
+        bot.send_message(user_id,text,reply_markup=kb if kb else None)
         return True,"sent"
     except Exception:
         logger.exception("Final signal delivery failed")
@@ -10586,6 +10674,406 @@ def __clean_main_v2():
 
 
 
+
+# ============================================================
+# RULE-BASED CANDLE ANALYSIS (no Gemini) + ADMIN RULES PANEL
+# ============================================================
+ANALYSIS_RULE_TYPES = ["TREND", "PATTERN", "SUPPORT", "MOMENTUM", "CANDLE_COUNT"]
+
+
+def _analysis_rules_migration():
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS analysis_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, rule_name TEXT NOT NULL, rule_type TEXT NOT NULL,
+                rule_value TEXT NOT NULL, direction TEXT NOT NULL, weight INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
+            if conn.execute("SELECT COUNT(*) FROM analysis_rules").fetchone()[0] == 0:
+                defaults = [
+                    ("Uptrend Detect", "TREND", "UPTREND", "UP", 3), ("Downtrend Detect", "TREND", "DOWNTREND", "DOWN", 3),
+                    ("Strong Bull Momentum", "MOMENTUM", "STRONG_BULL", "UP", 2), ("Strong Bear Momentum", "MOMENTUM", "STRONG_BEAR", "DOWN", 2),
+                    ("Bullish Engulfing", "PATTERN", "BULLISH_ENGULFING", "UP", 2), ("Bearish Engulfing", "PATTERN", "BEARISH_ENGULFING", "DOWN", 2),
+                    ("Hammer Pattern", "PATTERN", "HAMMER", "UP", 2), ("Shooting Star", "PATTERN", "SHOOTING_STAR", "DOWN", 2),
+                    ("Support Bounce", "SUPPORT", "SUPPORT_BOUNCE", "UP", 2), ("Resistance Reject", "SUPPORT", "RESISTANCE_REJECT", "DOWN", 2),
+                    ("Minimum 20 Candles", "CANDLE_COUNT", "20", "WAIT", 1)]
+                for name, rt, rv, d, w in defaults:
+                    conn.execute("INSERT INTO analysis_rules(rule_name,rule_type,rule_value,direction,weight,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
+                                 (name, rt, rv, d, w, utc_iso(now_utc())))
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_rules_type ON analysis_rules(rule_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_rules_enabled ON analysis_rules(enabled)")
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('analysis_confidence_min','70')")
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('candle_analysis_enabled','ON')")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def candle_ai_enabled():
+    return get_setting("candle_analysis_enabled", "ON") == "ON"
+
+
+def analyze_candle_screenshot(images, user_id=None):
+    """Colour-ratio analysis of chart screenshots (bytes or list of bytes) + admin rules.
+    HONEST LIMITS: it measures green vs red pixels in the chart area only. It cannot
+    recognise real candle patterns, support or resistance, so only TREND and MOMENTUM
+    features are produced."""
+    try:
+        from PIL import Image
+        import io
+        if isinstance(images, (bytes, bytearray)):
+            images = [bytes(images)]
+        green = red = 0
+        for raw in images:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            w, h = img.size
+            if w < 200 or h < 200:
+                return {"status": "INVALID", "message": "Screenshot too small."}
+            # chart area only: skip top bar and the bottom UP/DOWN buttons
+            x0, x1, y0, y1 = int(w * 0.02), int(w * 0.88), int(h * 0.12), int(h * 0.70)
+            px = img.load()
+            for y in range(y0, y1, 3):
+                for x in range(x0, x1, 3):
+                    r, g, b = px[x, y]
+                    if r < 30 and g < 30 and b < 30:
+                        continue
+                    if g > r + 40 and g > b + 20:
+                        green += 1
+                    elif r > g + 40 and r > b + 20:
+                        red += 1
+        total = green + red
+        if total < 50:
+            return {"status": "INVALID", "message": "Candle পাওয়া যায়নি. Clear chart screenshot দিন."}
+        gr = green / total
+        feats = []
+        if gr >= 0.58:
+            feats += [("TREND", "UPTREND"), ("MOMENTUM", "STRONG_BULL")]
+        elif gr >= 0.52:
+            feats.append(("TREND", "UPTREND"))
+        elif gr <= 0.42:
+            feats += [("TREND", "DOWNTREND"), ("MOMENTUM", "STRONG_BEAR")]
+        elif gr <= 0.48:
+            feats.append(("TREND", "DOWNTREND"))
+        else:
+            feats.append(("TREND", "SIDEWAYS"))
+        with DB_LOCK:
+            conn = db()
+            try:
+                rules = conn.execute("SELECT * FROM analysis_rules WHERE enabled=1").fetchall()
+            finally:
+                conn.close()
+        up = down = 0
+        matched = []
+        for rule in rules:
+            for ft, fv in feats:
+                if ft == rule["rule_type"] and fv == rule["rule_value"]:
+                    if rule["direction"] == "UP":
+                        up += rule["weight"]
+                    elif rule["direction"] == "DOWN":
+                        down += rule["weight"]
+                    matched.append(f"{rule['rule_name']} (W:{rule['weight']})")
+                    break
+        if up + down == 0:
+            return {"status": "WAIT", "message": "কোনো analysis rule match হয়নি."}
+        if up == down:
+            return {"status": "WAIT", "message": "Conflicting signals."}
+        direction = "UP" if up > down else "DOWN"
+        score = int(max(up, down) / (up + down) * 100)
+        try:
+            min_conf = int(get_setting("analysis_confidence_min", "70"))
+        except Exception:
+            min_conf = 70
+        if score < min_conf:
+            return {"status": "WAIT", "message": f"Rule score কম: {score}% (min {min_conf}%)"}
+        return {"status": "SIGNAL", "direction": direction, "confidence": score, "matched_rules": matched,
+                "green_ratio": round(gr * 100, 1), "total_candles": total}
+    except ImportError:
+        return {"status": "ERROR", "message": "PIL (Pillow) installed নেই. requirements.txt-এ Pillow যোগ করুন."}
+    except Exception as exc:
+        logger.exception("Analysis failed")
+        return {"status": "ERROR", "message": str(exc)[:200]}
+
+
+def start_candle_analysis(message):
+    uid = message.from_user.id
+    if not candle_ai_enabled() and not is_master(uid):
+        return bot.send_message(message.chat.id, "🤖 <b>Candle Analysis বর্তমানে OFF.</b>", reply_markup=main_keyboard(uid))
+    limit = candle_ai_max_images()
+    STATES[uid] = {"action": "candle_upload", "images": [], "previous_menu": NAV_MENU.get(uid, "signals")}
+    bot.send_message(message.chat.id,
+        f"📸 <b>Candle Analysis</b>\n\nসর্বোচ্চ <b>{limit}টি</b> chart screenshot upload করুন, তারপর <b>🔍 Analyze Candles</b> চাপুন.\n\n"
+        "⚠️ এটি শুধু chart-এর green/red রঙের অনুপাত দেখে. Real pattern/support বোঝে না; guarantee নয়.",
+        reply_markup=make_keyboard([["🔍 Analyze Candles", "🗑️ Clear Candles"], ["🔙 Back", "🏠 Main Menu"]]))
+
+
+def _record_analysis_signal(uid, direction, score):
+    """Unique inactive signal row so WIN/LOSS buttons work for every analysis."""
+    now = now_bd()
+    with DB_LOCK:
+        conn = db()
+        try:
+            cur = conn.execute(
+                "INSERT INTO signals(signal_date,signal_time,signal_at_utc,pair,direction,confidence,audience,active,auto_sent,created_at) VALUES(?,?,?,?,?,?,?,0,1,?)",
+                (now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S.%f"), utc_iso(now_utc()), f"ANALYSIS-{uid}-{int(time.time()*1000)}-{os.urandom(2).hex()}", direction, f"{score}%", "ANALYSIS", utc_iso(now_utc())))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def _analysis_engine():
+    eng = str(get_setting("analysis_engine", "") or "").upper()
+    if eng in ("GEMINI", "RULES"):
+        return eng
+    return "GEMINI" if os.getenv("GEMINI_API_KEY", "").strip() else "RULES"
+
+
+def _new_analyze_candle_state(message):
+    uid = message.from_user.id
+    st = STATES.get(uid)
+    if not st or st.get("action") != "candle_upload":
+        return False
+    text = (message.text or "").strip()
+    if text == "🔍 Analyze Candles" and _analysis_engine() == "GEMINI":
+        return __clean_analyze_candle_state_v2(message)
+    kb = make_keyboard([["🔍 Analyze Candles", "🗑️ Clear Candles"], ["🔙 Back", "🏠 Main Menu"]])
+    if text == "🗑️ Clear Candles":
+        st["images"] = []
+        _state_set(uid, st)
+        bot.send_message(message.chat.id, "🗑️ Screenshots cleared.", reply_markup=kb)
+        return True
+    if text != "🔍 Analyze Candles":
+        return False
+    file_ids = list(st.get("images") or [])
+    if not file_ids:
+        bot.send_message(message.chat.id, "📸 আগে screenshot upload করুন.", reply_markup=kb)
+        return True
+    reset_user_daily_state(uid)
+    u = get_user(uid)
+    vip = vip_is_active(u)
+    try:
+        limit = int(u["ai_limit_vip"] if vip else u["ai_limit_nonvip"])
+    except Exception:
+        limit = 50 if vip else 3
+    if int(u["ai_usage_count"] or 0) >= limit and not is_master(uid):
+        clear_state(uid)
+        bot.send_message(message.chat.id, "⛔ আজকের Analysis limit শেষ.", reply_markup=main_keyboard(uid))
+        return True
+    bot.send_message(message.chat.id, "🔎 Screenshot analyze করছি…")
+    try:
+        raws = [bot.download_file(bot.get_file(fid).file_path) for fid in file_ids]
+        result = analyze_candle_screenshot(raws, uid)
+        with DB_LOCK:
+            conn = db()
+            try:
+                conn.execute("UPDATE users SET ai_usage_count=ai_usage_count+1,ai_usage_date=? WHERE user_id=?", (_daily_reset_key(), uid))
+                conn.execute("INSERT INTO ai_usage_log(user_id,image_count,status,result_summary,created_at) VALUES(?,?,?,?,?)",
+                             (uid, len(file_ids), result["status"], str(result)[:500], utc_iso(now_utc())))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        logger.exception("Analysis error")
+        clear_state(uid)
+        bot.send_message(message.chat.id, "❌ Analysis failed. আবার চেষ্টা করুন.", reply_markup=main_keyboard(uid))
+        return True
+    clear_state(uid)
+    if result["status"] != "SIGNAL":
+        bot.send_message(message.chat.id, f"⏸️ <b>{'WAIT' if result['status'] in ('WAIT','INVALID') else 'ERROR'}</b>\n\n{escape(result.get('message', 'No signal'))}", reply_markup=main_keyboard(uid))
+        return True
+    d = result["direction"]
+    icon = "🟢" if d == "UP" else "🔴"
+    matched = "\n".join(f"✅ {escape(r)}" for r in result["matched_rules"])
+    reset_user_daily_state(uid)
+    u = get_user(uid)
+    mm = ""
+    if u and int(u["mm_enabled"] or 0) and not int(u["mm_stop"] or 0):
+        mode = u["mm_current_mode"] or "BASE"
+        amt = int(u["mm_m1_cents"] or 0) if mode == "M1" else int(u["mm_base_cents"] or 100)
+        profit = int(round(amt * float(u["mm_payout_percent"] or 85) / 100))
+        mm = (f"\n\n━━━━━━━━━━━━━━━━━━\n💰 <b>Money Management</b>\n📊 Mode: <b>{mode}</b>\n💵 Trade: <b>{money(amt)}</b>\n"
+              f"📈 WIN হলে: <b>+{money(profit)}</b>\n📉 LOSS হলে M1: <b>{money(u['mm_m1_cents'])}</b>\n━━━━━━━━━━━━━━━━━━")
+    text = ("━━━━━━━━━━━━━━━━━━\n🤖 <b>CANDLE ANALYSIS</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 Green Ratio: <b>{result['green_ratio']}%</b>\n🕯️ Sampled Candle Pixels: <b>{result['total_candles']}</b>\n\n"
+            f"📋 <b>Matched Rules:</b>\n{matched}\n\n🎯 SIGNAL: {icon} <b>{d}</b>\n"
+            f"📊 Rule Score: <b>{result['confidence']}%</b> <i>(rule-weight অনুপাত; win probability নয়)</i>\n"
+            f"⏰ Next Candle: <b>1 min</b>{mm}\n\n⚠️ Colour-ratio analysis — guarantee নয়.\n━━━━━━━━━━━━━━━━━━")
+    sid = _record_analysis_signal(uid, d, result["confidence"])
+    kb2 = result_buttons(sid, uid)
+    bot.send_message(message.chat.id, text, reply_markup=kb2 if kb2 else main_keyboard(uid))
+    return True
+
+
+def admin_analysis_kb():
+    return make_keyboard([["➕ Add Analysis Rule", "📋 Analysis Rule List"], ["🗑️ Remove Analysis Rule", "🔘 Rule ON/OFF"],
+                          ["📊 Analysis Stats", "🎯 Set Confidence Min"], ["🤖 Analysis ON/OFF", "🔀 Analysis Engine"], _BB])
+
+
+def _rule_guard(message):
+    if not can(message.from_user.id, "signals"):
+        bot.send_message(message.chat.id, "⛔ Access denied.", reply_markup=admin_analysis_kb())
+        return False
+    return True
+
+
+def admin_analysis_menu(message):
+    if not _rule_guard(message):
+        return
+    with DB_LOCK:
+        conn = db()
+        try:
+            q = lambda sql: conn.execute(sql).fetchone()[0]
+            total, active = q("SELECT COUNT(*) FROM analysis_rules"), q("SELECT COUNT(*) FROM analysis_rules WHERE enabled=1")
+            ups, downs = q("SELECT COUNT(*) FROM analysis_rules WHERE direction='UP' AND enabled=1"), q("SELECT COUNT(*) FROM analysis_rules WHERE direction='DOWN' AND enabled=1")
+        finally:
+            conn.close()
+    NAV_MENU[message.from_user.id] = "admin_analysis"
+    bot.send_message(message.chat.id,
+        f"━━━━━━━━━━━━━━━━━━\n🧠 <b>ANALYSIS RULES PANEL</b>\n━━━━━━━━━━━━━━━━━━\n\n📋 Total Rules: <b>{total}</b>\n✅ Active: <b>{active}</b>\n"
+        f"🟢 UP Rules: <b>{ups}</b>\n🔴 DOWN Rules: <b>{downs}</b>\n🎯 Min Score: <b>{get_setting('analysis_confidence_min','70')}%</b>\n"
+        f"🤖 Analysis: <b>{get_setting('candle_analysis_enabled','ON')}</b>\n🔀 Engine: <b>{_analysis_engine()}</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "ℹ️ বর্তমানে শুধু TREND ও MOMENTUM rule match করে (colour-ratio ভিত্তিক).", reply_markup=admin_analysis_kb())
+
+
+def admin_add_analysis_rule(message):
+    if _rule_guard(message):
+        set_user_state(message.from_user.id, "add_rule_name", "admin_analysis")
+        bot.send_message(message.chat.id, "📝 Rule Name পাঠান:\nExample: <code>Uptrend Detect</code>", reply_markup=back_keyboard())
+
+
+def admin_list_analysis_rules(message):
+    if not _rule_guard(message):
+        return
+    rules = _q("SELECT * FROM analysis_rules ORDER BY id")
+    if not rules:
+        return bot.send_message(message.chat.id, "📭 কোনো rule নেই.", reply_markup=admin_analysis_kb())
+    lines = ["📋 <b>ANALYSIS RULES</b>\n"]
+    for r in rules:
+        icon = "🟢" if r["direction"] == "UP" else "🔴" if r["direction"] == "DOWN" else "⏸️"
+        lines.append(f"#{r['id']} {escape(r['rule_name'])} | {r['rule_type']}:{escape(r['rule_value'])} | {icon}{r['direction']} W:{r['weight']} {'✅' if r['enabled'] else '⛔'}")
+    bot.send_message(message.chat.id, "\n".join(lines) + f"\n\n📊 Total: {len(rules)}", reply_markup=admin_analysis_kb())
+
+
+def admin_remove_analysis_rule(message):
+    if _rule_guard(message):
+        set_user_state(message.from_user.id, "remove_rule_id", "admin_analysis")
+        bot.send_message(message.chat.id, "🗑️ যে Rule ID delete করবেন পাঠান:", reply_markup=back_keyboard())
+
+
+def admin_toggle_analysis_rule(message):
+    if _rule_guard(message):
+        set_user_state(message.from_user.id, "toggle_rule_id", "admin_analysis")
+        bot.send_message(message.chat.id, "🔘 যে Rule ID ON/OFF করবেন পাঠান:", reply_markup=back_keyboard())
+
+
+def admin_analysis_stats(message):
+    if not _rule_guard(message):
+        return
+    c = lambda w="": _count("SELECT COUNT(*) FROM ai_usage_log" + w)
+    bot.send_message(message.chat.id,
+        f"━━━━━━━━━━━━━━━━━━\n📊 <b>ANALYSIS STATS</b>\n━━━━━━━━━━━━━━━━━━\n\n📊 Total: <b>{c()}</b>\n🎯 Signals: <b>{c(' WHERE status=\'SIGNAL\'')}</b>\n"
+        f"⏸️ WAIT: <b>{c(' WHERE status=\'WAIT\'')}</b>\n❌ Invalid: <b>{c(' WHERE status=\'INVALID\'')}</b>\n📅 Today: <b>{c(' WHERE date(created_at)=date(\'now\')')}</b>\n━━━━━━━━━━━━━━━━━━",
+        reply_markup=admin_analysis_kb())
+
+
+def admin_set_analysis_confidence(message):
+    if _rule_guard(message):
+        set_user_state(message.from_user.id, "set_analysis_conf", "admin_analysis")
+        bot.send_message(message.chat.id, f"🎯 Minimum Score দিন (50-99). Current: {get_setting('analysis_confidence_min','70')}%", reply_markup=back_keyboard())
+
+
+def admin_toggle_analysis_enabled(message):
+    if not _rule_guard(message):
+        return
+    new = "OFF" if get_setting("candle_analysis_enabled", "ON") == "ON" else "ON"
+    set_setting("candle_analysis_enabled", new)
+    bot.send_message(message.chat.id, f"🤖 Analysis: <b>{new}</b>", reply_markup=admin_analysis_kb())
+
+
+def admin_toggle_analysis_engine(message):
+    if not _rule_guard(message):
+        return
+    new = "RULES" if _analysis_engine() == "GEMINI" else "GEMINI"
+    set_setting("analysis_engine", new)
+    note = "" if new == "RULES" or os.getenv("GEMINI_API_KEY", "").strip() else "\n⚠️ GEMINI_API_KEY সেট করা নেই."
+    bot.send_message(message.chat.id, f"🔀 Engine: <b>{new}</b>{note}", reply_markup=admin_analysis_kb())
+
+
+ANALYSIS_ADMIN_BUTTONS = {
+    "🔀 Analysis Engine": admin_toggle_analysis_engine,
+    "🧠 Analysis Rules": admin_analysis_menu, "➕ Add Analysis Rule": admin_add_analysis_rule,
+    "📋 Analysis Rule List": admin_list_analysis_rules, "🗑️ Remove Analysis Rule": admin_remove_analysis_rule,
+    "🔘 Rule ON/OFF": admin_toggle_analysis_rule, "📊 Analysis Stats": admin_analysis_stats,
+    "🎯 Set Confidence Min": admin_set_analysis_confidence, "🤖 Analysis ON/OFF": admin_toggle_analysis_enabled,
+}
+
+
+def _analysis_rules_state(message, st):
+    """Returns True if handled, None if the action is not ours."""
+    uid = message.from_user.id
+    action = st.get("action")
+    text = (message.text or "").strip()
+    if action not in ("add_rule_name", "add_rule_type", "add_rule_value", "add_rule_direction", "add_rule_weight",
+                      "remove_rule_id", "toggle_rule_id", "set_analysis_conf"):
+        return None
+    try:
+        if action == "add_rule_name":
+            if not text or len(text) > 60: raise ValueError("Rule name ১-৬০ অক্ষরের হতে হবে.")
+            st.update(rule_name=text, action="add_rule_type"); _state_set(uid, st)
+            bot.send_message(message.chat.id, "📊 Rule Type বেছে নিন:", reply_markup=make_keyboard([["TREND", "PATTERN"], ["SUPPORT", "MOMENTUM"], ["CANDLE_COUNT"], _BB]))
+        elif action == "add_rule_type":
+            if text not in ANALYSIS_RULE_TYPES: raise ValueError("Valid type: " + ", ".join(ANALYSIS_RULE_TYPES))
+            st.update(rule_type=text, action="add_rule_value"); _state_set(uid, st)
+            bot.send_message(message.chat.id, "📝 Rule Value পাঠান:\nExample: UPTREND, DOWNTREND, STRONG_BULL", reply_markup=back_keyboard())
+        elif action == "add_rule_value":
+            if not text or len(text) > 40: raise ValueError("Value ঠিকভাবে দিন.")
+            st.update(rule_value=text.upper().strip(), action="add_rule_direction"); _state_set(uid, st)
+            bot.send_message(message.chat.id, "🎯 Direction বেছে নিন:", reply_markup=make_keyboard([["🟢 UP", "🔴 DOWN"], ["⏸️ WAIT"], _BB]))
+        elif action == "add_rule_direction":
+            dm = {"🟢 UP": "UP", "🔴 DOWN": "DOWN", "⏸️ WAIT": "WAIT"}
+            if text not in dm: raise ValueError("Direction button ব্যবহার করুন.")
+            st.update(direction=dm[text], action="add_rule_weight"); _state_set(uid, st)
+            bot.send_message(message.chat.id, "⚖️ Weight (1-10) পাঠান:", reply_markup=back_keyboard())
+        elif action == "add_rule_weight":
+            w = int(text)
+            if not 1 <= w <= 10: raise ValueError("Weight 1-10 এর মধ্যে হতে হবে.")
+            with DB_LOCK:
+                conn = db()
+                try:
+                    conn.execute("INSERT INTO analysis_rules(rule_name,rule_type,rule_value,direction,weight,enabled,created_at) VALUES(?,?,?,?,?,1,?)",
+                                 (st["rule_name"], st["rule_type"], st["rule_value"], st["direction"], w, utc_iso(now_utc())))
+                    conn.commit()
+                finally:
+                    conn.close()
+            clear_state(uid)
+            bot.send_message(message.chat.id, f"✅ Rule added!\n\n📝 {escape(st['rule_name'])}\n📊 {st['rule_type']}: {escape(st['rule_value'])}\n🎯 {st['direction']} (W:{w})", reply_markup=admin_analysis_kb())
+        elif action in ("remove_rule_id", "toggle_rule_id"):
+            rid = int(text)
+            with DB_LOCK:
+                conn = db()
+                try:
+                    r = conn.execute("SELECT enabled FROM analysis_rules WHERE id=?", (rid,)).fetchone()
+                    if not r: raise ValueError("Rule পাওয়া যায়নি.")
+                    if action == "remove_rule_id":
+                        conn.execute("DELETE FROM analysis_rules WHERE id=?", (rid,)); msg = f"🗑️ Rule #{rid} deleted."
+                    else:
+                        ns = 0 if r["enabled"] else 1
+                        conn.execute("UPDATE analysis_rules SET enabled=? WHERE id=?", (ns, rid)); msg = f"🔘 Rule #{rid} → {'✅ Enabled' if ns else '⛔ Disabled'}"
+                    conn.commit()
+                finally:
+                    conn.close()
+            clear_state(uid)
+            bot.send_message(message.chat.id, msg, reply_markup=admin_analysis_kb())
+        elif action == "set_analysis_conf":
+            n = int(text)
+            if not 50 <= n <= 99: raise ValueError("50-99 এর মধ্যে হতে হবে.")
+            set_setting("analysis_confidence_min", str(n)); clear_state(uid)
+            bot.send_message(message.chat.id, f"🎯 Min Score: {n}%", reply_markup=admin_analysis_kb())
+    except ValueError as exc:
+        bot.send_message(message.chat.id, "❌ " + escape(str(exc)) + "\nআবার চেষ্টা করুন বা 🔙 Back চাপুন.")
+    return True
+
+
 # ============================================================
 # FINAL RUNTIME BINDINGS
 # ============================================================
@@ -10604,16 +11092,25 @@ vote_menu = __clean_vote_menu_v2
 safe_startup_migration = __clean_safe_startup_migration_v2
 
 _orig_safe_startup = safe_startup_migration
-def safe_startup_migration():
+def _safe_startup_with_extras():
     ok = _orig_safe_startup()
     try:
         _wd_column_migration()
     except Exception:
         logger.exception("Withdrawal serial migration failed")
         ok = False
+    try:
+        _analysis_rules_migration()
+    except Exception:
+        logger.exception("Analysis rules migration failed")
+        ok = False
     return ok
 
+safe_startup_migration = _safe_startup_with_extras
 handle_state = handle_state          # single public state dispatcher (explicit)
+handle_candle_photo = __clean_handle_candle_photo_v2
+analyze_candle_state = _new_analyze_candle_state
+
 handle_admin_button = __clean_handle_admin_button_v3
 admin_text_editor = __clean_admin_text_editor_v2
 admin_subadmins = __clean_admin_subadmins_v2
