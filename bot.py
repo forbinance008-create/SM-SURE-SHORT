@@ -12,6 +12,14 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from html import escape
+import io
+
+try:
+    from PIL import Image
+    import numpy as np
+except ImportError:  # keep the bot alive; Screenshot Signal reports the problem
+    Image = None
+    np = None
 
 import telebot
 from telebot import types
@@ -462,6 +470,8 @@ def now_utc():
 
 
 def utc_iso(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC).isoformat()
 
 
@@ -834,6 +844,10 @@ def admin_keyboard():
         [
             "🛡️ Sub-admins",
             "🎯 Notify Targets"
+        ],
+
+        [
+            "📸 Screenshot Signal"
         ],
 
         [
@@ -6837,7 +6851,7 @@ def admin_content_kb():
 def admin_home_kb():
     return make_keyboard([
         ["📊 Signals", "👥 Users"], ["⭐ VIP", "💰 Money"], ["🎁 Referral", "⚙️ Settings"],
-        ["📈 Analytics", "📝 Content"], ["🧠 Analysis Rules"], _BB])
+        ["📈 Analytics", "📝 Content"], ["🧠 Analysis Rules", "📸 Screenshot Signal"], _BB])
 
 
 def admin_search_kb():
@@ -7350,6 +7364,11 @@ def _nav_match(message):
         return t in _NAV_ALL or t.startswith("⭐ VIP") or t.startswith("⭐ JOIN VIP")
     except Exception:
         return False
+
+
+@bot.message_handler(func=lambda m: ss_text_match(m), content_types=["text"])
+def ss_admin_text_handler(message):
+    ss_admin_text(message)
 
 
 @bot.message_handler(func=_nav_match, content_types=["text"])
@@ -9754,12 +9773,19 @@ def reset_user_daily_state(user_id):
 
 
 def vip_is_active(user):
-    if not user: return False
-    if user["status"] != "VIP": return False
-    until=user["vip_until"]
-    if not until: return True
-    try: return datetime.fromisoformat(until).astimezone(BD_TZ) > now_bd()
-    except Exception: return False
+    if not user:
+        return False
+    if user["status"] != "VIP":
+        return False
+    if not user["vip_until"]:
+        return True
+    try:
+        until = datetime.fromisoformat(user["vip_until"])
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=BD_TZ)
+        return until > now_bd()
+    except Exception:
+        return False
 
 
 def vip_expiry_loop():
@@ -11118,6 +11144,887 @@ admin_notify_targets = __clean_admin_notify_targets_v2
 format_signal = patched_format_signal_final
 deliver_signal = patched_deliver_signal_final
 main = __clean_main_v2
+
+# ============================================================
+# SCREENSHOT SIGNAL (pixel-based, no AI) — PIL + numpy only
+# ============================================================
+SS_MENU_KEY = "admin_screenshot"
+
+
+def _ss_is_admin(uid):
+    try:
+        return bool(is_master(uid) or get_permissions(uid))
+    except Exception:
+        return False
+
+
+def _ss_migration():
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS signal_user_results (
+                signal_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (signal_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS screenshot_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uploader_id INTEGER NOT NULL,
+                uploader_type TEXT NOT NULL,
+                photo_file_id TEXT,
+                pair TEXT,
+                trend TEXT,
+                next1_direction TEXT,
+                next1_confidence INTEGER,
+                next2_direction TEXT,
+                next2_confidence INTEGER,
+                patterns_json TEXT,
+                candles_count INTEGER,
+                broadcast INTEGER DEFAULT 0,
+                broadcast_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_screenshot_quota (
+                user_id INTEGER PRIMARY KEY,
+                used_today INTEGER DEFAULT 0,
+                last_reset TEXT
+            );
+            CREATE TABLE IF NOT EXISTS screenshot_signal_deliveries (
+                signal_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                delivered_at TEXT NOT NULL,
+                PRIMARY KEY (signal_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS screenshot_signal_results (
+                signal_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (signal_id, user_id)
+            );
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+    defaults = {
+        "screenshot_mode": "OFF",
+        "screenshot_user_limit": "3",
+        "screenshot_admin_auto_send": "ON",
+        "screenshot_user_auto_send": "ON",
+        "screenshot_min_confidence": "70",
+    }
+    for key, value in defaults.items():
+        try:
+            if get_setting(key, "") == "":
+                set_setting(key, value)
+        except Exception:
+            logger.exception("Could not initialize setting %s", key)
+
+
+_ss_prev_safe_startup = safe_startup_migration
+
+
+def _ss_safe_startup():
+    ok = _ss_prev_safe_startup()
+    try:
+        _ss_migration()
+    except Exception:
+        logger.exception("Screenshot signal migration failed")
+        ok = False
+    return ok
+
+
+safe_startup_migration = _ss_safe_startup
+
+
+# ---------------- candle detection ----------------
+
+class CandleDetector:
+    def __init__(self, image_bytes):
+        if Image is None or np is None:
+            raise RuntimeError("Pillow/numpy installed নেই (pip install pillow numpy)")
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        if img.width > 2000 or img.height > 2000:
+            ratio = min(2000 / img.width, 2000 / img.height)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+        self.pixels = np.array(img)
+        self.height, self.width, _ = self.pixels.shape
+
+    def detect_candles(self, max_candles=30):
+        chart_top = int(self.height * 0.12)
+        chart_bottom = int(self.height * 0.82)
+        chart_left = int(self.width * 0.02)
+        chart_right = int(self.width * 0.92)
+
+        # Vectorised version of the per-pixel rules (int16 avoids uint8 overflow).
+        sub = self.pixels[chart_top:chart_bottom:2, chart_left:chart_right:2].astype(np.int16)
+        if sub.size == 0:
+            return []
+        r, g, b = sub[..., 0], sub[..., 1], sub[..., 2]
+        gray = (np.abs(r - g) < 15) & (np.abs(g - b) < 15)
+        white = (r > 200) & (g > 200) & (b > 200)
+        green = (~gray) & (g > 100) & (g > r + 25) & (g > b + 10) & (~white)
+        white2 = (r > 240) & (g > 240) & (b > 240)
+        red = (~gray) & (~green) & (r > 120) & (r > g + 40) & (r > b + 40) & (~white2)
+
+        col_data = []
+        for ci in range(sub.shape[1]):
+            x = chart_left + ci * 2
+            g_idx = np.nonzero(green[:, ci])[0]
+            r_idx = np.nonzero(red[:, ci])[0]
+            if len(g_idx) >= 3 or len(r_idx) >= 3:
+                if len(g_idx) >= len(r_idx):
+                    col_data.append({"x": x, "color": "GREEN", "rows": (chart_top + g_idx * 2).tolist()})
+                else:
+                    col_data.append({"x": x, "color": "RED", "rows": (chart_top + r_idx * 2).tolist()})
+
+        if not col_data:
+            return []
+
+        groups, current = [], [col_data[0]]
+        for item in col_data[1:]:
+            if item["x"] - current[-1]["x"] <= 4:
+                current.append(item)
+            else:
+                groups.append(current)
+                current = [item]
+        groups.append(current)
+        groups = [grp for grp in groups if len(grp) >= 2]
+
+        candles = []
+        for group in groups:
+            xs = [it["x"] for it in group]
+            rows_all = []
+            for it in group:
+                rows_all.extend(it["rows"])
+            if not rows_all:
+                continue
+            colors = [it["color"] for it in group]
+            color = max(set(colors), key=colors.count)
+            rows_sorted = sorted(rows_all)
+            n = len(rows_sorted)
+            p5 = rows_sorted[max(0, int(n * 0.05))]
+            p95 = rows_sorted[min(n - 1, int(n * 0.95))]
+            body_top, body_bottom = p5, p95
+            wick_top, wick_bottom = rows_sorted[0], rows_sorted[-1]
+            body_height = body_bottom - body_top
+            total_height = wick_bottom - wick_top
+            if total_height < 4:
+                continue
+            candles.append({
+                "x": int(np.mean(xs)), "color": color,
+                "body_top": body_top, "body_bottom": body_bottom,
+                "wick_top": wick_top, "wick_bottom": wick_bottom,
+                "body_height": body_height, "total_height": total_height,
+                "upper_wick": body_top - wick_top, "lower_wick": wick_bottom - body_bottom,
+                "width": max(xs) - min(xs) + 1,
+            })
+
+        candles.sort(key=lambda c: c["x"], reverse=True)
+        filtered = []
+        for c in candles:
+            if not filtered or abs(c["x"] - filtered[-1]["x"]) > 5:
+                filtered.append(c)
+        return filtered[:max_candles]
+
+    def extract_pattern(self):
+        candles = self.detect_candles()
+        if len(candles) < 5:
+            return None
+        candles = list(reversed(candles))
+        return {
+            "total": len(candles),
+            "green_count": sum(1 for c in candles if c["color"] == "GREEN"),
+            "red_count": sum(1 for c in candles if c["color"] == "RED"),
+            "sequence": [c["color"] for c in candles],
+            "sizes": [c["body_height"] for c in candles],
+            "candles": candles,
+        }
+
+
+# ---------------- pattern analyzer (20 hardcoded rules) ----------------
+
+class PatternAnalyzer:
+    def __init__(self, pattern):
+        self.seq = pattern["sequence"]
+        self.sizes = pattern["sizes"]
+        self.candles = pattern["candles"]
+        self.n = len(self.seq)
+        self.score_up = 0
+        self.score_down = 0
+        self.reasons = []
+
+    def _last(self, i=1):
+        return self.candles[-i]
+
+    def _avg_body(self, window=10):
+        recent = self.sizes[-window:]
+        return float(np.mean(recent)) if recent else 1.0
+
+    def run_all_rules(self):
+        last = self._last()
+        body = max(last["body_height"], 1)
+
+        # Rule 1: Doji
+        if last["total_height"] > 0:
+            ratio = last["body_height"] / last["total_height"]
+            if ratio < 0.15:
+                if last["color"] == "GREEN":
+                    self.score_down += 20
+                    self.reasons.append("Doji reversal (bearish)")
+                else:
+                    self.score_up += 20
+                    self.reasons.append("Doji reversal (bullish)")
+
+        # Rule 2: Hammer
+        if last["lower_wick"] > body * 2 and last["upper_wick"] < body * 0.5:
+            self.score_up += 30
+            self.reasons.append("Hammer pattern")
+
+        # Rule 3: Shooting Star
+        if last["upper_wick"] > body * 2 and last["lower_wick"] < body * 0.5:
+            self.score_down += 30
+            self.reasons.append("Shooting star")
+
+        # Rule 4: Bullish Engulfing
+        if self.n >= 2:
+            lc, prev = self._last(1), self._last(2)
+            if (lc["color"] == "GREEN" and prev["color"] == "RED"
+                    and lc["body_height"] > prev["body_height"] * 1.2):
+                self.score_up += 35
+                self.reasons.append("Bullish engulfing")
+
+        # Rule 5: Bearish Engulfing
+        if self.n >= 2:
+            lc, prev = self._last(1), self._last(2)
+            if (lc["color"] == "RED" and prev["color"] == "GREEN"
+                    and lc["body_height"] > prev["body_height"] * 1.2):
+                self.score_down += 35
+                self.reasons.append("Bearish engulfing")
+
+        # Rule 6: Three White Soldiers
+        if self.n >= 3 and self.seq[-3:] == ["GREEN", "GREEN", "GREEN"]:
+            s = self.sizes[-3:]
+            if s[0] < s[1] < s[2]:
+                self.score_up += 32
+                self.reasons.append("Three white soldiers")
+
+        # Rule 7: Three Black Crows
+        if self.n >= 3 and self.seq[-3:] == ["RED", "RED", "RED"]:
+            s = self.sizes[-3:]
+            if s[0] < s[1] < s[2]:
+                self.score_down += 32
+                self.reasons.append("Three black crows")
+
+        # Rule 8: Morning Star
+        if self.n >= 3:
+            c1, c2, c3 = self._last(3), self._last(2), self._last(1)
+            avg = self._avg_body()
+            if (c1["color"] == "RED" and c1["body_height"] > avg * 1.2
+                    and c2["body_height"] < avg * 0.4
+                    and c3["color"] == "GREEN" and c3["body_height"] > avg * 1.2):
+                self.score_up += 28
+                self.reasons.append("Morning star")
+
+        # Rule 9: Evening Star
+        if self.n >= 3:
+            c1, c2, c3 = self._last(3), self._last(2), self._last(1)
+            avg = self._avg_body()
+            if (c1["color"] == "GREEN" and c1["body_height"] > avg * 1.2
+                    and c2["body_height"] < avg * 0.4
+                    and c3["color"] == "RED" and c3["body_height"] > avg * 1.2):
+                self.score_down += 28
+                self.reasons.append("Evening star")
+
+        # Rule 10: Long Lower Wick
+        if last["lower_wick"] > body * 1.5:
+            self.score_up += 22
+            self.reasons.append("Long lower wick")
+
+        # Rule 11: Long Upper Wick
+        if last["upper_wick"] > body * 1.5:
+            self.score_down += 22
+            self.reasons.append("Long upper wick")
+
+        # Rule 12: Strong Green Body
+        avg = self._avg_body()
+        if last["color"] == "GREEN" and last["body_height"] > avg * 1.5:
+            self.score_up += 20
+            self.reasons.append("Strong green body")
+
+        # Rule 13: Strong Red Body
+        if last["color"] == "RED" and last["body_height"] > avg * 1.5:
+            self.score_down += 20
+            self.reasons.append("Strong red body")
+
+        # Rule 14 & 15: Exhaustion
+        if self.n >= 5:
+            last5 = self.seq[-5:]
+            if last5 == ["GREEN"] * 5:
+                self.score_down += 25
+                self.reasons.append("Exhaustion 5 green")
+            elif last5 == ["RED"] * 5:
+                self.score_up += 25
+                self.reasons.append("Exhaustion 5 red")
+
+        # Rule 16: Uptrend
+        recent10 = self.seq[-10:]
+        if recent10.count("GREEN") >= 6:
+            self.score_up += 15
+            self.reasons.append("Uptrend")
+
+        # Rule 17: Downtrend
+        if recent10.count("RED") >= 6:
+            self.score_down += 15
+            self.reasons.append("Downtrend")
+
+        # Rule 18: Support Bounce
+        if self.n >= 3:
+            recent3 = self.candles[-3:]
+            bottoms = [c["wick_bottom"] for c in recent3]
+            if max(bottoms) - min(bottoms) < 6:
+                if all(c["lower_wick"] > c["body_height"] for c in recent3):
+                    self.score_up += 25
+                    self.reasons.append("Support bounce")
+
+        # Rule 19: Resistance Reject
+        if self.n >= 3:
+            recent3 = self.candles[-3:]
+            tops = [c["wick_top"] for c in recent3]
+            if max(tops) - min(tops) < 6:
+                if all(c["upper_wick"] > c["body_height"] for c in recent3):
+                    self.score_down += 25
+                    self.reasons.append("Resistance reject")
+
+        # Rule 20: Pin Bar
+        if (last["color"] == "GREEN" and last["lower_wick"] > body * 2
+                and last["upper_wick"] < body * 0.3):
+            self.score_up += 25
+            self.reasons.append("Bullish pin bar")
+        if (last["color"] == "RED" and last["upper_wick"] > body * 2
+                and last["lower_wick"] < body * 0.3):
+            self.score_down += 25
+            self.reasons.append("Bearish pin bar")
+
+        return self.score_up, self.score_down, self.reasons
+
+
+def analyze_chart(image_bytes):
+    try:
+        detector = CandleDetector(image_bytes)
+        pattern = detector.extract_pattern()
+        if not pattern or pattern["total"] < 5:
+            return {"status": "ERROR", "message": "কমপক্ষে ৫টি candle দরকার"}
+
+        analyzer = PatternAnalyzer(pattern)
+        up, down, reasons = analyzer.run_all_rules()
+        total = up + down
+
+        green, red = pattern["green_count"], pattern["red_count"]
+        if green > red + 3:
+            trend = "BULLISH"
+        elif red > green + 3:
+            trend = "BEARISH"
+        else:
+            trend = "SIDEWAYS"
+
+        if total < 20:
+            return {"status": "WAIT", "message": "Pattern দুর্বল", "trend": trend}
+
+        diff = up - down
+        if diff > 0:
+            n1_dir = "UP"
+        elif diff < 0:
+            n1_dir = "DOWN"
+        else:
+            n1_dir = "UP" if pattern["sequence"][-1] == "GREEN" else "DOWN"
+
+        n1_conf = min(85, 50 + min(35, abs(diff)))
+
+        if abs(diff) > 25:
+            n2_dir = "DOWN" if n1_dir == "UP" else "UP"
+            n2_reason = "Possible reversal after strong move"
+        else:
+            n2_dir = n1_dir
+            n2_reason = "Trend continuation"
+
+        n2_conf = max(45, n1_conf - 15)
+
+        return {
+            "status": "SIGNAL",
+            "trend": trend,
+            "next1": {"direction": n1_dir, "confidence": n1_conf,
+                      "reason": " + ".join(reasons[:3]) if reasons else "Pattern"},
+            "next2": {"direction": n2_dir, "confidence": n2_conf, "reason": n2_reason},
+            "patterns": reasons[:5],
+            "candles_count": pattern["total"],
+        }
+    except Exception as e:
+        logger.exception("Analysis failed")
+        return {"status": "ERROR", "message": str(e)[:200]}
+
+
+# ---------------- helpers ----------------
+
+def check_user_quota(uid):
+    limit = int(get_setting("screenshot_user_limit", "3"))
+    today = now_bd().date().isoformat()
+    with DB_LOCK:
+        conn = db()
+        try:
+            row = conn.execute(
+                "SELECT used_today, last_reset FROM user_screenshot_quota WHERE user_id=?", (uid,)
+            ).fetchone()
+            if not row or row["last_reset"] != today:
+                conn.execute(
+                    "INSERT INTO user_screenshot_quota(user_id, used_today, last_reset) VALUES(?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET used_today=0, last_reset=excluded.last_reset",
+                    (uid, 0, today)
+                )
+                conn.commit()
+                return True, 0, limit
+            return row["used_today"] < limit, row["used_today"], limit
+        finally:
+            conn.close()
+
+
+def increment_user_quota(uid):
+    today = now_bd().date().isoformat()
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.execute(
+                "INSERT INTO user_screenshot_quota(user_id, used_today, last_reset) VALUES(?,1,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET used_today=used_today+1",
+                (uid, today)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def save_screenshot_signal(uid, uploader_type, photo_file_id, pair, result):
+    with DB_LOCK:
+        conn = db()
+        try:
+            cur = conn.execute(
+                "INSERT INTO screenshot_signals("
+                "uploader_id, uploader_type, photo_file_id, pair, trend, "
+                "next1_direction, next1_confidence, next2_direction, next2_confidence, "
+                "patterns_json, candles_count, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (uid, uploader_type, photo_file_id, pair, result["trend"],
+                 result["next1"]["direction"], result["next1"]["confidence"],
+                 result["next2"]["direction"], result["next2"]["confidence"],
+                 json.dumps(result["patterns"]), result["candles_count"],
+                 utc_iso(now_utc()))
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def format_chart_signal(pair, result):
+    n1 = result["next1"]
+    n2 = result["next2"]
+    trend_icon = {"BULLISH": "📈", "BEARISH": "📉", "SIDEWAYS": "➡️"}.get(result["trend"], "❓")
+    i1 = "🟢⬆️" if n1["direction"] == "UP" else "🔴⬇️"
+    i2 = "🟢⬆️" if n2["direction"] == "UP" else "🔴⬇️"
+    patterns = "\n".join(f"✅ {escape(p)}" for p in result["patterns"][:4])
+    return (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🤖 <b>CANDLE ANALYSIS SIGNAL</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💱 Pair: <b>{escape(pair)}</b>\n"
+        f"⏰ Time: <b>{now_bd().strftime('%I:%M %p')}</b>\n"
+        f"📊 Candles: <b>{result['candles_count']}</b>\n\n"
+        f"{trend_icon} Trend: <b>{result['trend']}</b>\n\n"
+        f"<b>Detected Patterns:</b>\n{patterns}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🕯️ <b>NEXT 1 CANDLE</b>\n"
+        f"{i1} <b>{n1['direction']}</b>\n"
+        f"🎯 Confidence: <b>{n1['confidence']}%</b>\n"
+        f"💡 {escape(n1['reason'])}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🕯️ <b>NEXT 2 CANDLE</b>\n"
+        f"{i2} <b>{n2['direction']}</b>\n"
+        f"🎯 Confidence: <b>{n2['confidence']}%</b>\n"
+        f"💡 {escape(n2['reason'])}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ Educational purpose only"
+    )
+
+
+def broadcast_screenshot_signal(signal_id, text, kb):
+    with DB_LOCK:
+        conn = db()
+        try:
+            users = conn.execute("SELECT user_id FROM users WHERE blocked=0 AND notify=1").fetchall()
+        finally:
+            conn.close()
+
+    sent = 0
+    for u in users:
+        uid = u["user_id"]
+        with DB_LOCK:
+            conn = db()
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO screenshot_signal_deliveries(signal_id, user_id, delivered_at) "
+                    "VALUES(?,?,?)", (signal_id, uid, utc_iso(now_utc()))
+                )
+                inserted = cur.rowcount > 0
+                conn.commit()
+            finally:
+                conn.close()
+        if not inserted:
+            continue
+        try:
+            bot.send_message(uid, text, reply_markup=kb)
+            sent += 1
+        except Exception:
+            with DB_LOCK:
+                conn = db()
+                try:
+                    conn.execute("DELETE FROM screenshot_signal_deliveries WHERE signal_id=? AND user_id=?",
+                                 (signal_id, uid))
+                    conn.commit()
+                finally:
+                    conn.close()
+        time.sleep(0.05)  # stay under Telegram's ~30 msg/s limit
+
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.execute("UPDATE screenshot_signals SET broadcast=1, broadcast_count=? WHERE id=?",
+                         (sent, signal_id))
+            conn.commit()
+        finally:
+            conn.close()
+    return sent
+
+
+def _ss_broadcast_worker(signal_id, text, kb, chat_id, reply_to_id):
+    try:
+        sent = broadcast_screenshot_signal(signal_id, text, kb)
+        bot.send_message(chat_id, f"📤 {sent} users দের কাছে পাঠানো হয়েছে (Signal #{signal_id})",
+                         reply_to_message_id=reply_to_id)
+    except Exception:
+        logger.exception("Screenshot broadcast failed")
+
+
+# ---------------- photo flow ----------------
+
+def ss_handle_chart_photo(message):
+    uid = message.from_user.id
+    mode = get_setting("screenshot_mode", "OFF")
+    is_admin_user = _ss_is_admin(uid)
+
+    if mode == "OFF":
+        if is_admin_user:
+            bot.reply_to(message, "⚠️ Screenshot mode বন্ধ।")
+        return False
+
+    if not is_admin_user and mode != "USER_ALLOWED":
+        bot.reply_to(message, "❌ শুধু Admin screenshot দিতে পারবে।")
+        return True
+
+    if not is_admin_user:
+        ok, used, limit = check_user_quota(uid)
+        if not ok:
+            bot.reply_to(message, f"❌ আজকের limit শেষ ({used}/{limit})")
+            return True
+
+    try:
+        bot.send_chat_action(message.chat.id, "typing")
+    except Exception:
+        pass
+    photo = message.photo[-1]
+
+    try:
+        file_info = bot.get_file(photo.file_id)
+        image_bytes = bot.download_file(file_info.file_path)
+    except Exception:
+        bot.reply_to(message, "❌ ছবি download করতে ব্যর্থ")
+        return True
+
+    result = analyze_chart(image_bytes)
+
+    if result["status"] == "ERROR":
+        bot.reply_to(message, f"❌ {escape(result['message'])}")
+        return True
+
+    if result["status"] == "WAIT":
+        bot.reply_to(message, f"⏸️ {result['message']}\nTrend: {result['trend']}")
+        return True
+
+    try:
+        min_conf = int(get_setting("screenshot_min_confidence", "70"))
+    except ValueError:
+        min_conf = 70
+    if result["next1"]["confidence"] < min_conf:
+        bot.reply_to(message, f"⏸️ Confidence কম ({result['next1']['confidence']}% < {min_conf}%)")
+        return True
+
+    pair = "AUTO"
+    if message.caption:
+        m = re.search(r"[A-Z]{3}[/_][A-Z]{3}", message.caption.upper())
+        if m:
+            pair = m.group(0).replace("_", "/")
+
+    signal_id = save_screenshot_signal(uid, "ADMIN" if is_admin_user else "USER",
+                                       photo.file_id, pair, result)
+    if not is_admin_user:
+        increment_user_quota(uid)
+
+    text = format_chart_signal(pair, result)
+
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ WIN", callback_data=f"ssres:{signal_id}:WIN"),
+        types.InlineKeyboardButton("❌ LOSE", callback_data=f"ssres:{signal_id}:LOSS"),
+        types.InlineKeyboardButton("⏭️ SKIP", callback_data=f"ssres:{signal_id}:SKIP"),
+    )
+
+    if is_admin_user:
+        should_broadcast = get_setting("screenshot_admin_auto_send", "ON") == "ON"
+    else:
+        should_broadcast = get_setting("screenshot_user_auto_send", "ON") == "ON"
+
+    if should_broadcast:
+        bot.reply_to(message, text + "\n\n📤 Broadcast শুরু হচ্ছে...")
+        threading.Thread(
+            target=_ss_broadcast_worker,
+            args=(signal_id, text, kb, message.chat.id, message.message_id),
+            daemon=True, name="ss_broadcast"
+        ).start()
+    else:
+        bot.reply_to(message, text, reply_markup=kb)
+    return True
+
+
+_ss_prev_candle_photo = handle_candle_photo
+
+
+def handle_candle_photo(message):
+    """Existing AI-candle upload flow first; otherwise the Screenshot Signal flow."""
+    handled = _ss_prev_candle_photo(message)
+    if handled:
+        return handled
+    return ss_handle_chart_photo(message)
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "").startswith("ssres:"))
+def handle_screenshot_result(call):
+    try:
+        _, sid_s, result = call.data.split(":", 2)
+        signal_id = int(sid_s)
+        uid = call.from_user.id
+        if result == "LOSE":
+            result = "LOSS"
+        if result not in ("WIN", "LOSS", "SKIP"):
+            raise ValueError("Invalid result")
+        with DB_LOCK:
+            conn = db()
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO screenshot_signal_results(signal_id, user_id, result, created_at) "
+                    "VALUES(?,?,?,?)", (signal_id, uid, result, utc_iso(now_utc()))
+                )
+                inserted = cur.rowcount > 0
+                conn.commit()
+            finally:
+                conn.close()
+        if not inserted:
+            bot.answer_callback_query(call.id, "Already submitted for this signal.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, {"WIN": "✅ WIN!", "LOSS": "❌ LOSE", "SKIP": "⏭️ Skipped"}[result])
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("ssres handler failed")
+        try:
+            bot.answer_callback_query(call.id, "Error")
+        except Exception:
+            pass
+
+
+# ---------------- admin panel ----------------
+
+def admin_screenshot_kb():
+    mode = get_setting("screenshot_mode", "OFF")
+    a_auto = get_setting("screenshot_admin_auto_send", "ON")
+    u_auto = get_setting("screenshot_user_auto_send", "ON")
+    limit = get_setting("screenshot_user_limit", "3")
+    minc = get_setting("screenshot_min_confidence", "70")
+    return make_keyboard([
+        [f"🔘 Mode: {mode}", "🔄 Change Mode"],
+        [f"📤 Admin Auto: {a_auto}", "🔄 Toggle Admin"],
+        [f"👤 User Auto: {u_auto}", "🔄 Toggle User"],
+        [f"👥 User Limit: {limit}", "✏️ Set Limit"],
+        [f"🎯 Min Conf: {minc}%", "✏️ Set Conf"],
+        ["📊 Stats", "📋 Recent"],
+        ["🔙 Back", "🏠 Main Menu"],
+    ])
+
+
+_MENU_TABLE[SS_MENU_KEY] = ("📸 <b>Screenshot Signal Settings</b>", lambda u: admin_screenshot_kb())
+NAV_PARENT[SS_MENU_KEY] = "admin"
+
+
+def _ss_panel(chat_id, uid, note=None):
+    NAV_MENU[uid] = SS_MENU_KEY
+    bot.send_message(chat_id, note or "📸 <b>Screenshot Signal Settings</b>",
+                     reply_markup=admin_screenshot_kb())
+
+
+def _ss_stats_text():
+    today_start = now_bd().replace(hour=0, minute=0, second=0, microsecond=0)
+    lo = utc_iso(today_start)
+    hi = utc_iso(today_start + timedelta(days=1))
+    with DB_LOCK:
+        conn = db()
+        try:
+            total = conn.execute("SELECT COUNT(*) c FROM screenshot_signals").fetchone()["c"]
+            td = conn.execute("SELECT COUNT(*) c FROM screenshot_signals WHERE created_at>=? AND created_at<?",
+                              (lo, hi)).fetchone()["c"]
+            wins = conn.execute("SELECT COUNT(*) c FROM screenshot_signal_results WHERE result='WIN'").fetchone()["c"]
+            loss = conn.execute("SELECT COUNT(*) c FROM screenshot_signal_results WHERE result='LOSS'").fetchone()["c"]
+        finally:
+            conn.close()
+    return (f"📊 <b>Screenshot Stats</b>\nTotal: {total}\nToday: {td}\n"
+            f"User-reported WIN: {wins} | LOSE: {loss}")
+
+
+def _ss_recent_text():
+    with DB_LOCK:
+        conn = db()
+        try:
+            rows = conn.execute("SELECT * FROM screenshot_signals ORDER BY id DESC LIMIT 5").fetchall()
+        finally:
+            conn.close()
+    if not rows:
+        return "No recent signals"
+    lines = ["📋 <b>Recent Screenshot Signals</b>", ""]
+    for r in rows:
+        lines.append(f"#{r['id']} | {escape(str(r['pair']))} | N1: {r['next1_direction']} "
+                     f"({r['next1_confidence']}%) | N2: {r['next2_direction']} ({r['next2_confidence']}%)")
+    return "\n".join(lines)
+
+
+_SS_BUTTONS = {"🔄 Change Mode", "🔄 Toggle Admin", "🔄 Toggle User", "✏️ Set Limit",
+               "✏️ Set Conf", "📊 Stats", "📋 Recent"}
+_SS_LABEL_PREFIXES = ("🔘 Mode:", "📤 Admin Auto:", "👤 User Auto:", "👥 User Limit:", "🎯 Min Conf:")
+
+
+def ss_text_match(message):
+    try:
+        if message.content_type != "text":
+            return False
+        t = (message.text or "").strip()
+        uid = message.from_user.id
+        if t == "📸 Screenshot Signal":
+            return _ss_is_admin(uid)
+        if NAV_MENU.get(uid) == SS_MENU_KEY and (t in _SS_BUTTONS or t.startswith(_SS_LABEL_PREFIXES)):
+            return _ss_is_admin(uid)
+        return False
+    except Exception:
+        return False
+
+
+def ss_admin_text(message):
+    uid = message.from_user.id
+    chat = message.chat.id
+    t = (message.text or "").strip()
+    try:
+        # A real menu button always wins over a half-finished input.
+        STATES.pop(uid, None)
+        NAV_INPUT.pop(uid, None)
+
+        if not can(uid, "settings"):
+            return bot.send_message(chat, "⛔ Access denied.", reply_markup=admin_keyboard())
+
+        if t == "📸 Screenshot Signal":
+            return _ss_panel(chat, uid)
+
+        if t == "🔄 Change Mode":
+            modes = ["OFF", "ADMIN_ONLY", "USER_ALLOWED"]
+            cur = get_setting("screenshot_mode", "OFF")
+            new_mode = modes[((modes.index(cur) if cur in modes else 0) + 1) % 3]
+            set_setting("screenshot_mode", new_mode)
+            return _ss_panel(chat, uid, f"✅ Mode: <b>{new_mode}</b>")
+
+        if t == "🔄 Toggle Admin":
+            new = "OFF" if get_setting("screenshot_admin_auto_send", "ON") == "ON" else "ON"
+            set_setting("screenshot_admin_auto_send", new)
+            return _ss_panel(chat, uid, f"✅ Admin Auto: <b>{new}</b>")
+
+        if t == "🔄 Toggle User":
+            new = "OFF" if get_setting("screenshot_user_auto_send", "ON") == "ON" else "ON"
+            set_setting("screenshot_user_auto_send", new)
+            return _ss_panel(chat, uid, f"✅ User Auto: <b>{new}</b>")
+
+        if t == "✏️ Set Limit":
+            _state_set(uid, {"action": "set_screenshot_limit", "previous_menu": SS_MENU_KEY})
+            return bot.send_message(chat, "Daily limit number পাঠান (1-100)", reply_markup=back_keyboard())
+
+        if t == "✏️ Set Conf":
+            _state_set(uid, {"action": "set_screenshot_conf", "previous_menu": SS_MENU_KEY})
+            return bot.send_message(chat, "Min confidence পাঠান (50-85)", reply_markup=back_keyboard())
+
+        if t == "📊 Stats":
+            return _ss_panel(chat, uid, _ss_stats_text())
+
+        if t == "📋 Recent":
+            return _ss_panel(chat, uid, _ss_recent_text())
+
+        # Display-only labels (e.g. "🔘 Mode: OFF") just refresh the panel.
+        return _ss_panel(chat, uid)
+    except Exception:
+        logger.exception("Screenshot admin panel failed")
+        try:
+            bot.send_message(chat, "❌ Error. আবার চেষ্টা করুন.", reply_markup=admin_keyboard())
+        except Exception:
+            pass
+
+
+_ss_prev_handle_state = handle_state
+
+
+def handle_state(message):
+    uid = message.from_user.id
+    st = STATES.get(uid)
+    action = st.get("action") if st else None
+    if action in ("set_screenshot_limit", "set_screenshot_conf"):
+        text = (message.text or "").strip()
+        chat = message.chat.id
+        if not can(uid, "settings"):
+            clear_state(uid)
+            bot.send_message(chat, "⛔ Access denied.", reply_markup=admin_keyboard())
+            return True
+        if action == "set_screenshot_limit":
+            lo, hi, key, label = 1, 100, "screenshot_user_limit", "Limit"
+        else:
+            lo, hi, key, label = 50, 85, "screenshot_min_confidence", "Min Conf"
+        try:
+            n = int(text)
+        except ValueError:
+            bot.send_message(chat, "সংখ্যা দিন")
+            return True
+        if not (lo <= n <= hi):
+            bot.send_message(chat, f"{lo}-{hi} এর মধ্যে দিন")
+            return True
+        set_setting(key, str(n))
+        clear_state(uid)
+        _ss_panel(chat, uid, f"✅ {label}: {n}{'%' if key == 'screenshot_min_confidence' else ''}")
+        return True
+    return _ss_prev_handle_state(message)
+
 
 # ============================================================
 # RUN
